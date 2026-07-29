@@ -1,0 +1,86 @@
+{
+  "enableTalkingMotion": true,
+  "debugLog": false,
+  "talkingFadeInMs": 300,
+  "talkingFadeOutMs": 800,
+  "minReactionIntervalMs": 1200,
+  "nodCooldownMs": 1500,
+  "keywordReactionCooldownMs": 2500,
+  "defaultEnergy": 0.4,
+  "prosodyStrength": 0.6,
+  "browStrength": 0.6,
+  "gazeMinIntervalMs": 700,
+  "gazeMaxIntervalMs": 2600,
+  "postureShiftMinMs": 5000,
+  "postureShiftMaxMs": 11000,
+  "listeningStrength": 0.4,
+  "listeningNodMinMs": 2200,
+  "listeningNodMaxMs": 4800,
+  "idleLifeStrength": 0.12,
+  "breathStrength": 0.6,
+  "breathRateHz": 0.25,
+  "thinkingStrength": 0.4,
+  "emotionSmoothMs": 400,
+  "cheekStrength": 0.6,
+  "tearStrength": 0.5,
+  "eyeHiStrength": 0.4,
+  "fidgetMinMs": 4000,
+  "fidgetMaxMs": 12000,
+  "energyFromLength": true,
+  "emotionStrength": {
+    "neutral": 0.35,
+    "calm": 0.3,
+    "happy": 0.6,
+    "thinking": 0.45,
+    "surprised": 0.85,
+    "sad": 0.25,
+    "nervous": 0.5
+  },
+  "keywordReactions": [
+    {
+      "keywords": ["ありがとう", "感謝", "thanks", "thank you"],
+      "reaction": "thanks_small",
+      "gesture": "small_nod",
+      "expression": "face_hohoemu",
+      "priority": 2
+    },
+    {
+      "keywords": ["なるほど", "そっか", "確かに", "i see", "got it"],
+      "reaction": "thinking_nod",
+      "gesture": "small_nod",
+      "expression": "face_kangaeru",
+      "priority": 1
+    },
+    {
+      "keywords": ["え？", "ええ？", "なに", "what?", "huh?", "eh?"],
+      "reaction": "surprise_small",
+      "gesture": "surprise_pop",
+      "expression": "face_bikkuri",
+      "priority": 3
+    },
+    {
+      "keywords": ["面白", "おもしろ", "楽しい", "funny", "haha", "lol", "笑"],
+      "reaction": "laugh_small",
+      "gesture": "emphasis",
+      "expression": "face_egao",
+      "priority": 2
+    },
+    {
+      "keywords": ["ごめん", "すみません", "申し訳", "sorry"],
+      "reaction": "apologetic_small",
+      "gesture": "small_nod",
+      "expression": "face_nayamu",
+      "priority": 2
+    }
+  ],
+  "punctuationGestures": {
+    "。": "small_nod",
+    ".": "small_nod",
+    "！": "emphasis",
+    "!": "emphasis",
+    "？": "head_tilt",
+    "?": "head_tilt",
+    "、": "micro_pause",
+    ",": "micro_pause"
+  }
+}

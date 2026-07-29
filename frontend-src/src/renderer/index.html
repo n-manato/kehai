@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Open-LLM-Vtuber</title>
+    <script>
+      // The frontend is always served by its own backend, so the WebSocket and
+      // base URLs MUST point at whatever origin served this page. Force them to
+      // the current origin on every load, so stale localStorage (old port, http
+      // vs https, a different host) can never strand the app on an unreachable
+      // backend. Also drop a stale background that points at a dead old origin.
+      (() => {
+        try {
+          const baseUrl = window.location.origin;
+          const wsUrl =
+            `${window.location.protocol === "https:" ? "wss" : "ws"}://` +
+            `${window.location.host}/client-ws`;
+          window.localStorage.setItem("wsUrl", JSON.stringify(wsUrl));
+          window.localStorage.setItem("baseUrl", JSON.stringify(baseUrl));
+
+          // If a previously-saved background URL points at a different origin
+          // (old port/scheme), clear it so it doesn't 404 / trip mixed-content.
+          const rawBg = window.localStorage.getItem("backgroundUrl");
+          if (rawBg) {
+            const bg = JSON.parse(rawBg);
+            if (typeof bg === "string" && /^https?:\/\//.test(bg) &&
+                bg.indexOf(window.location.origin) !== 0) {
+              window.localStorage.removeItem("backgroundUrl");
+            }
+          }
+        } catch {
+          /* localStorage unavailable — in-app defaults will be used */
+        }
+      })();
+    </script>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./src/main.tsx"></script>
+  </body>
+</html>

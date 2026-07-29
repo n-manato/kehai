@@ -1,0 +1,11 @@
+# Hatsune Miku — a SEPARATE character (3D MMD model, rendered via three.js).
+# Selecting this preset swaps the canvas to the MMD viewer (the model URL is a
+# .pmx). Persona is Miku's own; other settings (LLM/ASR/TTS) inherit from
+# conf.yaml. To give Miku her own voice, add a tts_config override here with a
+# Miku reference clip (see Stage 4).
+character_config:
+  conf_name: "初音ミク"
+  conf_uid: "miku_yyb_001"
+  live2d_model_name: "yyb_miku_10th"
+  character_name: "Miku"
+  persona_prompt_file: "prompts/personas/miku.txt"

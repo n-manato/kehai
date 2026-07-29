@@ -1,0 +1,25 @@
+# レム (Japanese) — the full Rem persona + RemGSV fine-tuned voice, one click
+# away from the EDI-english default. Selecting this switches the WHOLE pipeline
+# back to Japanese (whisper hint ja, latin->katakana ON, JA speech rules) and
+# hot-swaps the RemGSV weights on the shared PC-B GSV server.
+# conf_uid keeps the ORIGINAL Rem uid so the existing chat history stays attached.
+character_config:
+  conf_name: "レム"
+  conf_uid: "miku_yyb_001"
+  live2d_model_name: "yyb_miku_10th"
+  character_name: "Rem"
+  language: "ja"
+  persona_prompt_file: "prompts/personas/rem.txt"
+  asr_config:
+    # Rem stays on the gateway whisper (JA pinned server-side; quality proven).
+    asr_model: "gateway_whisper_asr"
+    gateway_whisper_asr:
+      language: "ja"
+  tts_config:
+    gsv_stream:
+      ref_audio_path: "/home/ai-ccore/Documents/DEV/voice/refs/f02_025.wav"
+      prompt_text: "今日はレーって始まってムーで終わる名前の女の子と一緒にいるといいことがありますよ。"
+      text_lang: "ja"
+      prompt_lang: "ja"
+      gpt_weights: "GPT_weights_v2/RemGSV-e15.ckpt"
+      sovits_weights: "SoVITS_weights_v2ProPlus/RemGSV_e16_s400.pth"

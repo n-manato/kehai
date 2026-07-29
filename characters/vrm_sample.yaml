@@ -1,0 +1,12 @@
+# Raw SMPL-X body — a TEST character that renders GestureLSM's exact output (55
+# SMPL-X joints) as an articulated body figure with ZERO retargeting (the model
+# URL is the "smplx-body" sentinel, so App.tsx mounts the SMPLBodyViewer). This is
+# the ground-truth motion the way GestureLSM demos it — the reference to retarget
+# other 3D models against. Shown below 初音ミク in the preset dropdown. Persona /
+# LLM / ASR / TTS inherit from conf.yaml.
+character_config:
+  conf_name: "サンプル (SMPL素の動き)"
+  conf_uid: "smplx_body_001"
+  live2d_model_name: "smplx_body"
+  character_name: "Sample"
+  persona_prompt_file: "prompts/personas/miku.txt"

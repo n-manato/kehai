@@ -1,0 +1,25 @@
+# Rem outfit variant — only the Live2D model changes.
+# Persona, TTS, LLM, ASR, etc. are inherited from conf.yaml (unset options
+# stay unchanged when switching character).
+character_config:
+  conf_name: "レム（幼少期）"
+  conf_uid: "rem_childhood01_cfg"
+  live2d_model_name: "ac_base_rem_childhood01"
+  character_name: "Rem"
+  # Rem persona/voice made EXPLICIT (2026-07-26): the base conf.yaml is now the
+  # EDI-english Miku, so outfit presets must carry Rem's language/persona/voice
+  # themselves (unset keys inherit from the BASE config = EDI, not from Rem).
+  language: "ja"
+  persona_prompt_file: "prompts/personas/rem.txt"
+  asr_config:
+    asr_model: "gateway_whisper_asr"
+    gateway_whisper_asr:
+      language: "ja"
+  tts_config:
+    gsv_stream:
+      ref_audio_path: "/home/ai-ccore/Documents/DEV/voice/refs/f02_025.wav"
+      prompt_text: "今日はレーって始まってムーで終わる名前の女の子と一緒にいるといいことがありますよ。"
+      text_lang: "ja"
+      prompt_lang: "ja"
+      gpt_weights: "GPT_weights_v2/RemGSV-e15.ckpt"
+      sovits_weights: "SoVITS_weights_v2ProPlus/RemGSV_e16_s400.pth"

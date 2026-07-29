@@ -1,0 +1,110 @@
+# ignore the user configuration file
+conf.yaml
+
+# pre-streaming frontend backup (local safety copy, not for VCS)
+frontend_backup_prestreaming/
+
+# ignore non-default background images
+/backgrounds/*
+!/backgrounds/README.md
+
+# ignore non-default live2d models
+/live2d-models/*
+!/live2d-models/mao_pro
+!/live2d-models/shizuku
+
+# ignore non-default character configs
+/characters/*
+!/characters/README.md
+# but all of the defaults are already tracked, so no need to un-ignore them
+
+# ignore avatars
+avatars/*
+
+# macOS system files
+.DS_Store
+
+# Python files
+__pycache__/
+*.pyc
+lab.py
+.idea
+
+# Virtual environment
+.venv
+.conda
+conda
+
+# Local conda/miniconda environment (must never be committed)
+third_party/miniconda3/
+
+# Sensitive data
+.env
+.motion_gateway_key
+api_keys.py
+src/open_llm_vtuber/llm/user_credentials.json
+
+# Database files
+memory.db
+memory.db.bk
+
+# Logs
+server.log
+server.stdout.log
+server.stderr.log
+logs/*
+
+# Cache and models
+cache/*
+src/open_llm_vtuber/tts/asset
+src/open_llm_vtuber/tts/config
+src/open_llm_vtuber/asr/models*
+!src/open_llm_vtuber/asr/models/silero_vad.onnx
+asset
+models/*
+!models/piper_voice
+models/piper_voice/*
+
+
+# Legacy and specific directories
+legacy/
+chat_history/
+knowledge_base/
+submodules/MeloTTS
+openapi_assistants.json
+openapi_memgpt.json
+
+# memory log
+mem.json
+conf.yaml.backup
+
+*.exe
+
+tmp/
+private/
+mcp_servers.json
+
+.vscode/
+# --- Live2D / TTS 作業で出た一時ファイル（コミット不要）---
+*.bak
+*.bak2
+**/_act_backup/
+tts_voice_samples/
+
+# --- frontend を本体取り込み後、ビルド成果物/依存は除外 ---
+frontend/node_modules/
+frontend/dist/
+
+# --- HY-Motion ライブ生成サービス (PC-B) ---
+# モデル重み (数GB〜十数GB) は Git に入れない。PC-B で HuggingFace から直接DL。
+motion-service/ckpts/
+# SMPL/SMPL-H ボディモデル (ライセンス上も再配布不可)
+motion-service/body_models/
+# 生成/リターゲット済みクリップのキャッシュ
+motion-service/cache/
+motion-service/.venv/
+# PC-A 側が PC-B から取得した .vmd の配信キャッシュ
+cache/motion/
+
+# Local reference video (too large for GitHub; keep only in the working tree)
+/videos/【MMD】トゥーン調エフェクトメイキング【msToonCoordinator】.mp4
