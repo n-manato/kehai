@@ -98,12 +98,17 @@ export function ChatHistoryProvider({ children }: { children: React.ReactNode })
         }];
       }
 
-      // Otherwise, merge with last AI text message
+      // Otherwise, merge with last AI text message. Callers hand this whole
+      // SENTENCES (one per spoken line), not tokens, so a bare concatenation ran
+      // them together — "You're welcome.I'm here to help." Join with a space
+      // unless one side already brings its own whitespace.
+      const needsGap = lastMessage.content
+        && !/\s$/.test(lastMessage.content) && !/^\s/.test(content);
       return [
         ...prevMessages.slice(0, -1),
         {
           ...lastMessage,
-          content: lastMessage.content + content,
+          content: lastMessage.content + (needsGap ? " " : "") + content,
           timestamp: new Date().toISOString(),
         },
       ];

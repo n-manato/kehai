@@ -1,10 +1,16 @@
 # CLAUDE.md
 
+> **このチェックアウトは PC-B (aiccore) 側のインスタンスです。**
+> 作業を始める前に必ず読むこと → @docs/PCB-HANDOFF.md
+> （この箱固有の制約・起動確認の手順・踏みやすい罠がまとまっている。
+> 下の記述は PC-A 前提のものが混ざっているので、食い違ったら HANDOFF が正）
+
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-Open-LLM-VTuber is a voice-interactive AI companion with Live2D avatar support that runs completely offline. It's a cross-platform Python application supporting real-time voice conversations, visual perception, and Live2D character animations. The project features modular architecture for LLM, ASR (Automatic Speech Recognition), TTS (Text-to-Speech), and other components.
+KEHAI is a voice-interactive AI companion with Live2D avatar support that runs completely offline. It's a cross-platform Python application supporting real-time voice conversations, visual perception, and Live2D character animations. The project features modular architecture for LLM, ASR (Automatic Speech Recognition), TTS (Text-to-Speech), and other components.
 
 ## Essential Commands
 
@@ -39,6 +45,43 @@ Open-LLM-VTuber is a voice-interactive AI companion with Live2D avatar support t
   `https://gpu.aiccore-uno.ai/v1` is the manual fallback for the two base_urls.
 - **Update project**: `uv run upgrade.py`
 
+### Running on PC-B instead (2026-08-06)
+
+A second, independent install lives on the GPU box at
+`aiccore-RTX3090:~/Documents/DEV/KEHAI`. Same code, its own `conf.yaml` and
+`start_server.sh` — **the two are not meant to be synced**, and this PC's copy
+still works exactly as documented above.
+
+Why it exists: on PC-B the Nexus gateway is a LOOPBACK service (`*:3000`), so
+LLM / STT / TTS / motion stop crossing the network entirely. No tunnel
+supervisor, no `:13000`, no Cloudflare fallback in the hot path.
+
+    # 1. server (PC-B) — has no display and no sound card; it only serves
+    ssh aiccore-RTX3090 'cd ~/Documents/DEV/KEHAI && ./kehai.sh start'
+    #    ./kehai.sh {start|stop|restart|status|log}   (status also probes :3000)
+
+    # 2. tunnel (here) — only :22 reaches PC-B; every other port is firewalled
+    pwsh scripts/pcb-app-tunnel.ps1
+
+    # 3. browser (here)
+    http://127.0.0.1:12395/
+
+Three things about that URL are deliberate:
+
+- **:12395, not :12394** — a separate browser origin from this PC's own server,
+  so localStorage (look presets, the `webrtc` flag) and the microphone grant
+  never bleed between the two instances.
+- **http, not https** — PC-B runs with `enable_https: false`. The hop is already
+  encrypted by SSH, `127.0.0.1` is a secure context even over http (so the mic
+  works), and it avoids a cert interstitial on *every* start: `clean_cache()`
+  deletes `cache/` on exit, so the self-signed cert is regenerated each run.
+- **WebRTC audio will not work over the tunnel** — aiortc only offers PC-B's own
+  host candidates and the browser cannot reach them, so ICE fails and the
+  frontend falls back to the WebSocket audio path by itself. Functional, but the
+  browser's echo cancellation is gone: **use headphones**. To skip the failed
+  attempt, set `localStorage.webrtc='0'` on the :12395 origin only. Getting
+  WebRTC back means opening PC-B's firewall or putting this PC on its tailnet.
+
 ### Code Quality
 - **Lint code**: `ruff check .`
 - **Format code**: `ruff format .`
@@ -53,17 +96,17 @@ Open-LLM-VTuber is a voice-interactive AI companion with Live2D avatar support t
 
 ### Core Components
 
-**WebSocket Server** (`src/open_llm_vtuber/server.py`):
+**WebSocket Server** (`src/kehai/server.py`):
 - FastAPI-based server handling WebSocket connections
 - Serves frontend, Live2D models, and static assets
 - Supports both main client and proxy WebSocket endpoints
 
-**Service Context** (`src/open_llm_vtuber/service_context.py`):
+**Service Context** (`src/kehai/service_context.py`):
 - Central dependency injection container
 - Manages all engines (LLM, ASR, TTS, VAD, etc.)
 - Each WebSocket connection gets its own service context instance
 
-**WebSocket Handler** (`src/open_llm_vtuber/websocket_handler.py`):
+**WebSocket Handler** (`src/kehai/websocket_handler.py`):
 - Routes WebSocket messages to appropriate handlers
 - Manages client connections, groups, and conversation state
 - Handles audio data, conversation triggers, and Live2D interactions
@@ -72,33 +115,33 @@ Open-LLM-VTuber is a voice-interactive AI companion with Live2D avatar support t
 
 The project uses a factory pattern for all AI engines:
 
-**Agent System** (`src/open_llm_vtuber/agent/`):
+**Agent System** (`src/kehai/agent/`):
 - `agent_factory.py` - Factory for creating different agent types
 - `agents/` - Various agent implementations (basic_memory, hume_ai, letta, mem0)
 - `stateless_llm/` - Stateless LLM implementations (Claude, OpenAI, Ollama, etc.)
 
-**ASR Engines** (`src/open_llm_vtuber/asr/`):
+**ASR Engines** (`src/kehai/asr/`):
 - Support for multiple ASR backends: Sherpa-ONNX, FunASR, Faster-Whisper, OpenAI Whisper, etc.
 - Factory pattern for engine selection based on configuration
 
-**TTS Engines** (`src/open_llm_vtuber/tts/`):
+**TTS Engines** (`src/kehai/tts/`):
 - Multiple TTS options: Azure TTS, Edge TTS, MeloTTS, CosyVoice, GPT-SoVITS, etc.
 - Configurable voice cloning and multi-language support
 
-**VAD (Voice Activity Detection)** (`src/open_llm_vtuber/vad/`):
+**VAD (Voice Activity Detection)** (`src/kehai/vad/`):
 - Silero VAD for detecting speech activity
 - Essential for voice interruption without feedback loops
 
 ### Configuration Management
 
-**Config System** (`src/open_llm_vtuber/config_manager/`):
+**Config System** (`src/kehai/config_manager/`):
 - Type-safe configuration classes for each component
 - Automatic validation and loading from YAML files
 - Support for multiple character configurations and config switching
 
 ### Conversation System
 
-**Conversation Handling** (`src/open_llm_vtuber/conversations/`):
+**Conversation Handling** (`src/kehai/conversations/`):
 - `conversation_handler.py` - Main conversation orchestration
 - `single_conversation.py` - Individual user conversations
 - `group_conversation.py` - Multi-user group conversations
@@ -106,7 +149,7 @@ The project uses a factory pattern for all AI engines:
 
 ### MCP (Model Context Protocol) Integration
 
-**MCP System** (`src/open_llm_vtuber/mcpp/`):
+**MCP System** (`src/kehai/mcpp/`):
 - Tool execution and server registry
 - JSON detection and parameter extraction
 - Integration with various MCP servers for extended functionality
@@ -134,11 +177,11 @@ The codebase uses the missing `_cleanup_failed_connection` method pattern - when
 ## Important File Locations
 
 - **Entry point**: `run_server.py`
-- **Main server**: `src/open_llm_vtuber/server.py`
-- **WebSocket routing**: `src/open_llm_vtuber/routes.py`
+- **Main server**: `src/kehai/server.py`
+- **WebSocket routing**: `src/kehai/routes.py`
 - **Configuration**: `conf.yaml` (user), `config_templates/` (defaults)
 - **Frontend (built)**: `frontend/` — served static build; do not hand-edit
-- **Frontend (source)**: `frontend-src/` — embedded Open-LLM-VTuber-Web source (React/Vite/TS + Cubism WebSDK) with this project's customizations. Rebuild & deploy with `pwsh scripts/build-frontend.ps1`
+- **Frontend (source)**: `frontend-src/` — embedded KEHAI-Web source (React/Vite/TS + Cubism WebSDK) with this project's customizations. Rebuild & deploy with `pwsh scripts/build-frontend.ps1`
 - **Live2D models**: `live2d-models/`
 - **Character definitions**: `characters/`
 - **Chat history**: `chat_history/`

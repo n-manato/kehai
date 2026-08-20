@@ -1,4 +1,8 @@
 /* eslint-disable no-underscore-dangle */
+// JA -> EN DISPLAY names. Only the LABEL is translated: the Japanese strings
+// are also PMX bone / morph KEYS (dict["上半身2"], morph lookups), so the
+// values themselves must never change.
+import UI_LABELS from "@/utils/ui-labels-ja-en.json";
 import { memo, useEffect, useRef } from "react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
@@ -20,17 +24,22 @@ import {
 import { mmdHairPhysics } from "../../utils/mmd-hair-physics";
 import { vrmMotionPlayer } from "@/utils/vrm-motion-player";
 import { vrmExpression } from "@/utils/vrm-expression";
+import { buildVrmFromGltf } from "@/utils/glb-humanoid";
+import { dedupeTextures, pruneZeroMorphTargets, describeVrmCost } from "@/utils/vrm-optimize";
+import { faceMotion } from "@/utils/face-motion";
 import { vrmLipSync } from "@/utils/vrm-lipsync";
 import { SmplReferenceFigure } from "@/utils/smpl-reference-figure";
 import { SmplMeshFigure } from "@/utils/smpl-mesh-figure";
 import { neuralSpace } from "@/utils/space/neural-space";
-import { aiDebug, debugParams } from "@/utils/debug/ai-debug";
+import { aiDebug, debugParams, flashRecorder } from "@/utils/debug/ai-debug";
 import { SPACE_LAYER } from "@/utils/space/layers";
 import { isProtoMode, setProtoMode } from "@/utils/space/proto-mode";
+import { deviceProfile } from "@/utils/space/device-profile";
 import { createFraming } from "@/utils/space/framing";
 import { createBodyDepth } from "@/utils/space/body-depth";
-import { autoHide, installAutoHide, refreshAutoHide } from "@/utils/space/auto-hide";
+import { autoHide, refreshAutoHide } from "@/utils/space/auto-hide";
 import { SPACE } from "@/utils/space/space-config";
+import { taa, TaaResolve, TaaVelocity } from "@/utils/space/taa";
 import { describePixelRatio, resolvePixelRatio, watchDevicePixelRatio } from "@/utils/space/pixel-ratio";
 import { applyOffAxis, currentPanel, impliedPanelHeightM } from "@/utils/space/off-axis";
 import { viewerTransform } from "@/utils/space/viewer-transform";
@@ -58,6 +67,37 @@ const HIDE_MATERIALS: string[] = [];
  *  shadow read as a red line down the back of the thigh. Chosen trade-off: keep the block,
  *  lose the line. Add names here only if the same A/B is re-run and the thigh stays clean. */
 const NO_CAST: string[] = [];
+
+/* ALPHA_BLEND_NOTE
+ *  2026-08-13, hair-behind-the-outer-skirt investigation — RECORDED SO IT IS NOT
+ *  RE-ATTEMPTED. The 11 alpha-blended materials (Hair01-03, Hairshadow, C01-C07)
+ *  ship as transparent + depthWrite:true + alphaTest:0, which LOOKS like the
+ *  textbook cause of "the hair is not drawn behind the transparent skirt": a
+ *  fully transparent texel still writes depth and rejects whatever is behind it.
+ *  Two repairs were tried and BOTH MEASURED AS NO-OPS, so neither is in the code:
+ *    - alphaTest 0.1 on every alpha-blended material
+ *    - depthWrite:false on the outer layers only (hair sheets keeping theirs)
+ *  Method: paint the hair flat opaque magenta, hide every OPAQUE surface, and
+ *  count magenta — so only hair lost to TRANSPARENT surfaces is counted, with a
+ *  fresh page per variant. Erased: 34.2% with everything untouched, 34.3% with
+ *  the depthWrite repair, 35.1% / 35.7% for the alphaTest and hair-depthWrite
+ *  variants. All within noise of each other.
+ *  Conclusion: depth-write is NOT what removes the hair here, and per-material
+ *  depth toggles cannot fix it. Re-confirmed with the render-probe MCP server
+ *  (noise floor 0.11%), which is the ONLY trustworthy instrument for this: hair
+ *  on screen was 12.740% of frame before the depthWrite repair and 12.750%
+ *  after — no effect.
+ *  MEASURE HAIR THIS WAY, not with hand-rolled screenshot diffs. `hairColorMix`
+ *  tints ONLY the hair materials, so render_compare between hairColorMix 0 and 1
+ *  yields the exact set of pixels where hair reaches the screen:
+ *    render_compare preset=fullbody
+ *      A {look:{hairColorMix:0}}  B {look:{hairColorMix:1,hairColor:0xff0000}}
+ *  Hand-rolled Playwright A/Bs CANNOT do this: the hair is physics-animated and
+ *  keeps moving between shots, and injecting taaSettle:0 (needed for live
+ *  material edits to appear) disables the determinism latch. Two "identical"
+ *  renders differed by 134,920 px that way — larger than any effect measured.
+ *  What IS fixed and verified: the mipmap exclusion below — alpha-shaped
+ *  textures must not be mip-filtered, confirmed at texture level and by GPU A/B. */
 
 /**
  * VRM (.vrm) viewer — a drop-in alternative to the Live2D / MMD canvas, used when
@@ -194,6 +234,8 @@ const LOOK = {
   subSat: 0.5, // サブ彩度 (0.5 neutral) for the replacement colour
   subVal: 0.6, // サブ明度 (0.5 neutral) for the replacement colour
   outlineWidth: 1, // 輪郭太さ scale on the authored outlineWidthFactor (body/clothes only — hair/face are authored "none")
+  // (see SCREEN_OUTLINE below — outlineWidth is now a multiplier on a SCREEN-space
+  //  width with a sub-pixel floor, not on a width in metres)
   outlineColor: -1, // 輪郭色: -1 = authored outlineColorFactor, else hex override
   outlineMix: -1, // 輪郭ライト混合: -1 = authored outlineLightingMixFactor, else 0..1 (0 = flat colour, msTC-like)
   outlineAll: 0, // 1 = show the runtime-generated hair/face outlines too (MMD標準エッジ相当; the msTC Edge stage outlines everything)
@@ -280,7 +322,338 @@ const LOOK = {
 
 // Build stamp shown in the 🎨 panel title + console — instantly tells whether
 // the client is running the latest deployed bundle.
+/**
+ * Outline width in SCREEN space, and the floor it may not go below.
+ *
+ * The model authors its outline in `worldCoordinates` — a width in METRES — and
+ * that is what made it flicker. Measured on this scene: the character covers
+ * 1115 px/m, the authored factor is 0.00048 m, the runtime-generated ones were
+ * 0.0012 (body) / 0.0004 (face), and `LOOK.outlineWidth` (0.4 in the shipping
+ * preset) scales them:
+ *
+ *     0.0012 * 1115 * 0.4 = 0.54 px        0.0004 * 1115 * 0.4 = 0.18 px
+ *
+ * Every outline in the scene was thinner than one pixel. Painting the outline
+ * pure red and counting it in isolation: only 71% of its pixels reached full
+ * coverage — the other 29% were partial — and the line was ENTIRELY ABSENT from
+ * ~325 of the 1559 rows it should occupy. A line missing from a fifth of its own
+ * length, half-covering a third of the pixels it does reach, appears and
+ * disappears per pixel as she moves. That is the reported ギザギザ / ちらつき.
+ *
+ * It is NOT the GPU, and not a resolution problem: with the clock frozen the
+ * renderer reproduces a frame to 0.000% (scripts/render-metrics.mjs --static).
+ * Supersampling hid it; this fixes it.
+ *
+ * `screenCoordinates` removes the cause: the width stops depending on camera
+ * distance, so it cannot thin out when she stands back. Values calibrated
+ * against the same measurement — 0.002 matched worldCoordinates at multiplier
+ * 1.0 (77% vs 79% full coverage, 1525 vs 1559 rows), i.e. the look this was
+ * tuned for.
+ *
+ * WIDTH IS AN ART DECISION, AND IT IS NOT MINE. Measured, at multiplier 0.4:
+ *
+ *     factor   full coverage   rows carrying the line   (1544 = none missing)
+ *     0.0006        72%              1284               <- the original look
+ *     0.0010        76%              1486
+ *     0.0015        79%              1544               <- thinnest with none missing
+ *     0.0018        81%              1544
+ *
+ * `body` is set so the shipping multiplier lands on 0.0006: the thin line this
+ * was tuned for, restored on request. That width still leaves ~260 rows without
+ * a line, so some shimmer remains — it is the same trade the original made, made
+ * knowingly this time. For the thinnest width with NO dropout, use 0.00375 here
+ * (0.0015 after the 0.4 multiplier).
+ *
+ * What screenCoordinates buys even at this width: the line no longer thins as
+ * the camera pulls back, so it cannot get WORSE with distance the way the
+ * metres-based version did.
+ *
+ * `min` only stops a preset going below what was asked for here.
+ */
+const SCREEN_OUTLINE = { body: 0.0015, face: 0.0005, min: 0.0006 };
+
 const LOOK_BUILD = "r26"; // r26: video preset cool rim (warmColor 0x9fd8ff, subInt 1.2)
+
+/**
+ * One-time migration of individual grade keys onto an already-saved look.
+ *
+ * Editing LOOK_PRESETS does not reach anyone who already has a look in
+ * localStorage: the loader below keeps a saved look verbatim while `_build`
+ * matches, which is the normal case. Bumping LOOK_BUILD would deliver it by
+ * throwing away the WHOLE saved look — every 🎨 tweak with it. This carries over
+ * only the listed keys.
+ *
+ * Stamped and saved immediately on apply, so it runs once and a later hand-tune
+ * of the same key sticks instead of being reverted on the next reload. Bump the
+ * rev (and edit the values) only for another correction of the same kind.
+ *
+ * rev 1: gSplit 0.25 -> 0.15. Reverted at the user's request — trading the
+ * preset's cast away for hem accuracy was the wrong axis; rev 2 puts it back.
+ * rev 2: gSplit back to 0.25.
+ * rev 3: gSat 1.32 -> 1.15 (see the preset note), gSplit 0.25 kept in the fix so
+ * a browser that only ever saw rev 1 converges to the same end state.
+ */
+const GRADE_REV = 3;
+const GRADE_FIX: Partial<typeof LOOK> = { gSat: 1.15, gSplit: 0.25 };
+
+/**
+ * Alpha dilation ("alpha bleeding") for alpha-TESTED textures.
+ *
+ * q3.png — the printed circuit pattern on the sleeves and skirt — keeps its shape
+ * entirely in the ALPHA channel. Its RGB channel outside that shape was never
+ * cleaned: the top half is random static and the bottom half is a flat, fully
+ * saturated cyan #16fffd. Byte-identical to the source MMD model's own
+ * tex/q3.png (sha1 ac51cbe239de), so this is authoring debris everyone inherits,
+ * not something the PMX->VRM conversion did.
+ *
+ * MMD never shows it because MMD does not mip model textures. We do, and the two
+ * do not compose: mip generation box-filters RGB *and* alpha together, so
+ * minified texels get an averaged alpha that can cross q301/q302's alphaTest of
+ * 0.5 while their averaged RGB has been dragged toward that cyan fill. The
+ * survivors are drawn at FULL opacity (alphaMode MASK does not blend), which is
+ * the cyan outline around every white speck on the skirt and sleeves — the
+ * 「白い斑点をふちどるように水色が入ってる」 report. Simulated against the GPU's own
+ * box filter, the surviving texels run #d9dcec (cyan-ness +10.9) at mip 0 to
+ * #b3dfeb (+50.7) at mip 3. 1,467,047 of the texture's 1,478,647 cyan texels sit
+ * below the cutoff and are never meant to be rasterised at all.
+ *
+ * The fix is to give the invisible texels the colour of the artwork nearest them,
+ * so averaging them in pulls in that artwork rather than the fill. THE ALPHA
+ * CHANNEL IS NOT TOUCHED — silhouette, cutoff and antialiasing come out bit for
+ * bit identical, and mip-mapped minification stays on, so the trim-line jaggies
+ * this replaced stay fixed. It is a repair of data that should never have been
+ * visible, not a change to the character's look.
+ *
+ * Fills by pyramid rather than by iterated 1-texel dilation: a 2048² texture that
+ * is 70% transparent needs a radius in the tens of texels, which is hundreds of
+ * passes over 4.2M texels. Level 0 is read straight from the ImageData, so only
+ * the 1024² level and smaller ever get their own buffer (~21MB, transient).
+ *
+ * Returns the number of texels filled, or 0 if there was nothing to do.
+ */
+/**
+ * Keyed on THREE.Source, not on the texture and not on the decoded image.
+ *
+ * The alpha-tested materials expose 42 texture slots over 30 distinct Texture
+ * objects — but only SIX distinct Sources: `map` and `shadeMultiplyTexture`, the
+ * base material and its generated `(Outline)` twin, and all eleven materials over
+ * the face atlas share their pixels. Keying per texture ran the 3.8M-texel pass
+ * 26 times and put 3.7s on model load.
+ *
+ * Source is also what makes one write enough: `Texture.image` is an accessor for
+ * `Texture.source.data`, so assigning the dilated canvas once hands it to every
+ * texture that shares the Source.
+ */
+const DILATED_SOURCES = new WeakMap<object, HTMLCanvasElement>();
+
+/**
+ * Coverage-preserving mip chain for a texture whose SHAPE lives in its alpha.
+ *
+ * A box filter conserves the MEAN alpha but not the solid core: measured on
+ * q3.png — the sleeve/skirt speck print — the fully opaque fraction runs
+ * 3.49% at mip 0, 1.64% at mip 3, 0.82% at mip 4 and 0.00% at mip 5, while the
+ * mean sits at 31.7 the whole way down. So at any distance the specks stop being
+ * solid and the hair behind the panel starts showing through them, which is what
+ * 「髪の毛の透過処理が腕の斑点に残ってる」 is. Nothing about the render is wrong;
+ * the prefilter simply cannot keep a sub-texel mark opaque.
+ *
+ * The standard answer (NVIDIA's alpha-test coverage rescale, Unity's "Preserve
+ * Coverage") is to rebuild each level's alpha so the fraction of texels at or
+ * above a solidity threshold matches level 0. Same family as the dilation above:
+ * repair the DATA so the ordinary mip path is correct, instead of special-casing
+ * the material or turning the prefilter off and taking the shimmer back.
+ *
+ * RGB is carried through the box filter untouched — only alpha is rescaled — so
+ * colour, and the dilation already applied to it, are unaffected.
+ */
+const COVERAGE_MIPPED = new WeakSet<object>();
+
+/** Greyscale shade-multiply copies for the print panels — see _printPanel. */
+const GREY_SHADE_TEX = new WeakMap<object, any>();
+
+function buildCoverageMips(tex: any, solid = 250): number {
+  const src = tex?.image;
+  const w0 = src?.width | 0;
+  const h0 = src?.height | 0;
+  if (!w0 || !h0 || (w0 & (w0 - 1)) !== 0 || (h0 & (h0 - 1)) !== 0) return 0;
+  const key = tex.source ?? src;
+  if (COVERAGE_MIPPED.has(key)) return 0;
+  try {
+    const cv0 = document.createElement("canvas");
+    cv0.width = w0; cv0.height = h0;
+    const cx0 = cv0.getContext("2d", { willReadFrequently: true });
+    if (!cx0) return 0;
+    cx0.drawImage(src, 0, 0, w0, h0);
+    let cur = cx0.getImageData(0, 0, w0, h0).data;
+    let w = w0, h = h0;
+
+    // Solve the gain from an alpha HISTOGRAM instead of bisecting on it: the
+    // fraction at or above `solid` after scaling by k is just the fraction at or
+    // above solid/k before it, so the needed threshold can be read straight off
+    // the suffix sums. Bisection re-scanned 4.2M texels 24 times per level and
+    // put 4.1s on model load.
+    const fracAtLeast = (data: Uint8ClampedArray, n: number) => {
+      const hist = new Uint32Array(256);
+      for (let i = 3; i < data.length; i += 4) hist[data[i]]++;
+      const suffix = new Float64Array(257);
+      for (let a = 255; a >= 0; a--) suffix[a] = suffix[a + 1] + hist[a];
+      return (a: number) => suffix[Math.max(0, Math.min(256, a))] / n;
+    };
+    const target = fracAtLeast(cur, w0 * h0)(solid);
+    if (target <= 0) return 0;
+
+    const mips: HTMLCanvasElement[] = [cv0];
+    while (w > 1 || h > 1) {
+      const nw = Math.max(1, w >> 1);
+      const nh = Math.max(1, h >> 1);
+      const next = new Uint8ClampedArray(nw * nh * 4);
+      for (let y = 0; y < nh; y++) {
+        const y0 = y * 2, y1 = Math.min(y * 2 + 1, h - 1);
+        for (let x = 0; x < nw; x++) {
+          const x0 = x * 2, x1 = Math.min(x * 2 + 1, w - 1);
+          const o = (y * nw + x) * 4;
+          const a = (y0 * w + x0) * 4, b = (y0 * w + x1) * 4;
+          const c = (y1 * w + x0) * 4, d = (y1 * w + x1) * 4;
+          for (let ch = 0; ch < 4; ch++) {
+            next[o + ch] = (cur[a + ch] + cur[b + ch] + cur[c + ch] + cur[d + ch]) / 4;
+          }
+        }
+      }
+      const at = fracAtLeast(next, nw * nh);
+      let a0 = 255;
+      while (a0 > 1 && at(a0) < target) a0--;
+      const k = Math.min(64, Math.max(1, solid / a0));
+
+      // Rescale a COPY. Feeding the boosted alpha into the next level compounds
+      // the gain — measured on q3.png, the stored mean ran 31.7 -> 47.4 by mip 4
+      // and 69.7 by mip 6 instead of 45.0 / 62.6. The chain has to keep filtering
+      // the honest box result; only what is uploaded gets the coverage fix.
+      const store = new Uint8ClampedArray(next);
+      if (k > 1.0001) for (let i = 3; i < store.length; i += 4) store[i] = Math.min(255, store[i] * k);
+
+      const cv = document.createElement("canvas");
+      cv.width = nw; cv.height = nh;
+      const cx = cv.getContext("2d");
+      if (!cx) break;
+      cx.putImageData(new ImageData(store, nw, nh), 0, 0);
+      mips.push(cv);
+      cur = next; w = nw; h = nh;
+    }
+    tex.mipmaps = mips;
+    tex.generateMipmaps = false;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.needsUpdate = true;
+    COVERAGE_MIPPED.add(key);
+    return mips.length;
+  } catch {
+    return 0;
+  }
+}
+
+function dilateAlphaTexture(tex: any, cutoff: number): number {
+  const src = tex?.image;
+  const w = src?.width | 0;
+  const h = src?.height | 0;
+  if (!w || !h) return 0;
+  // Every alphaTest material on this model shares one cutoff (0.5), and no
+  // alpha-tested Source is also used by a material that ignores alpha, so a
+  // single cached result is correct for all of them.
+  const key = tex.source ?? src;
+  if (DILATED_SOURCES.has(key)) return 0; // the Source already holds the canvas
+  try {
+    const cv = document.createElement("canvas");
+    cv.width = w;
+    cv.height = h;
+    const cx = cv.getContext("2d", { willReadFrequently: true });
+    if (!cx) return 0;
+    cx.drawImage(src, 0, 0, w, h);
+    const id = cx.getImageData(0, 0, w, h);
+    const px = id.data;
+
+    // SEED ON FULL OPACITY, not on the alphaTest cutoff.
+    //
+    // Seeding at the cutoff repairs only what is discarded, and that is not where
+    // the visible fringe lives: the texels at alpha 128..249 are DRAWN (MASK does
+    // not blend, so they go down at full opacity) and they were already composited
+    // against the cyan fill when the texture was authored. Measured over q3.png's
+    // 218,835 such texels — the edge of every white speck — #c5eafc, cyan-ness
+    // +46.4, and a cutoff-seeded fill leaves that untouched at +46.4. Seeding on
+    // full opacity instead carries the artwork's own colour into them: #e6ecfc,
+    // +14.2.
+    //
+    // Still nothing but colour: the alpha channel is untouched either way, so the
+    // silhouette and its antialiasing are unchanged and only the tint under the
+    // edge moves.
+    const OPAQUE = 250;
+    let seeds = 0;
+    for (let i = 3; i < px.length; i += 4) if (px[i] >= OPAQUE) seeds++;
+    // Fall back to the cutoff if the texture has no fully opaque texel at all,
+    // so a soft-edged mask still gets *some* repair rather than none.
+    const T = seeds > 0 ? OPAQUE : Math.max(1, Math.min(255, Math.round(cutoff * 255)));
+
+    // Pyramid of alpha-gated colour sums: [r, g, b, count] per texel.
+    const levels: { w: number; h: number; d: Float32Array }[] = [];
+    let lw = Math.max(1, w >> 1);
+    let lh = Math.max(1, h >> 1);
+    {
+      const d = new Float32Array(lw * lh * 4);
+      for (let y = 0; y < h; y++) {
+        const oy = Math.min(lh - 1, y >> 1) * lw;
+        for (let x = 0; x < w; x++) {
+          const s = (y * w + x) * 4;
+          if (px[s + 3] < T) continue; // only FULLY OPAQUE texels seed the fill
+          const o = (oy + Math.min(lw - 1, x >> 1)) * 4;
+          d[o] += px[s]; d[o + 1] += px[s + 1]; d[o + 2] += px[s + 2]; d[o + 3] += 1;
+        }
+      }
+      levels.push({ w: lw, h: lh, d });
+    }
+    while (lw > 1 || lh > 1) {
+      const p = levels[levels.length - 1];
+      const nw = Math.max(1, p.w >> 1);
+      const nh = Math.max(1, p.h >> 1);
+      const d = new Float32Array(nw * nh * 4);
+      for (let y = 0; y < p.h; y++) {
+        const oy = Math.min(nh - 1, y >> 1) * nw;
+        for (let x = 0; x < p.w; x++) {
+          const s = (y * p.w + x) * 4;
+          if (p.d[s + 3] === 0) continue;
+          const o = (oy + Math.min(nw - 1, x >> 1)) * 4;
+          d[o] += p.d[s]; d[o + 1] += p.d[s + 1]; d[o + 2] += p.d[s + 2]; d[o + 3] += p.d[s + 3];
+        }
+      }
+      levels.push({ w: nw, h: nh, d });
+      lw = nw;
+      lh = nh;
+    }
+
+    let filled = 0;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const s = (y * w + x) * 4;
+        if (px[s + 3] >= T) continue;
+        for (let l = 0; l < levels.length; l++) {
+          const L = levels[l];
+          const o = (Math.min(L.h - 1, y >> (l + 1)) * L.w + Math.min(L.w - 1, x >> (l + 1))) * 4;
+          const n = L.d[o + 3];
+          if (n === 0) continue; // nothing visible at this scale — go coarser
+          px[s] = L.d[o] / n;
+          px[s + 1] = L.d[o + 1] / n;
+          px[s + 2] = L.d[o + 2] / n;
+          filled += 1;
+          break;
+        }
+      }
+    }
+    if (!filled) return 0;
+    cx.putImageData(id, 0, 0);
+    DILATED_SOURCES.set(key, cv);
+    tex.image = cv; // === tex.source.data, so every sharer gets it too
+    return filled;
+  } catch {
+    return 0; // a tainted or unreadable image must not break model loading
+  }
+}
 
 // Skin materials on this model — kept off the sublight + given a warm floor.
 const SKIN_MATS = /^(body01|face01|face02)$/i;
@@ -481,7 +854,13 @@ const LOOK_PRESETS: Record<string, Partial<typeof LOOK>> = {
     // Grade: the reference's vivid look — contrast + saturation up, blue-violet
     // shadow lift (tints the achromatic cloth shadows), split-tone, vignette.
     gContrast: 1.25,
-    gSat: 1.32,
+    // Was 1.32. At 1.32 the grade amplifies any faint hue the shading leaves on
+    // near-white surfaces — the skirt hem's mint crushed to R=0 (hue error 46%)
+    // and the sleeve prints flipped cyan in shade — and it does so on top of the
+    // uWarm cast, so no single other knob could pull it back. 1.15 keeps the
+    // vivid reading (measured: white cloth hue error 16.3% -> 13.8%, hem
+    // 46.1% -> 27.5%) while the blue-violet convergence stays.
+    gSat: 1.15,
     // 実測: 服の「白」は #B1A8D3 のラベンダー — 画面全体を青紫に収束させる
     // グレード (白→薄紫、G を沈めて B を持ち上げ)
     gWarmR: 0.84,
@@ -591,6 +970,7 @@ const GradeShader = {
     "    c += ( n - 0.5 ) * uGrain;\n" +
     "  }\n" +
     "  c = clamp( c, 0.0, 1.0 );\n" +
+
     "  if ( uBars > 0.0001 && ( vUv.y < uBars || vUv.y > 1.0 - uBars ) ) c = vec3( 0.0 );\n" + // letterbox
     "  gl_FragColor = vec4( c, t.a );\n" +
     "}",
@@ -654,6 +1034,7 @@ const LineShader = {
 // GLSL for the fresnel + non-mixing dual sublight (cyan left / magenta right)
 // and the msTC (msToonCoordinator) colour-coordination uniforms + HSV helpers.
 const SUB_DECLS =
+  "uniform float uIdMode;\nuniform vec3 uMatId;\n" +
   "uniform float uFresInt;\nuniform float uFresPow;\nuniform vec3 uFresColor;\n" +
   "uniform float uSubInt;\nuniform float uSubPow;\nuniform float uSubMix;\n" +
   "uniform float uSubIntCool;\nuniform float uSubIntWarm;\n" +
@@ -801,6 +1182,15 @@ const BLACK_TEX = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
 BLACK_TEX.needsUpdate = true;
 
 const makeSubUniforms = () => ({
+  // MATERIAL ID PASS. uIdMode 1 makes the fragment emit uMatId flat, bypassing
+  // every shading and msTC stage. It exists because identifying which material
+  // draws a given pixel by hiding meshes one at a time does not survive this
+  // scene: spring-bone physics and the TAA history drift between captures, and
+  // recolouring materials from the JS side is overwritten by the msTC injection
+  // further down. Driven by __vrmIdMode(); also the hook a per-material grade
+  // mask would render through.
+  uIdMode: { value: 0 },
+  uMatId: { value: new THREE.Color(0, 0, 0) },
   uFresInt: { value: LOOK.fresInt },
   uFresPow: { value: LOOK.fresPow },
   uFresColor: { value: new THREE.Color(LOOK.fresColor) },
@@ -946,7 +1336,7 @@ const injectSublight = (m: any) => {
         "#ifndef OUTLINE\n"
           // msTC v2.1 SSS: warm red band on the light/shade terminator.
           + "if ( uSssInt > 0.001 ) col = mix( col, col * vec3( 1.32, 0.72, 0.68 ), clamp( mstcBorder, 0.0, 1.0 ) * uSssInt );\n"
-          + `${subEffect("col")}\n#endif\ncol += totalEmissiveRadiance;`,
+          + `${subEffect("col")}\n#endif\ncol += totalEmissiveRadiance;\nif ( uIdMode > 0.5 ) col = uMatId;`,
       );
     m.needsUpdate = true;
     m._subInjected = true;
@@ -972,7 +1362,7 @@ const injectSublight = (m: any) => {
         .replace("#include <common>", SUB_DECLS + "#include <common>")
         .replace(
           "#include <opaque_fragment>",
-          `${subEffect("outgoingLight")}\n#include <opaque_fragment>`,
+          `${subEffect("outgoingLight")}\nif ( uIdMode > 0.5 ) { outgoingLight = uMatId; diffuseColor.a = 1.0; }\n#include <opaque_fragment>`,
         );
     };
     m.needsUpdate = true;
@@ -980,6 +1370,48 @@ const injectSublight = (m: any) => {
 };
 
 export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
+  // These panels are built as raw DOM, outside React, so react-i18next never sees
+  // them and a language switch cannot re-render them. `L` picks the string at
+  // build time from the same language the app is set to; the panels are rebuilt
+  // when the model binds, which is when a switch takes effect.
+  const uiLang = (() => {
+    try {
+      return (localStorage.getItem('i18nextLng') || navigator.language || 'ja').toLowerCase();
+    } catch { return 'ja'; }
+  })();
+  // Read the language at CALL time, not once at mount. The panels are built on
+  // mount, so a value captured here would freeze whatever language was active
+  // then and never follow the app's language selector.
+  const isJa = (): boolean => {
+    try {
+      return (localStorage.getItem('i18nextLng') || navigator.language || uiLang)
+        .toLowerCase().startsWith('ja');
+    } catch { return uiLang.startsWith('ja'); }
+  };
+  const L = (ja: string, en: string): string => (isJa() ? ja : en);
+  /**
+   * Set a label AND remember both wordings on the element, so a later language
+   * change can re-render it in place — the panels themselves are never rebuilt.
+   */
+  const SET = (el: HTMLElement, ja: string, en?: string): void => {
+    el.dataset.ja = ja;
+    if (en !== undefined) el.dataset.en = en;
+    el.textContent = en !== undefined ? L(ja, en) : TX(ja);
+  };
+  /** Re-render every remembered label. Runs whenever a panel is opened. */
+  const retranslate = (root: HTMLElement | null): void => {
+    root?.querySelectorAll<HTMLElement>('[data-ja]').forEach((el) => {
+      const ja = el.dataset.ja as string;
+      el.textContent = el.dataset.en !== undefined ? L(ja, el.dataset.en) : TX(ja);
+    });
+  };
+  /** Label text only — never a lookup key. Unknown strings pass through. */
+  const TX = (ja: string): string =>
+    (isJa() ? ja : ((UI_LABELS as Record<string, string>)[ja] ?? ja));
+  // Mixer for a model's OWN embedded idle clip (Chancelor ships
+  // Female_Animation_Idle). Only created for models that both have such a clip
+  // and are not driven by the KAWAII idle library.
+  const idleMixerRef = useRef<THREE.AnimationMixer | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const { aiState } = useAiState();
 
@@ -999,8 +1431,44 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     let vrm: VRM | null = null;
     let disposeFacePanel: (() => void) | null = null;
     let disposeLookPanel: (() => void) | null = null;
+    let disposeFaceMotionPanel: (() => void) | null = null;
+
+    /**
+     * Drop the stylised look for models it was not designed for.
+     *
+     * Everything in LOOK — the cyan/magenta rim light, the line art, the toon
+     * banding, the saturated purple-lifted grade — was dialled in against Miku,
+     * a toon character. Applied unchanged to a photoreal avatar it reads as a
+     * fault rather than a style: the first .glb loaded came out violet with a
+     * cyan edge glow.
+     *
+     * Implemented as a READ-TIME override rather than by writing LOOK, and that
+     * distinction matters: LOOK is persisted to localStorage and carries a lot
+     * of hand-tuning, so mutating it for one model would quietly destroy the
+     * other's look the moment anything called saveLook().
+     */
+    let plainStyle = false;
+    const fx = <T,>(styled: T, neutral: T): T => (plainStyle ? neutral : styled);
 
     const scene = new THREE.Scene();
+    /**
+     * The world-matrix walk is driven BY HAND, once a frame, not by every render.
+     *
+     * `renderer.render()` begins with `scene.updateMatrixWorld()`, and this frame
+     * makes six render calls (panel backdrop, ink-line normals, TAA velocity, the
+     * composer's own pass, GTAO's depth/normal pre-pass, DOF's depth pass). That
+     * walk is not conditional in any useful sense: `updateMatrix()` runs
+     * unconditionally wherever `matrixAutoUpdate` is on, and it re-arms
+     * `matrixWorldNeedsUpdate`, so each of the six recomposed and re-multiplied
+     * every one of the ~1150 nodes in this scene. Profiling put matrix work at
+     * 34% of all CPU time — the single largest item in the frame, ahead of the
+     * physics.
+     *
+     * Nothing writes a transform between the second walk and the last render, so
+     * two explicit walks reproduce the six exactly: one inside the panels module
+     * before its backdrop render, one here after the environment has moved.
+     */
+    scene.matrixWorldAutoUpdate = false;
     const camera = new THREE.PerspectiveCamera(
       30,
       Math.max(container.clientWidth, 1) / Math.max(container.clientHeight, 1),
@@ -1010,7 +1478,18 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     camera.position.set(0, 1.05, 2.4);
     camera.lookAt(0, 0.98, 0);
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    // antialias:false is NOT a quality decision — the default framebuffer never
+    // receives geometry. Every pass renders into a composer target (the scene
+    // side carries its own MSAA), and the only thing ever drawn to the screen
+    // buffer is SMAAPass's final fullscreen quad, which has no interior edges
+    // for MSAA to find. Asking for it allocated a multisampled backbuffer and
+    // paid a resolve blit every frame for an effect that cannot exist.
+    // alpha stays: the canvas is composited over the container's CSS gradient.
+    const renderer = new THREE.WebGLRenderer({
+      antialias: false,
+      alpha: true,
+      powerPreference: "high-performance",
+    });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // cap for FPS on hi-DPI
     renderer.setSize(container.clientWidth, container.clientHeight);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -1018,6 +1497,15 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     // the MMD viewer's effect stack. OutputPass applies the tone map at the end.
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // The shadow map is re-rendered by EVERY renderer.render() whose camera can
+    // see the key light — and this frame makes several: the TAA velocity pass,
+    // the ink-line normal pre-pass, and the composer's own RenderPass. That is
+    // two or three full re-renders of a 4096x4096 PCF-soft map per frame, all
+    // producing the identical result because the pose does not change between
+    // them. Driven by hand instead: `needsUpdate` is set once per frame,
+    // immediately before the pass whose output is actually seen.
+    renderer.shadowMap.autoUpdate = false;
+    renderer.shadowMap.needsUpdate = true;
     const TONE_MODES = [
       THREE.NoToneMapping,
       THREE.ACESFilmicToneMapping,
@@ -1126,10 +1614,37 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     // reflection all need the ground in shot). No-op in a normal browser, so the
     // desktop framing is untouched. Runs AFTER init so the saved SPACE values
     // (loaded there) are the ones applied.
-    const disposeAutoHide = installAutoHide();
+    // (auto-hide is installed once by App.tsx — the arrows it fades exist in
+    // every model mode, and two install sites raced on model switch.)
     const framing = createFraming(camera, controls);
     const bodyDepth = createBodyDepth();
+    /**
+     * Take the framing range from the CHARACTER, not from a constant.
+     *
+     * The solver frames `fitBottomY..fitTopY`, and that top was 1.65 — Miku's
+     * height in this scene, hard-coded while she was the only 3D model. The
+     * first 1.80 m avatar was therefore framed as if it were 1.65 m and lost its
+     * head off the top edge. Measuring the loaded model makes the crop correct
+     * for whatever is standing there.
+     *
+     * Uses the world bounding box rather than the head bone: hair, ears and
+     * headgear all sit outside the skeleton, and it is the silhouette that gets
+     * cropped, not the bone.
+     */
+    const measureFitRange = () => {
+      if (!SPACE.fitAutoHeight || !vrm?.scene) return;
+      vrm.scene.updateWorldMatrix(true, true);
+      const box = new THREE.Box3().setFromObject(vrm.scene);
+      if (!box.isEmpty()) {
+        const h = box.max.y - box.min.y;
+        if (h > 0.2 && h < 5) {
+          SPACE.fitBottomY = Math.min(0, box.min.y);
+          SPACE.fitTopY = box.max.y + h * SPACE.fitHeadroom;
+        }
+      }
+    };
     const applyFraming = () => {
+      measureFitRange();
       framing.apply();
       setBgGrad(LOOK.bgInner, LOOK.bgOuter); // re-evaluates SPACE.backdrop
     };
@@ -1325,6 +1840,11 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       freeze: () => aiDebug.freeze(),
       play: () => aiDebug.play(),
       setTime: (sec: number) => aiDebug.setTime(sec),
+      // Advance by exactly one rendered frame. Use this, not setTime, whenever
+      // what is being measured has state that survives a frame — the temporal
+      // resolve does. See the note on stepFrame() in ai-debug.ts.
+      stepFrame: () => aiDebug.stepFrame(),
+      endStep: () => aiDebug.endStep(),
       ready: () => aiDebug.ready(),
       setSeed: (seed: number | null) => aiDebug.setSeed(seed),
       suppressGrain: (on = true) => aiDebug.suppressGrain(on),
@@ -1360,11 +1880,89 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         if (!p) return { error: `unknown hud preset "${name}"`, available: Object.keys(presets) };
         Object.assign(SPACE, p);
         neuralSpace.rebuild();
+        // rebuild() replaces the environment wholesale, so the temporal history
+        // describes geometry that no longer exists. Same reasoning as
+        // setCameraPreset: tests call this after the scene has already settled.
+        taa.reset();
         return { preset: name, ...neuralSpace.describe() };
       },
+      // Reproducible arbitrary view — a drag-orbit is not, so any A/B that
+      // compares two runs frame-by-frame has to place the camera this way.
+      setCamera: (pos: number[], target: number[]) => aiDebug.setCamera(pos, target),
+      // The live camera object itself, for probes that must project a world
+      // point (a bone) to screen pixels in the same frame they measure — a
+      // per-frame round trip through getSceneInfo() cannot do that.
+      camera: () => camera,
+      // WHICH BONE OWNS THIS PIXEL — the instrument that separates "the shading
+      // changed" from "a different surface won the depth test". Paints every
+      // fragment by the class of its dominant skinning bone: red = hand/fingers,
+      // green = skirt panels, blue = everything else. Two surfaces that
+      // interpenetrate produce SPECKLE (isolated red inside green and vice
+      // versa) which no amount of legitimate motion can create — a clean moving
+      // silhouette has a clean boundary. Counting that speckle is a direct,
+      // motion-immune measure of cloth-vs-body punch-through.
+      classPass: (on: boolean = true) => {
+        if (!on) {
+          scene.overrideMaterial = null;
+          return { classPass: false };
+        }
+        let skel: THREE.Skeleton | null = null;
+        scene.traverse((o) => {
+          const m = o as THREE.SkinnedMesh;
+          if (!skel && m.isSkinnedMesh && m.skeleton) skel = m.skeleton;
+        });
+        if (!skel) return { error: "no skeleton" };
+        const bones = (skel as THREE.Skeleton).bones;
+        const data = new Uint8Array(bones.length * 4);
+        let nHand = 0; let nSkirt = 0;
+        bones.forEach((b, i) => {
+          let v = 255; // other
+          if (/手首|指/.test(b.name)) { v = 0; nHand += 1; } // hand + fingers
+          else if (/^スカート/.test(b.name)) { v = 128; nSkirt += 1; }
+          data[i * 4] = v;
+          data[i * 4 + 3] = 255;
+        });
+        const tex = new THREE.DataTexture(data, bones.length, 1, THREE.RGBAFormat);
+        tex.minFilter = THREE.NearestFilter;
+        tex.magFilter = THREE.NearestFilter;
+        tex.needsUpdate = true;
+        scene.overrideMaterial = new THREE.ShaderMaterial({
+          uniforms: { uClass: { value: tex }, uCount: { value: bones.length } },
+          vertexShader:
+            "#include <common>\n#include <skinning_pars_vertex>\n"
+            + "uniform sampler2D uClass;\nuniform float uCount;\nvarying float vClass;\n"
+            + "void main() {\n#include <begin_vertex>\n#include <skinbase_vertex>\n"
+            + "  vClass = 1.0;\n"
+            + "  #ifdef USE_SKINNING\n"
+            + "    float bi = skinIndex.x; float bw = skinWeight.x;\n"
+            + "    if (skinWeight.y > bw) { bw = skinWeight.y; bi = skinIndex.y; }\n"
+            + "    if (skinWeight.z > bw) { bw = skinWeight.z; bi = skinIndex.z; }\n"
+            + "    if (skinWeight.w > bw) { bw = skinWeight.w; bi = skinIndex.w; }\n"
+            + "    vClass = texture2D(uClass, vec2((bi + 0.5) / uCount, 0.5)).r;\n"
+            + "  #endif\n"
+            + "#include <skinning_vertex>\n"
+            + "  gl_Position = projectionMatrix * modelViewMatrix * vec4(transformed, 1.0);\n"
+            + "  gl_PointSize = 1.0;\n}",
+          fragmentShader:
+            "varying float vClass;\nvoid main() {\n"
+            + "  vec3 c = vec3(0.0, 0.0, 1.0);\n"
+            + "  if (vClass < 0.25) c = vec3(1.0, 0.0, 0.0);\n"
+            + "  else if (vClass < 0.75) c = vec3(0.0, 1.0, 0.0);\n"
+            + "  gl_FragColor = vec4(c, 1.0);\n}",
+        });
+        return { classPass: true, bones: bones.length, handBones: nHand, skirtBones: nSkirt };
+      },
+      // The flash black-box: press "9" the moment the artefact is visible and
+      // the last ~1.2s of frames upload to the server's cache/flash/ drop-box.
+      flashDump: () => flashRecorder.dump(),
       ndcBounds: (prefix: string) => aiDebug.ndcBounds(prefix),
       getSceneInfo: () => aiDebug.getSceneInfo(),
       getRendererInfo: () => aiDebug.getRendererInfo(),
+      // What a frame COSTS. getRendererInfo() reports draw calls, which do not
+      // move when the render resolution does — so it cannot price the very
+      // changes this surface exists to evaluate.
+      getFrameStats: () => aiDebug.frameStats(),
+      resetFrameStats: () => aiDebug.resetFrameStats(),
       getStats: () => aiDebug.getStats(),
       state: () => aiDebug.state(),
     };
@@ -1428,8 +2026,24 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     const drawW = Math.max(1, Math.floor(container.clientWidth * pixelRatio));
     const drawH = Math.max(1, Math.floor(container.clientHeight * pixelRatio));
     const maxSamples = renderer.capabilities.maxSamples || 8;
-    const aaSamples = Math.min(4, maxSamples);
-    const composer = new EffectComposer(
+    // Was a hard 4. Most desktop GPUs report 8 or 16, and the outline is extruded
+    // GEOMETRY — the one thing MSAA is genuinely good at. Clamped to the driver's
+    // own ceiling, so this is a no-op where 4 really is the maximum.
+    const aaSamples = Math.min(SPACE.msaaSamples || 4, maxSamples);
+    // Internal render scale (TAAU). The SCENE side renders at pixelRatio *
+    // this; the TAA resolve reconstructs full resolution from the jittered
+    // low-res frames, and the post side runs at full res. Only meaningful with
+    // the accumulator running — without it a low-res render is just a stretch,
+    // so taa:0 forces 1.
+    const upscaleNow = () => (taa.enabled()
+      ? Math.min(1, Math.max(0.5, SPACE.taaUpscale ?? 1)) : 1);
+    // THE CHAIN IS SPLIT IN TWO at exactly the TAA seam, because an
+    // EffectComposer ping-pongs two same-sized buffers and can therefore never
+    // change resolution mid-chain. Scene side (this one, possibly low-res):
+    // Render -> linePass -> GTAO. Post side (full-res): TAA bridge -> grade ->
+    // DOF -> bloom -> diffusion -> Output -> SMAA. The TaaResolve sits between
+    // them as a standalone step.
+    const sceneComposer = new EffectComposer(
       renderer,
       new THREE.WebGLRenderTarget(
         Math.max(1, container.clientWidth),
@@ -1437,9 +2051,10 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         { type: THREE.HalfFloatType, samples: aaSamples },
       ),
     );
-    composer.setPixelRatio(pixelRatio);
-    composer.setSize(container.clientWidth, container.clientHeight);
-    composer.addPass(new RenderPass(scene, camera));
+    sceneComposer.renderToScreen = false;
+    sceneComposer.setPixelRatio(pixelRatio * upscaleNow());
+    sceneComposer.setSize(container.clientWidth, container.clientHeight);
+    sceneComposer.addPass(new RenderPass(scene, camera));
     // SSAO supply (msTC folds SvSSAO/ImSSAO into the shade): GTAO contact
     // shading, composited before the grade so its darks pick up the same
     // blue-violet shadow lift as everything else.
@@ -1493,10 +2108,37 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     // linePass MUST be the first needsSwap pass: it samples the depth texture
     // attached to renderTarget2, so it must always WRITE renderTarget1. GTAO
     // (which renders its own depth/normals) composites after it.
-    composer.addPass(linePass);
-    composer.addPass(gtaoPass);
+    sceneComposer.addPass(linePass);
+    sceneComposer.addPass(gtaoPass);
+    // Temporal resolve — the bridge between the two composers. AFTER GTAO (so
+    // it cannot displace linePass from the head of the scene chain) and BEFORE
+    // the grade (its neighbourhood clamp needs a sharp frame, and grain must
+    // never enter the history). History at OUTPUT res, input at scene res.
+    const inW = Math.max(1, Math.floor(container.clientWidth * pixelRatio * upscaleNow()));
+    const inH = Math.max(1, Math.floor(container.clientHeight * pixelRatio * upscaleNow()));
+    const taaResolve = new TaaResolve(drawW, drawH, inW, inH);
+    let taaWasOn = taa.enabled(); // edge-detects __space({taa}) toggles in the loop
+    // Motion vectors for the resolve — a scene pre-pass like normalRT, not a
+    // composer pass, because it renders geometry rather than a fullscreen quad.
+    const taaVelocity = new TaaVelocity(inW, inH);
+    taaResolve.setVelocity(taaVelocity.texture, taaVelocity.rt.depthTexture);
+    const postComposer = new EffectComposer(
+      renderer,
+      new THREE.WebGLRenderTarget(
+        Math.max(1, container.clientWidth),
+        Math.max(1, container.clientHeight),
+        { type: THREE.HalfFloatType }, // no MSAA: this side only composites quads
+      ),
+    );
+    postComposer.setPixelRatio(pixelRatio);
+    postComposer.setSize(container.clientWidth, container.clientHeight);
+    // The bridge pass: copy/sharpen/debug-view, fed each frame with either the
+    // TAA output (full res) or, with taa:0, the scene composer's own result.
+    // The second ctor arg names a texture that does not exist ON PURPOSE —
+    // ShaderPass would otherwise overwrite tDiffuse with its readBuffer.
+    postComposer.addPass(new ShaderPass(taaResolve.copyMat, "tTaaBridge"));
     const gradePass = new ShaderPass(GradeShader);
-    composer.addPass(gradePass); // cool/purple colour grade before bloom
+    postComposer.addPass(gradePass); // cool/purple colour grade before bloom
     // Depth of field — blurs the far hair/edges by distance (focus tracks the model).
     const bokehPass = new BokehPass(scene, camera, {
       focus: 3.0,
@@ -1504,14 +2146,14 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       maxblur: LOOK.dofBlur,
     });
     bokehPass.enabled = LOOK.dofAperture > 0.00001;
-    composer.addPass(bokehPass);
+    postComposer.addPass(bokehPass);
     const bloomPass = new UnrealBloomPass(
       new THREE.Vector2(container.clientWidth, container.clientHeight),
       LOOK.bloomStrength,
       LOOK.bloomRadius,
       LOOK.bloomThreshold,
     );
-    composer.addPass(bloomPass);
+    postComposer.addPass(bloomPass);
     // ikDiffusion analogue: threshold-0 wide soft glow over the whole frame.
     const diffPass = new UnrealBloomPass(
       new THREE.Vector2(container.clientWidth, container.clientHeight),
@@ -1520,9 +2162,18 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       0.0,
     );
     diffPass.enabled = LOOK.diffusion > 0.001;
-    composer.addPass(diffPass);
-    composer.addPass(new OutputPass());
-    composer.addPass(new SMAAPass(container.clientWidth, container.clientHeight));
+    postComposer.addPass(diffPass);
+    postComposer.addPass(new OutputPass());
+    const smaaPass = new SMAAPass(container.clientWidth, container.clientHeight);
+    postComposer.addPass(smaaPass);
+    // SMAA re-decides its edge blends from scratch every frame, which on a
+    // dense moving pattern can flip per frame — a shimmer source that sits
+    // AFTER the temporal resolve and thus outside its reach. It was never
+    // testable in isolation before (every other stage has a LOOK/space knob).
+    (window as any).__smaa = (on: boolean = true) => {
+      smaaPass.enabled = !!on;
+      return { smaa: smaaPass.enabled };
+    };
 
     // View-space rim direction from azimuth (0 = front, +90 = screen-right) +
     // elevation (up/down), in degrees. Default cool -45 / warm +45 reproduce the
@@ -1562,19 +2213,29 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         outline.name = `${m.name} (Outline)`;
         outline.isOutline = true;
         outline.side = THREE.BackSide;
-        outline.outlineWidthMode = "worldCoordinates";
+        // screenCoordinates, NOT worldCoordinates — see SCREEN_OUTLINE below.
+        outline.outlineWidthMode = "screenCoordinates";
         // The face outline must be MUCH thinner — at body thickness it drew a
         // heavy line down the jaw with skin bleeding past it (あごの線が肌色).
         const isFaceOutline = /^face0\d/i.test(m.name);
-        outline.outlineWidthFactor = isFaceOutline ? 0.0004 : 0.0012;
+        outline.outlineWidthFactor = isFaceOutline
+          ? SCREEN_OUTLINE.face
+          : SCREEN_OUTLINE.body;
         outline.outlineColorFactor.setRGB(0.03, 0.02, 0.05);
         outline.userData._genOutline = true;
         outline.userData._genFace = isFaceOutline;
         outline.visible = LOOK.outlineAll >= 0.5;
         mesh.material = [m, outline];
+        // addGroup's `count` is a VERTEX/INDEX count, not a triangle count — the
+        // "/ 3" here drew only a third of the triangles for BOTH the base and
+        // the outline material, i.e. two thirds of the mesh silently vanished.
+        // It never fired on this model (every geometry is indexed, verified via
+        // __vrmMats), but VRMUtils.removeUnnecessaryVertices above can change
+        // indexing and any non-indexed mesh would have hit it. Matches
+        // three-vrm's own _generateOutline.
         const primitiveVertices = geometry.index
           ? geometry.index.count
-          : geometry.attributes.position.count / 3;
+          : geometry.attributes.position.count;
         geometry.addGroup(0, primitiveVertices, 0);
         geometry.addGroup(0, primitiveVertices, 1);
       });
@@ -1633,6 +2294,18 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       // Hair keeps its ORIGINAL texture (#276A91 steel blue = the model's real
       // default). The distributed Pure/Hair.png is #6ABFB0 mint-green — that was
       // the "hair colour looks wrong" culprit, so no pure swap for hair.
+      // q301/q302 — the printed circuit panels. VERIFIED against the UV rather
+      // than guessed this time: 100% of the non-zero texels in Shade/q3.png and
+      // SubLight/q3.png fall inside tex/q3.png's own alpha, so the masks are
+      // authored in exactly this material's UV space. Only the PURE swap is
+      // wrong for it (28.8% overlap), and that is what produced the purple
+      // patches the note above records — so the pure slot stays null.
+      //
+      // What the author painted, by channel: SubLight uses B alone (8.57% of the
+      // sheet) = CANCEL the sublight, and Shade uses G alone (7.62%) = force
+      // highlight. In other words the print is meant to be lit, NOT rimmed — and
+      // running it without the mask is what put a cyan edge on every white speck.
+      [/^q30\d/i, null, "Shade/q3.png", "SubLight/q3.png"],
       [/^Hair01/i, null, "Shade/Hair01.png", "SubLight/Hair01.png"],
       [/^Hair02/i, null, "Shade/Hair02.png", "SubLight/Hair02.png"],
       [/^Hair03/i, null, "Shade/Hair01.png", "SubLight/Hair01.png"],
@@ -1831,6 +2504,38 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
               }
             }
           }
+          // DEPTH WRITE STAYS ON for the translucent layers — see the source
+          // model. Every one of the PMX's 31 materials is authored at diffuse
+          // alpha 1.000; the see-through look comes ENTIRELY from the textures'
+          // alpha channels (q2.png, the sleeve overlay, is 80% partial alpha;
+          // C.png 35%). So each panel is meant to be composited ONCE, exactly as
+          // its texture says. Turning depthWrite off here was tried and made the
+          // coat wash out: with nothing rejecting the layers behind, every
+          // overlapping panel blended again on top of the last and the compound
+          // transparency ate through to the shoulder (「透過しすぎてる」「肩の
+          // ところまで透過している」). Depth write is what keeps it to one blend.
+          //
+          // ...and the outer layers draw AFTER the hair. Both are alpha-blended,
+          // so three.js orders them by mesh-centroid distance — decided by where
+          // a whole twintail averages out, not by what is actually in front at a
+          // given pixel. When that sort put a coat panel first, the panel wrote
+          // depth across its quad and every hair fragment behind it was rejected
+          // and never rasterised: the hair was not see-through, it was ABSENT.
+          // The arm never showed the fault because it is opaque and therefore
+          // already in the framebuffer before any of this
+          // (「腕の描画はうまくいってるんだけど髪の描画だけがうまくいってない」).
+          //
+          // Drawing HAIR FIRST and the panels after — both still writing depth —
+          // is correct in both directions, which is why it beats forcing either
+          // one on top:
+          //   panel nearer -> passes the depth test, blends ONCE over the hair
+          //                   already in the buffer = the hair shows through it,
+          //                   at exactly the texture's alpha (MMD's look)
+          //   hair nearer  -> the panel is depth-rejected there, hair survives
+          // Ordering was the bug; occlusion and blending were both fine.
+          if (m.transparent && !/^Hair0\d/i.test(matName) && mesh.renderOrder < 1) {
+            mesh.renderOrder = 1;
+          }
           // 眉の露出 (前髪透け): Facial (brows/lashes) skips the depth test so it
           // draws over the bangs — the guide's "前髪の影と眉の露出が2D感の要".
           if (/^Facial/i.test(matName)) {
@@ -1886,9 +2591,27 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
             // 一周する太い黒紫のリングに見える (口を開くと口枠が黒い). Hide the
             // outline material AND zero its width — belt and braces.
             if (mouthM && m.isOutline) m.visible = false;
-            if (m.userData._olwBase === undefined) m.userData._olwBase = m.outlineWidthFactor;
-            m.outlineWidthFactor =
+            if (m.userData._olwBase === undefined) {
+              // Convert the AUTHORED outlines too, once. The runtime-generated
+              // ones are already screenCoordinates (generateMissingOutlines);
+              // these came from the VRM in metres and are the ones measured at
+              // 0.53 px. Rebasing here rather than at load keeps the conversion
+              // in one place with the clamp that gives it its point.
+              if (m.outlineWidthMode === "worldCoordinates") {
+                m.outlineWidthMode = "screenCoordinates";
+                m.userData._olwBase = SCREEN_OUTLINE.body;
+                m.needsUpdate = true;
+              } else {
+                m.userData._olwBase = m.outlineWidthFactor;
+              }
+            }
+            const olw =
               m.userData._olwBase * (mouthM ? 0 : m.userData._genFace ? 1 : LOOK.outlineWidth);
+            // Floor, not scale: 0 still means "no outline" (the mouth interior
+            // relies on that), but anything asked to be visible is at least a
+            // pixel wide. A preset is free to want a thin line; it is not free
+            // to want one that only exists on some of its own rows.
+            m.outlineWidthFactor = olw > 0 ? Math.max(olw, SCREEN_OUTLINE.min) : 0;
             if (m.outlineColorFactor?.copy) {
               if (!m.userData._olcBase) m.userData._olcBase = m.outlineColorFactor.clone();
               if (LOOK.outlineColor >= 0) m.outlineColorFactor.set(LOOK.outlineColor);
@@ -1915,15 +2638,15 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
           const u = m.userData?._subU;
           if (!u) return;
           const skinScale = isSkin ? LOOK.skinSub : 1;
-          u.uFresInt.value = LOOK.fresInt * skinScale;
+          u.uFresInt.value = fx(LOOK.fresInt * skinScale, 0);
           u.uFresPow.value = LOOK.fresPow;
           u.uFresColor.value.set(LOOK.fresColor);
-          u.uSubInt.value = LOOK.subInt * skinScale;
+          u.uSubInt.value = fx(LOOK.subInt * skinScale, 0); // the coloured rim
           u.uSubPow.value = LOOK.subPow;
           u.uSubMix.value = LOOK.subMix;
           u.uSubIntCool.value = LOOK.subIntCool;
           u.uSubIntWarm.value = LOOK.subIntWarm;
-          u.uCelBands.value = LOOK.celBands;
+          u.uCelBands.value = fx(LOOK.celBands, 0); // toon banding
           u.uSubCoolColor.value.set(LOOK.coolColor);
           u.uSubWarmColor.value.set(LOOK.warmColor);
           u.uSubCoolDir.value.copy(coolDir);
@@ -1982,6 +2705,14 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
             if (m.map !== want) m.map = want;
           }
           subUList.push(u);
+          if (m.userData._printPanel) {
+            // Print panels: shade stays the authored-luma grey set at load —
+            // 色トレス would re-derive a hue from the albedo and hand the grade
+            // its amplification seed back. Sublight/highlight/fresnel keep
+            // their normal behaviour (measured non-contributors).
+            u.uShadeCoord.value = 0;
+            u.uShadeHueMix.value = 0;
+          }
           if (eyeM || mouthM) {
             // 白目/瞳/HL/口内: keep them completely out of the msTC recolor — no
             // shade derivation, no sublight replacement, no highlight, no fresnel.
@@ -2492,12 +3223,32 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     // bumped to 8: the gest*/ikPelvis* sliders now tune the GESTURELSM set only, and a
     // browser that saved the brief "everything at 1.0" experiment would otherwise keep
     // feeding 1.0 back in and re-break GestureLSM.
-    const LS_LOOK = "vrmLook8";
+    // PER MODEL, not global. One shared key meant tuning Miku's look also changed
+    // Chancelor's — the two are different meshes, materials and proportions, so a
+    // value that flatters one is wrong on the other. Keyed on the model URL's
+    // basename, which is stable and already unique per preset.
+    const modelKey = (url || "unknown")
+      .split("?")[0]
+      .split("/")
+      .pop()!
+      .replace(/\.[^.]+$/, "")
+      .replace(/[^A-Za-z0-9_-]/g, "_");
+    const LS_LOOK = `vrmLook8:${modelKey}`;
+    const LS_LOOK_LEGACY = "vrmLook8";
+    let migrated = false;
     try {
-      const s = localStorage.getItem(LS_LOOK);
+      // Fall back to the pre-split key ONCE, so an existing tuning is inherited by
+      // whichever model is loaded first rather than silently reset to defaults.
+      const s = localStorage.getItem(LS_LOOK) ?? localStorage.getItem(LS_LOOK_LEGACY);
       const saved = s ? JSON.parse(s) : null;
       if (saved && saved._build === LOOK_BUILD) {
         delete saved._build;
+        // See GRADE_FIX — applied once per saved look, then stamped.
+        if (saved._grade !== GRADE_REV) {
+          Object.assign(saved, GRADE_FIX);
+          migrated = true;
+        }
+        delete saved._grade;
         Object.assign(LOOK, saved);
       } else {
         // New deploy (or fresh storage): saved tweaks belong to an older build —
@@ -2510,11 +3261,17 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     }
     const saveLook = () => {
       try {
-        localStorage.setItem(LS_LOOK, JSON.stringify({ ...LOOK, _build: LOOK_BUILD }));
+        localStorage.setItem(
+          LS_LOOK,
+          JSON.stringify({ ...LOOK, _build: LOOK_BUILD, _grade: GRADE_REV }),
+        );
       } catch {
         /* ignore */
       }
     };
+    // Persist the migration NOW rather than waiting for the next 🎨 edit, so it
+    // cannot re-apply on every load and undo a deliberate later hand-tune.
+    if (migrated) saveLook();
     const applyLookState = () => {
       setBgGrad(LOOK.bgInner, LOOK.bgOuter);
       ambient.intensity = LOOK.ambient;
@@ -2537,28 +3294,35 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       bloomPass.strength = LOOK.bloomStrength;
       bloomPass.radius = LOOK.bloomRadius;
       bloomPass.threshold = LOOK.bloomThreshold;
-      diffPass.strength = LOOK.diffusion;
-      diffPass.enabled = LOOK.diffusion > 0.001;
+      diffPass.strength = fx(LOOK.diffusion, 0);
+      diffPass.enabled = diffPass.strength > 0.001;
       gtaoPass.blendIntensity = LOOK.ssao;
       gtaoPass.enabled = LOOK.ssao > 0.001;
-      linePass.uniforms.uLineInt.value = LOOK.lineInt;
-      linePass.uniforms.uLineN.value = LOOK.lineNInt;
-      linePass.uniforms.uLineZ.value = LOOK.lineZInt;
+      linePass.uniforms.uLineInt.value = fx(LOOK.lineInt, 0);
+      linePass.uniforms.uLineN.value = fx(LOOK.lineNInt, 0);
+      linePass.uniforms.uLineZ.value = fx(LOOK.lineZInt, 0);
       linePass.uniforms.uLineThresh.value = LOOK.lineThresh;
       linePass.uniforms.uLineColor.value.set(LOOK.outlineColor >= 0 ? LOOK.outlineColor : 0x151030);
-      linePass.enabled = LOOK.lineInt + LOOK.lineNInt + LOOK.lineZInt > 0.001;
-      gradePass.uniforms.uContrast.value = LOOK.gContrast;
-      gradePass.uniforms.uSat.value = LOOK.gSat;
-      gradePass.uniforms.uWarm.value.setRGB(LOOK.gWarmR, LOOK.gWarmG, LOOK.gWarmB);
-      gradePass.uniforms.uShadowLift.value.setRGB(LOOK.gLiftR, LOOK.gLiftG, LOOK.gLiftB);
-      gradePass.uniforms.uChroma.value = LOOK.chroma;
-      gradePass.uniforms.uVignette.value = LOOK.vignette;
-      gradePass.uniforms.uGrain.value = aiDebug.grainFor(LOOK.grain);
-      gradePass.uniforms.uBars.value = LOOK.bars;
-      gradePass.uniforms.uTemp.value = LOOK.gTemp;
-      gradePass.uniforms.uTint.value = LOOK.gTint;
-      gradePass.uniforms.uSplit.value = LOOK.gSplit;
-      gradePass.uniforms.uSteps.value = LOOK.toonSteps;
+      linePass.enabled = linePass.uniforms.uLineInt.value
+        + linePass.uniforms.uLineN.value + linePass.uniforms.uLineZ.value > 0.001;
+      // Grade: neutral means "leave the colours as authored" — contrast and
+      // saturation at 1, every lift/split/temperature at 0.
+      gradePass.uniforms.uContrast.value = fx(LOOK.gContrast, 1);
+      gradePass.uniforms.uSat.value = fx(LOOK.gSat, 1);
+      gradePass.uniforms.uWarm.value.setRGB(
+        fx(LOOK.gWarmR, 1), fx(LOOK.gWarmG, 1), fx(LOOK.gWarmB, 1),
+      );
+      gradePass.uniforms.uShadowLift.value.setRGB(
+        fx(LOOK.gLiftR, 0), fx(LOOK.gLiftG, 0), fx(LOOK.gLiftB, 0),
+      );
+      gradePass.uniforms.uChroma.value = fx(LOOK.chroma, 0);
+      gradePass.uniforms.uVignette.value = fx(LOOK.vignette, 0);
+      gradePass.uniforms.uGrain.value = aiDebug.grainFor(fx(LOOK.grain, 0));
+      gradePass.uniforms.uBars.value = fx(LOOK.bars, 0);
+      gradePass.uniforms.uTemp.value = fx(LOOK.gTemp, 0);
+      gradePass.uniforms.uTint.value = fx(LOOK.gTint, 0);
+      gradePass.uniforms.uSplit.value = fx(LOOK.gSplit, 0);
+      gradePass.uniforms.uSteps.value = fx(LOOK.toonSteps, 0);
       gradePass.uniforms.uGradTopC.value.set(LOOK.gradTop);
       gradePass.uniforms.uGradTopI.value = LOOK.gradTopInt;
       gradePass.uniforms.uGradBotC.value.set(LOOK.gradBot);
@@ -2612,7 +3376,14 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     (window as any).__vrmLook = (patch: Partial<typeof LOOK> = {}) => {
       Object.assign(LOOK, patch);
       applyLookState();
-      saveLook();
+      // Only PERSIST when something was actually set. `__vrmLook()` with no args
+      // is the read accessor — every tool and every console poke uses it — and it
+      // used to write the saved look back out on each call. That turns any
+      // transient patch into a permanent one: a measurement run that set
+      // hairColorMix:1 to identify hair pixels left the character's hair stored
+      // as bright red, and the same path is how a temporary 「スカート不透明」
+      // A/B became the persisted state that killed the coat's transparency.
+      if (Object.keys(patch).length) saveLook();
       return LOOK;
     };
     // __vrmPick() — arm a one-shot picker: the NEXT click on the canvas raycasts and logs
@@ -2707,6 +3478,89 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       return LOOK.forceHiMats || "(none)";
     };
     // __vrmObj() — raw VRM handle (debug only).
+    // Mip-mapped minification on/off, live. The trade-off is real and only the
+    // eye can settle it — mips kill the stair-stepping on the outfit's thin trim
+    // lines, and cost a little crispness in the skirt interior at grazing
+    // angles. Both states are one call away rather than a rebuild apart.
+    /**
+     * __vrmIdMode(1) — paint every material a unique flat colour and return the
+     * name->colour table, so a single deterministic capture says which material
+     * owns which pixel. __vrmIdMode(0) restores. See uIdMode in makeSubUniforms.
+     *
+     * IDs are spaced on a coarse lattice (6 levels per channel, black reserved)
+     * so nearest-match classification survives SMAA/TAA edge blending.
+     */
+    (window as any).__vrmIdMode = (on: boolean | number = 1) => {
+      const want = !!on;
+      const table: { name: string; rgb: number[] }[] = [];
+      let i = 0;
+      vrm?.scene.traverse((obj: THREE.Object3D) => {
+        const mesh = obj as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach((mat: THREE.Material) => {
+          const m = mat as any;
+          const u = m?.userData?._subU;
+          if (!u?.uIdMode) return;
+          i += 1;
+          const r = ((i % 6) + 1) / 7;
+          const g = ((Math.floor(i / 6) % 6) + 1) / 7;
+          const b = ((Math.floor(i / 36) % 6) + 1) / 7;
+          u.uIdMode.value = want ? 1 : 0;
+          if (want) {
+            u.uMatId.value.setRGB(r, g, b);
+            table.push({
+              name: m.name,
+              rgb: [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)],
+            });
+          }
+          m.uniformsNeedUpdate = true;
+        });
+      });
+      return { idMode: want, materials: table.length, table };
+    };
+    (window as any).__vrmMips = (on: boolean | number = 1) => {
+      const want = !!on;
+      let n = 0;
+      // Alpha-shaped textures are excluded here for the same reason the loader
+      // excludes them — mipping them dissolves the hair. Recomputed rather than
+      // shared so this toggle is honest on its own: turning mips back ON must
+      // not be a way to reintroduce the bug.
+      const keys = ["map", "emissiveTexture", "shadeMultiplyTexture", "matcapTexture"];
+      const skip = new Set<unknown>();
+      vrm?.scene.traverse((obj: THREE.Object3D) => {
+        const mesh = obj as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach((mat: THREE.Material) => {
+          const m = mat as any;
+          if (!m?.transparent) return;
+          keys.forEach((k) => {
+            const tex = m[k] || m.uniforms?.[k]?.value;
+            if (tex) skip.add(tex);
+          });
+        });
+      });
+      vrm?.scene.traverse((obj: THREE.Object3D) => {
+        const mesh = obj as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach((mat: THREE.Material) => {
+          const m = mat as any;
+          keys.forEach((k) => {
+            const tex = m[k] || m.uniforms?.[k]?.value;
+            if (!tex || !("minFilter" in tex) || skip.has(tex)) return;
+            const next = want ? THREE.LinearMipmapLinearFilter : THREE.LinearFilter;
+            if (tex.minFilter === next) return;
+            tex.minFilter = next;
+            tex.generateMipmaps = want;
+            tex.needsUpdate = true; // re-uploads and (re)builds the mip chain
+            n += 1;
+          });
+        });
+      });
+      return { mips: want, texturesChanged: n };
+    };
     (window as any).__vrmObj = () => vrm;
     // __vrmBones("腕") — list skeleton bone names (debug).
     (window as any).__vrmBones = (pat: string = "") => {
@@ -2786,6 +3640,176 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     // On-screen slider panel (🎭 button) to tune the resting FACE — one slider per
     // face morph (eye shape, brows, mouth corners, effects). Edits drive
     // vrmExpression.setBase and persist (shared with the MMD viewer's saved face).
+    /**
+     * 😀 FACE / CLIP AUDITION — the same idea as the 🎬 idle picker, for the face.
+     *
+     * Built because "this model has face motion" needed checking and could not be
+     * checked: the .glb's one embedded clip turned out to move exactly two morphs
+     * (eyeBlinkLeft/Right), while the model itself carries 293 that nothing drives.
+     * A list you can click through is the only way to find out what is in there,
+     * and it reads the morphs off the loaded meshes so it works for any model —
+     * Miku's Japanese PMX names and the Avaturn ARKit/Oculus ones alike.
+     */
+    const buildFaceMotionPanel = (): (() => void) => {
+      const btn = document.createElement("button");
+      btn.textContent = "😀";
+      btn.title = L("表情モーフ / 内蔵アニメを試聴", "Audition face morphs / embedded clips");
+      btn.style.cssText = "position:absolute;top:8px;right:84px;z-index:20;width:32px;height:32px;"
+        + "border-radius:8px;border:1px solid rgba(255,255,255,.25);background:rgba(20,24,40,.6);"
+        + "color:#fff;cursor:pointer;font-size:15px;line-height:1";
+      container.appendChild(autoHide(btn));
+
+      const panel = document.createElement("div");
+      // Second class: the 🎭 toggle opens this alongside the resting-face panel,
+      // so the two surfaces read as one "face" panel. Offset downward so they
+      // stack instead of covering each other.
+      panel.className = "vrm-tune-panel vrm-face-motion-panel";
+      panel.style.cssText = "position:absolute;top:48px;right:8px;z-index:21;width:320px;max-height:76%;"
+        + "display:none;flex-direction:column;border-radius:10px;border:1px solid rgba(255,255,255,.18);"
+        + "background:rgba(14,17,28,.94);color:#e8ecf5;font:12px/1.45 system-ui,sans-serif;"
+        + "box-shadow:0 8px 30px rgba(0,0,0,.5);overflow:hidden";
+      container.appendChild(panel);
+
+      const head = document.createElement("div");
+      head.style.cssText = "padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.12);"
+        + "display:flex;gap:6px;align-items:center;flex:0 0 auto";
+      const info = document.createElement("span");
+      info.style.cssText = "flex:1;opacity:.85";
+      const relaxBtn = document.createElement("button");
+      SET(relaxBtn, "全解除", "Clear all");
+      relaxBtn.style.cssText = "padding:3px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.25);"
+        + "background:rgba(60,64,80,.9);color:#fff;cursor:pointer";
+      head.append(info, relaxBtn);
+
+      const clipBox = document.createElement("div");
+      clipBox.style.cssText = "padding:6px 10px;border-bottom:1px solid rgba(255,255,255,.12);flex:0 0 auto";
+
+      const filter = document.createElement("input");
+      filter.placeholder = L("モーフ名で絞り込み (例: jaw, blink, aa)", "Filter by morph name (e.g. jaw, blink, aa)");
+      filter.style.cssText = "margin:8px 10px 4px;padding:5px 8px;border-radius:6px;"
+        + "border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);"
+        + "color:#e8ecf5;flex:0 0 auto";
+
+      const list = document.createElement("div");
+      list.style.cssText = "overflow-y:auto;padding:4px 6px 10px;flex:1 1 auto";
+      panel.append(head, clipBox, filter, list);
+
+      const renderClips = () => {
+        clipBox.textContent = "";
+        const names = faceMotion.clipNames;
+        const label = document.createElement("div");
+        label.style.cssText = "opacity:.75;margin-bottom:4px";
+        if (!names.length) {
+          SET(label, "内蔵アニメーション: なし", "Embedded animations: none");
+          clipBox.append(label);
+          return;
+        }
+        label.textContent = L(`内蔵アニメーション (${names.length})`, `Built-in animations (${names.length})`);
+        clipBox.append(label);
+        for (const n of names) {
+          const row = document.createElement("div");
+          row.style.cssText = "display:flex;gap:6px;align-items:center;margin:3px 0";
+          const nm = document.createElement("span");
+          nm.textContent = n;
+          nm.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+          const play = document.createElement("button");
+          play.textContent = faceMotion.playing === n ? L("停止", "Stop") : L("再生", "Play");
+          play.style.cssText = "padding:2px 10px;border-radius:6px;border:1px solid rgba(255,255,255,.25);"
+            + "background:rgba(80,140,220,.85);color:#fff;cursor:pointer";
+          play.addEventListener("click", () => {
+            if (faceMotion.playing === n) faceMotion.stopClip();
+            else faceMotion.playClip(n);
+            renderClips();
+          });
+          row.append(nm, play);
+          clipBox.append(row);
+        }
+        const warn = document.createElement("div");
+        warn.style.cssText = "opacity:.6;margin-top:4px;font-size:11px";
+        SET(warn, "※ 内蔵クリップは全身も動かすため、通常のモーションと競合します", "Note: an embedded clip also drives the body, so it fights the normal motion");
+        clipBox.append(warn);
+      };
+
+      const renderList = () => {
+        list.textContent = "";
+        const q = filter.value.trim().toLowerCase();
+        const all = faceMotion.morphNames;
+        const matched = q ? all.filter((n) => n.toLowerCase().includes(q)) : all;
+        // Sort by GROUP first. Sorting by name alone put the headings back every
+        // few rows (viseme, other, viseme, brow...) because the names interleave
+        // alphabetically, which made the grouping useless as a way to find things.
+        const ORDER = ["viseme", "mouth", "eye", "brow", "face", "body-shape", "other"];
+        const shown = matched.slice().sort((a, b) => {
+          const ga = ORDER.indexOf(faceMotion.groupOf(a));
+          const gb = ORDER.indexOf(faceMotion.groupOf(b));
+          return ga !== gb ? ga - gb : a.localeCompare(b);
+        });
+        info.textContent = L(`モーフ ${shown.length}/${all.length}`, `Morphs ${shown.length}/${all.length}`);
+        let group = "";
+        for (const name of shown) {
+          const g = faceMotion.groupOf(name);
+          if (g !== group) {
+            group = g;
+            const h = document.createElement("div");
+            SET(h, g);
+            h.style.cssText = "margin:8px 4px 2px;opacity:.55;text-transform:uppercase;font-size:10px;letter-spacing:.05em";
+            list.append(h);
+          }
+          const row = document.createElement("div");
+          row.style.cssText = "display:flex;gap:6px;align-items:center;padding:1px 4px";
+          const nm = document.createElement("span");
+          SET(nm, name);
+          nm.title = name; // key stays Japanese
+          nm.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer";
+          // Click the NAME to sweep it 0->1->0: the fastest way to see what a
+          // morph is without deciding a value first.
+          nm.addEventListener("click", () => faceMotion.sweep(name));
+          const sl = document.createElement("input");
+          sl.type = "range";
+          sl.min = "0"; sl.max = "1"; sl.step = "0.02"; sl.value = "0";
+          sl.style.cssText = "width:96px";
+          sl.addEventListener("input", () => {
+            const v = parseFloat(sl.value);
+            faceMotion.hold(name, v > 0.001 ? v : null);
+          });
+          // Ticked = keep this morph in the RESTING face (persisted). Unticked,
+          // the slider is a preview only — which is the whole difference the two
+          // separate lists used to encode, now expressed per row.
+          row.append(nm, sl);
+          list.append(row);
+        }
+        if (!shown.length) {
+          const e = document.createElement("div");
+          e.style.cssText = "opacity:.6;padding:10px 4px";
+          e.textContent = all.length ? L("一致するモーフがありません", "No matching morphs") : L("このモデルにモーフはありません", "This model has no morphs");
+          list.append(e);
+        }
+      };
+
+      relaxBtn.addEventListener("click", () => {
+        faceMotion.releaseAll();
+        renderList();
+      });
+      filter.addEventListener("input", renderList);
+      btn.addEventListener("click", () => {
+        retranslate(container);
+        container.querySelectorAll(".vrm-tune-panel").forEach((p) => {
+          if (p !== panel) (p as HTMLElement).style.display = "none";
+        });
+        const open = panel.style.display === "none";
+        panel.style.display = open ? "flex" : "none";
+        if (open) { renderClips(); renderList(); }
+        else faceMotion.releaseAll();
+      });
+
+      return () => {
+        faceMotion.releaseAll();
+        faceMotion.stopClip();
+        btn.remove();
+        panel.remove();
+      };
+    };
+
     const buildFacePanel = (dict: Record<string, number>): (() => void) => {
       // まばたき IS adjustable now (it's the resting "hood"); the blink animates on
       // top of it. Only skip the lip-sync mouth vowels.
@@ -2800,7 +3824,7 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       const head = document.createElement("div");
       head.style.cssText = "font-weight:bold;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center";
       const title = document.createElement("span");
-      title.textContent = "表情調整";
+      SET(title, "表情調整", "Face");
       const resetBtn = document.createElement("button");
       resetBtn.textContent = "Reset";
       resetBtn.style.cssText = "font-size:11px;cursor:pointer;background:#444;color:#fff;border:none;border-radius:4px;padding:2px 8px";
@@ -2808,6 +3832,15 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       head.appendChild(resetBtn);
       panel.appendChild(head);
       const sliders: Record<string, HTMLInputElement> = {};
+      // ONE list, not two. This panel used to render a slider per morph and the
+      // section below renders the same set again — same morphs, different order,
+      // one with search. Keeping both meant the same "笑い" appeared twice with two
+      // independent sliders. The list below is the better of the two (grouped and
+      // filterable), so it is the only one now; what this panel keeps is the part
+      // the list has no notion of — committing the current pose as the RESTING face.
+      // RESTING FACE sliders — the persisted base pose, one row per morph. This is
+      // the panel that existed before the merge experiment; the morph AUDITION list
+      // lives behind its own button again.
       Object.keys(dict)
         .sort((a, b) => dict[a] - dict[b])
         .forEach((name) => {
@@ -2815,22 +3848,21 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
           const row = document.createElement("label");
           row.style.cssText = "display:flex;align-items:center;gap:6px;margin:2px 0";
           const lab = document.createElement("span");
-          lab.textContent = name;
-          lab.title = name;
+          SET(lab, name); lab.title = name; // key stays Japanese
           lab.style.cssText = "flex:0 0 84px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
           const sl = document.createElement("input");
-          sl.type = "range"; sl.min = "0"; sl.max = "1"; sl.step = "0.05";
-          sl.value = String(base[name] ?? 0);
+          sl.type = "range"; sl.min = "0"; sl.max = "1"; sl.step = "0.01";
+          sl.value = String((vrmExpression.getBase() as Record<string, number>)[name] ?? 0);
           sl.style.cssText = "flex:1;min-width:0";
           const val = document.createElement("span");
+          val.style.cssText = "flex:0 0 34px;text-align:right;opacity:.7";
           val.textContent = sl.value;
-          val.style.cssText = "flex:0 0 28px;text-align:right;opacity:.7";
           sl.addEventListener("input", () => {
-            vrmExpression.setBase(name, parseFloat(sl.value));
             val.textContent = sl.value;
+            vrmExpression.setBase(name, parseFloat(sl.value));
           });
           sliders[name] = sl;
-          row.appendChild(lab); row.appendChild(sl); row.appendChild(val);
+          row.append(lab, sl, val);
           panel.appendChild(row);
         });
       resetBtn.addEventListener("click", () => {
@@ -2842,16 +3874,26 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       });
       const toggle = document.createElement("button");
       toggle.textContent = "🎭";
-      toggle.title = "表情調整パネル";
+      toggle.title = L("顔の調整（安静時の表情 + モーフ確認）", "Face (resting expression + morph audit)");
       toggle.style.cssText =
-        "position:absolute;top:8px;right:8px;z-index:51;cursor:pointer;font-size:16px;" +
-        "background:rgba(18,18,26,0.75);border:none;border-radius:6px;padding:2px 7px";
+        "position:absolute;top:8px;right:8px;z-index:51;width:32px;height:32px;"
+        + "border-radius:8px;border:1px solid rgba(255,255,255,.25);"
+        + "background:rgba(20,24,40,.6);color:#fff;cursor:pointer;"
+        + "font-size:15px;line-height:1;display:flex;align-items:center;"
+        + "justify-content:center;padding:0";
       toggle.addEventListener("click", () => {
         const open = panel.style.display === "none";
+        retranslate(container);
         container.querySelectorAll(".vrm-tune-panel").forEach((p) => {
           (p as HTMLElement).style.display = "none";
         });
         panel.style.display = open ? "block" : "none";
+        // ONE button for the whole face. The two surfaces stayed separate
+        // builders (one tunes the persisted resting face, the other auditions
+        // every morph and is deliberately not saved), but there was no reason
+        // for the USER to know that — they are both "the face", and the panels
+        // looked identical. Opened together, stacked.
+        // the morph section now lives inside `panel`, so it opens with it
       });
       container.appendChild(panel);
       container.appendChild(autoHide(toggle));
@@ -2993,7 +4035,7 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         "border-radius:8px;z-index:50;display:none;box-shadow:0 4px 16px rgba(0,0,0,.5)";
       const head = document.createElement("div");
       head.style.cssText = "font-weight:bold;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center";
-      const title = document.createElement("span"); title.textContent = `ビジュアル調整 ${LOOK_BUILD}`;
+      const title = document.createElement("span"); title.textContent = L("ビジュアル調整", "Visual") + ` ${LOOK_BUILD}`;
       const resetBtn = document.createElement("button"); resetBtn.textContent = "Reset";
       resetBtn.style.cssText = "font-size:11px;cursor:pointer;background:#444;color:#fff;border:none;border-radius:4px;padding:2px 8px";
       head.appendChild(title); head.appendChild(resetBtn); panel.appendChild(head);
@@ -3003,10 +4045,17 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       // coordination on). Applied as defaults + overrides so they fully reset.
       const presetRow = document.createElement("div");
       presetRow.style.cssText = "display:flex;gap:6px;margin:2px 0 6px";
+      // Highlight whichever preset is active, and restore it on load.
+      const presetBtns: Record<string, HTMLButtonElement> = {};
+      const markPreset = (active: string | null) => {
+        Object.entries(presetBtns).forEach(([k, el]) => {
+          el.style.background = k === active ? "#5570b0" : "#3a3a55";
+        });
+      };
       (["base", "mstc", "video", "recipe"] as const).forEach((nm) => {
         const b = document.createElement("button");
         b.textContent =
-          nm === "mstc" ? "msTC" : nm === "video" ? "映像" : nm === "recipe" ? "配方" : "既定";
+          nm === "mstc" ? "msTC" : nm === "video" ? L("映像", "Video") : nm === "recipe" ? L("配方", "Recipe") : L("既定", "Default");
         b.style.cssText =
           "flex:1;font-size:11px;cursor:pointer;background:#3a3a55;color:#fff;border:none;border-radius:4px;padding:3px 0";
         b.addEventListener("click", () => {
@@ -3016,17 +4065,28 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
           LOOK.skirtOpaque = keepSkirt;
           LOOK.armOpaque = keepArm;
           applyLookState(); saveLook();
+          // Remember WHICH preset, not just the resulting slider values. The
+          // values were already persisted, but a preset is also a statement of
+          // intent — reopening the panel showed no sign of what had been picked,
+          // and a later default change could not be inherited.
+          try { localStorage.setItem(`${LS_LOOK}:preset`, nm); } catch { /* private mode */ }
+          markPreset(nm);
           rows.forEach((r) => r());
         });
+        presetBtns[nm] = b;
         presetRow.appendChild(b);
       });
+      // Restore the remembered choice. The slider VALUES are already restored
+      // from LS_LOOK, so this only re-marks the button — re-applying the preset
+      // here would discard any tweaks made after picking it.
+      try { markPreset(localStorage.getItem(`${LS_LOOK}:preset`)); } catch { markPreset(null); }
       panel.appendChild(presetRow);
       const hex6 = (n: number) => `#${(n & 0xffffff).toString(16).padStart(6, "0")}`;
       const b2 = (x: number) => Math.max(0, Math.min(255, Math.round(x))).toString(16).padStart(2, "0");
       SLIDERS.forEach(([key, label, min, max, step]) => {
         const row = document.createElement("label");
         row.style.cssText = "display:flex;align-items:center;gap:6px;margin:2px 0";
-        const lab = document.createElement("span"); lab.textContent = label; lab.title = String(key);
+        const lab = document.createElement("span"); SET(lab, label); lab.title = String(key);
         lab.style.cssText = "flex:0 0 72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
         const sl = document.createElement("input");
         sl.type = "range"; sl.min = String(min); sl.max = String(max); sl.step = String(step);
@@ -3044,7 +4104,7 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       HEXCOLORS.forEach(([key, label]) => {
         const row = document.createElement("label");
         row.style.cssText = "display:flex;align-items:center;gap:6px;margin:2px 0";
-        const lab = document.createElement("span"); lab.textContent = label;
+        const lab = document.createElement("span"); SET(lab, label);
         lab.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
         const ci = document.createElement("input"); ci.type = "color";
         ci.style.cssText = "flex:0 0 34px;height:20px;padding:0;border:none;background:none;cursor:pointer";
@@ -3060,7 +4120,7 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       RGBCOLORS.forEach(([label, keys]) => {
         const row = document.createElement("label");
         row.style.cssText = "display:flex;align-items:center;gap:6px;margin:2px 0";
-        const lab = document.createElement("span"); lab.textContent = label;
+        const lab = document.createElement("span"); SET(lab, label);
         lab.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
         const ci = document.createElement("input"); ci.type = "color";
         ci.style.cssText = "flex:0 0 34px;height:20px;padding:0;border:none;background:none;cursor:pointer";
@@ -3084,12 +4144,16 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       });
 
       const toggle = document.createElement("button");
-      toggle.textContent = "🎨"; toggle.title = "ビジュアル調整パネル";
+      toggle.textContent = "🎨"; toggle.title = L("ビジュアル調整パネル", "Visual tuning");
       toggle.style.cssText =
-        "position:absolute;top:8px;right:44px;z-index:51;cursor:pointer;font-size:16px;" +
-        "background:rgba(18,18,26,0.75);border:none;border-radius:6px;padding:2px 7px";
+        "position:absolute;top:8px;right:46px;z-index:51;width:32px;height:32px;"
+        + "border-radius:8px;border:1px solid rgba(255,255,255,.25);"
+        + "background:rgba(20,24,40,.6);color:#fff;cursor:pointer;"
+        + "font-size:15px;line-height:1;display:flex;align-items:center;"
+        + "justify-content:center;padding:0";
       toggle.addEventListener("click", () => {
         const open = panel.style.display === "none";
+        retranslate(container);
         container.querySelectorAll(".vrm-tune-panel").forEach((p) => {
           (p as HTMLElement).style.display = "none";
         });
@@ -3107,23 +4171,101 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     // Cache-bust the .vrm: the file is re-deployed under the SAME name while the
     // look is tuned, so a cached copy would show a stale (dark/old) model. A
     // per-load query forces a fresh fetch. (Local file, so the refetch is cheap.)
-    const bustUrl = url.includes(".vrm")
+    const bustUrl = url.includes(".vrm") || url.includes(".glb")
       ? `${url}${url.includes("?") ? "&" : "?"}cb=${Date.now()}`
       : url;
     loader.load(
       bustUrl,
-      (gltf: { userData: { vrm: VRM }; scene: THREE.Object3D }) => {
+      (gltf: { userData: { vrm: VRM }; scene: THREE.Object3D; animations?: THREE.AnimationClip[] }) => {
         if (disposed) return;
         vrm = gltf.userData.vrm as VRM;
+        // Plain .glb: no VRM extension, so the loader plugin leaves userData.vrm
+        // undefined. Build a humanoid over the glTF's own bones instead — see
+        // glb-humanoid.ts for why that is a name table and not a retarget.
+        if (!vrm) {
+          const built = buildVrmFromGltf(gltf);
+          if (!built) {
+            console.error("[vrm-viewer] .glb has no humanoid rig this app can drive");
+            return;
+          }
+          vrm = built.vrm;
+          // A plain .glb is a PBR asset from some other pipeline, not a toon
+          // model — so it opts out of the stylised pass by default. Override
+          // per-session with __vrmPlainStyle(false) if a particular .glb does
+          // suit the look.
+          plainStyle = true;
+          console.info(
+            `[glb-humanoid] rig mapped from ${built.boneNames.length} nodes`
+            + (built.missing.length ? `; unmapped optional: ${built.missing.join(", ")}` : ""),
+          );
+        }
         VRMUtils.removeUnnecessaryVertices(gltf.scene);
         // VRM 1.0 faces +Z; VRM 0.x faces -Z -> flip to face the +Z camera.
         if (vrm.meta && (vrm.meta as { metaVersion?: string }).metaVersion === "0") {
           vrm.scene.rotation.y = Math.PI;
         }
         scene.add(vrm.scene);
+        // WASTE FROM THE PMX->VRM CONVERSION, removed before anything touches the
+        // model. Both passes delete data that cannot reach a pixel, so the render
+        // diff across them must be exactly zero — see utils/vrm-optimize.ts.
+        //
+        // Order matters twice over. The texture dedupe runs BEFORE the mip /
+        // dilation work below so that work runs once per surviving texture rather
+        // than once per duplicate, and so the `alphaShapedTex` pre-pass classifies
+        // the objects that will actually be uploaded. The morph prune runs before
+        // the face systems bind (further down), so they resolve names against the
+        // renumbered dictionaries rather than being re-bound afterwards.
+        {
+          const tex = dedupeTextures(vrm.scene);
+          const morph = pruneZeroMorphTargets(vrm);
+          const MB = (b: number) => Math.round(b / 1048576);
+          console.info(
+            `[vrm-optimize] textures ${tex.before} -> ${tex.after} objects `
+            + `(${MB(tex.bytesBefore)} -> ${MB(tex.bytesAfter)} MB); `
+            + `morphs ${morph.slotsBefore} -> ${morph.slotsAfter} slots `
+            + `(${MB(morph.bytesBefore)} -> ${MB(morph.bytesAfter)} MB, `
+            + `${morph.meshesCleared}/${morph.meshes} meshes now morph-free)`,
+          );
+        }
+        (window as any).__vrmCost = () => describeVrmCost(vrm!.scene);
         // Anisotropic filtering on every texture: the detailed sleeve / armband
         // patterns aliased into grainy noise when seen at grazing angles.
         const maxAniso = renderer.capabilities.getMaxAnisotropy();
+        // ALPHA-SHAPED TEXTURES — never mip these (see the mip block below).
+        // Collected in a PRE-PASS because textures are SHARED between materials:
+        // Hair01, Hair02 and Hairshadow are three materials over one 2048x1200
+        // image, so a per-material test would still mip the hair the moment any
+        // sibling that happens to be opaque reached the same texture object.
+        // Membership is by texture identity, decided before anything is changed.
+        // Captured at LOAD time on purpose: applyLook later flips the coat
+        // overlays q201-q203 to transparent:false, but their silhouette is the
+        // printed circuit pattern in their alpha exactly like the hair's, so the
+        // load-time reading is the one that describes the texture. Verified on
+        // this model: 32 alpha-shaped textures, 48 opaque, and ZERO shared
+        // between the two groups — so nothing opaque loses its prefilter here.
+        const TEX_KEYS = ["map", "emissiveTexture", "shadeMultiplyTexture", "matcapTexture"];
+        const alphaShapedTex = new Set<unknown>();
+        vrm.scene.traverse((obj: THREE.Object3D) => {
+          const mesh = obj as THREE.Mesh;
+          if (!mesh.isMesh) return;
+          const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+          mats.forEach((mat: THREE.Material) => {
+            const m = mat as any;
+            // ALPHA-TESTED counts too. The test used to be `transparent` alone,
+            // which split two textures that are the same kind of thing: the coat
+            // overlays q201-q203 came out of the converter as BLEND and were
+            // excluded, while q301/q302 — the SAME printed circuit pattern, shape
+            // in the alpha — came out as MASK, read as transparent:false here, and
+            // got mipped. One print stayed crisp and its twin dissolved, purely
+            // from an alphaMode the conversion picked. Shape-in-alpha is the
+            // property that matters, and a cutoff is just another way to declare it.
+            if (!m?.transparent && !(m?.alphaTest > 0)) return;
+            TEX_KEYS.forEach((k) => {
+              const tex = m[k] || m.uniforms?.[k]?.value;
+              if (tex) alphaShapedTex.add(tex);
+            });
+          });
+        });
         vrm.scene.traverse((obj: THREE.Object3D) => {
           const mesh = obj as THREE.Mesh;
           if (!mesh.isMesh) return;
@@ -3159,40 +4301,172 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
             const mc = (Array.isArray(mesh.material) ? mesh.material[0] : mesh.material) as THREE.Material | undefined;
             if (mc?.name && NO_CAST.includes(mc.name)) mesh.castShadow = false;
           }
-          // ALPHA-AWARE SHADOWS. 14 of this model's materials are alpha-blended quads whose
-          // SHAPE lives entirely in the texture's alpha channel: the wide translucent hip
-          // panels (C01-C07), the coat overlays (q201-q203), the hair sheets (Hair01-03) and
-          // — worst of all — a material literally called `Hairshadow`, a flat plate carrying
-          // a PAINTED shadow. They all ship with alphaTest = 0, so the shadow pass ignored
-          // alpha completely and rendered each one as SOLID geometry: hard-edged rectangular
-          // slabs of shadow across the skirt and the inner skirt, with no visible caster
-          // because the caster is see-through. That is the "四角い謎の影" report.
-          // A custom depth material fixes only the shadow pass — the visible render keeps its
-          // blending — so the shadow now follows the pattern instead of the quad. Meshes with
-          // no texture to test against simply stop casting.
-          {
-            const m0 = (Array.isArray(mesh.material) ? mesh.material[0] : mesh.material) as any;
-            if (m0?.transparent) {
-              const map = m0.map || m0.uniforms?.map?.value || null;
-              if (map) {
-                mesh.customDepthMaterial = new THREE.MeshDepthMaterial({
-                  depthPacking: THREE.RGBADepthPacking, map, alphaTest: 0.5,
-                });
-              } else {
-                mesh.castShadow = false;
-              }
-            }
-          }
+          // (depthWrite / alphaTest on the alpha-blended materials are left as
+          //  authored — see ALPHA_BLEND_NOTE at the top for what was tried.)
           const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
           mats.forEach((mat: THREE.Material) => {
             const m = mat as any;
-            ["map", "emissiveTexture", "shadeMultiplyTexture", "matcapTexture"].forEach((k) => {
+            TEX_KEYS.forEach((k) => {
               const tex = m[k] || m.uniforms?.[k]?.value;
               if (tex && "anisotropy" in tex) {
                 tex.anisotropy = maxAniso;
+                // Repair the invisible RGB BEFORE the mip chain is built below —
+                // once the driver has box-filtered the fill colour into the chain
+                // there is nothing left to fix. Alpha-TESTED materials only: they
+                // are the ones where a mip-averaged alpha can cross the cutoff and
+                // paint that fill at full opacity. See dilateAlphaTexture.
+                if (m.alphaTest > 0 && !tex.userData?._dilated) {
+                  const t0 = performance.now();
+                  const n = dilateAlphaTexture(tex, m.alphaTest);
+                  // ...then rebuild the chain so the print stays solid when it is
+                  // minified. Must come AFTER the dilation: it consumes the
+                  // repaired RGB, and it turns generateMipmaps off, so the driver
+                  // never sees the texture again.
+                  // Only for textures that still get a mip chain. An alpha-shaped
+                  // one is not mipped at all now, so there is no chain to correct
+                  // and rescaling its alpha would only make it denser than authored.
+                  const lv = alphaShapedTex.has(tex) ? 0 : buildCoverageMips(tex);
+                  tex.userData = { ...(tex.userData || {}), _dilated: true };
+                  if (n || lv) {
+                    console.log(
+                      `[vrm] ${m.name}: dilated ${n} texels, ${lv} coverage mips`
+                      + ` in ${Math.round(performance.now() - t0)}ms`,
+                    );
+                  }
+                }
+                // MIP-MAPPED MINIFICATION. The VRM's glTF samplers ask for
+                // minFilter LINEAR, and the loader honours it — so every 2048px
+                // character texture was minified with a raw bilinear tap and NO
+                // mipmaps. Sampling a high-frequency print past Nyquist is
+                // textbook aliasing: the thin bright trim lines that edge the
+                // outfit came out stair-stepped and crawled with every movement.
+                // Mip-mapped minification is the prefilter that fixes it at the
+                // source (measured: shimmer spikes 4.8-5.4% -> 2.0-2.6%, i.e.
+                // the strobe collapses to the noise floor); the anisotropy set
+                // just above is what keeps those mips sharp at grazing angles.
+                // magFilter is untouched, so close-ups are unchanged.
+                //
+                // This was briefly reverted (2026-08-13) and then restored on
+                // the user's report that it had visibly fixed the trim-line
+                // jaggies. Known trade-off: the skirt INTERIOR print reads a
+                // little softer at grazing angles, which is the same prefilter
+                // doing its job. `__vrmMips(0)` flips it live for an A/B.
+                //
+                // NOT for alpha-shaped textures. Eleven of this model's
+                // materials are alpha-BLENDED with alphaTest 0, so their shape
+                // is the texture's alpha channel and nothing else: Hair01-03,
+                // Hairshadow, and the hip panels C01-C07. Box-filtering that
+                // alpha down a mip chain averages the opaque strands with the
+                // transparent gaps between them, so every mip level is more
+                // see-through than the last and the hair dissolves into the
+                // background objects behind it — reproduced and confirmed by
+                // A/B on the real GPU (logs/render-probe/mipsAB-front-mips*.png:
+                // solid twintails at mips=0, washed out at mips=1). That was the
+                // 「髪の毛が映らない / 髪の毛を通り越して奥の背景オブジェクトが
+                // 映ってる」 report. The trim lines that motivated mips live on
+                // the OPAQUE materials (body01, q01-q04, q201-q203), so they
+                // keep their prefilter and the jaggies fix is unaffected.
+                if (alphaShapedTex.has(tex)) {
+                  tex.needsUpdate = true;
+                  return;
+                }
+                if (tex.minFilter === THREE.LinearFilter) {
+                  tex.minFilter = THREE.LinearMipmapLinearFilter;
+                  tex.generateMipmaps = true;
+                }
                 tex.needsUpdate = true;
               }
             });
+            // SOFT GLOW, NOT A HARD CUT. q301/q302 are the only outfit materials
+            // the PMX->VRM conversion gave alphaMode MASK; every sibling panel
+            // (q201-q203, C01-C07) came out BLEND. PMX has no alpha modes at all —
+            // MMD always blends on the texture's alpha — so MASK is the converter
+            // guessing, and guessing against the artwork: these motifs are a crisp
+            // shape wrapped in a WIDE soft alpha falloff, drawn to read as a glow.
+            // alphaTest 0.5 turns that falloff into a hard-edged slab at whatever
+            // radius the alpha happens to cross 0.5, which is what made every speck
+            // look outlined rather than lit.
+            //
+            // Matched to the sibling convention exactly — transparent + alphaTest 0
+            // + depthWrite ON — so ALPHA_BLEND_NOTE still holds: each panel is
+            // composited once and cannot eat through to the layers behind it. The
+            // `m.transparent` rule further down then gives these meshes renderOrder
+            // 1 on its own, so they draw after the hair like every other panel.
+            //
+            // The (Outline) twins are deliberately left alone: they are alpha-tested
+            // hulls contributing 0.043% of the frame (measured with outlineWidth 0),
+            // and making them transparent would drop them into the same renderOrder
+            // as the surface they outline, where the sort between them is arbitrary.
+            if (/^q30[12]$/i.test(m.name || "") && m.alphaTest > 0) {
+              m.alphaTest = 0;
+              m.transparent = true;
+              m.depthWrite = true;
+              m.needsUpdate = true;
+              // NEUTRAL SHADE for the print panels — the "moving cyan" fix.
+              //
+              // The印 marks are authored near-white (#f2fefd) but carry a faint
+              // cyan hue, and the pipeline's shade path amplifies hue three ways:
+              // shadeColorFactor is blue-violet [0.88,0.85,0.97], the shade
+              // re-multiplies the same cyan-tinted texture (shadeMultiplyTexture
+              // = q3.png), and 色トレス (shadeCoord 1) saturates whatever hue the
+              // albedo has. Individually mild — but the video grade doubles the
+              // result: measured at a frozen mid-swing pose, mark pixels sat at
+              // cyan-ness +63.8 pre-grade and +137.7 with the grade, and ONLY a
+              // full grade-neutral killed it (sub/mask/hi/cel toggles left
+              // 84-98% of it standing). As the arm swings, marks cross the
+              // terminator and flip white -> saturated cyan (「腕をいろんな角度に
+              // してみて青く映る」).
+              //
+              // The grade is the look and stays. What gets fixed is the SEED:
+              // these two materials render their shade in NEUTRAL GREY — same
+              // darkening, no hue for the grade to amplify. Material-scoped on
+              // purpose; the rest of the outfit keeps its blue-violet shade.
+              m.userData._printPanel = true;
+              if (m.shadeColorFactor?.clone) {
+                const sc = m.shadeColorFactor;
+                const l = 0.299 * sc.r + 0.587 * sc.g + 0.114 * sc.b;
+                sc.setRGB(l, l, l);
+                // applyLook re-derives from _shadeBase every pass (celBands
+                // scales it); seed it grey so later passes stay grey.
+                m.userData._shadeBase = sc.clone();
+              }
+              const sm = m.shadeMultiplyTexture || m.uniforms?.shadeMultiplyTexture?.value;
+              const smImg = sm?.image;
+              if (smImg?.width) {
+                let grey = GREY_SHADE_TEX.get(sm.source ?? smImg);
+                if (!grey) {
+                  const cv = document.createElement("canvas");
+                  cv.width = smImg.width;
+                  cv.height = smImg.height;
+                  const cx = cv.getContext("2d", { willReadFrequently: true });
+                  if (cx) {
+                    cx.drawImage(smImg, 0, 0);
+                    const id = cx.getImageData(0, 0, cv.width, cv.height);
+                    const px = id.data;
+                    for (let i = 0; i < px.length; i += 4) {
+                      const l = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+                      px[i] = px[i + 1] = px[i + 2] = l;
+                    }
+                    cx.putImageData(id, 0, 0);
+                    grey = new THREE.Texture(cv);
+                    grey.flipY = sm.flipY;
+                    grey.colorSpace = sm.colorSpace;
+                    grey.wrapS = sm.wrapS;
+                    grey.wrapT = sm.wrapT;
+                    grey.minFilter = sm.minFilter;
+                    grey.magFilter = sm.magFilter;
+                    grey.anisotropy = sm.anisotropy;
+                    grey.generateMipmaps = sm.generateMipmaps;
+                    grey.needsUpdate = true;
+                    GREY_SHADE_TEX.set(sm.source ?? smImg, grey);
+                  }
+                }
+                if (grey) {
+                  if ("shadeMultiplyTexture" in m && m.shadeMultiplyTexture) m.shadeMultiplyTexture = grey;
+                  else if (m.uniforms?.shadeMultiplyTexture) m.uniforms.shadeMultiplyTexture.value = grey;
+                }
+              }
+            }
           });
         });
         // DOUBLE-SIDE the swinging cloth (skirt). MMD renders every face two-sided; the
@@ -3238,7 +4512,16 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         // comes up, hand those bones over: remove their springbone joints (double-driving
         // fights). If ammo or the baked asset is unavailable, init() returns false and the
         // springbone setup above stays as the fallback.
-        mmdHairPhysics.init(vrm).then((ok) => {
+        // NOT ON A PHONE. 296 bodies and 381 constraints cost 6.3 ms a frame on a
+        // desktop CPU — a third of the 60 fps budget before an A16 is asked for it,
+        // and this frame is CPU-bound rather than fill-bound, so no amount of
+        // resolution reduction pays for it. The spring bones below are left intact
+        // in that case, so the hair still swings; see device-profile.ts.
+        const wantHairPhysics = deviceProfile().hairPhysics;
+        if (!wantHairPhysics) {
+          console.info("[vrm] mobile profile: Bullet hair physics off, spring bones retained");
+        }
+        (wantHairPhysics ? mmdHairPhysics.init(vrm) : Promise.resolve(false)).then((ok) => {
           if (!ok || disposed) return;
           const sbm = (vrm as unknown as { springBoneManager?: any }).springBoneManager;
           if (sbm?.joints) {
@@ -3279,17 +4562,142 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
             }
           }
         });
-        if (faceMeshes.length && faceDict) {
-          vrmExpression.setMeshes(faceMeshes, faceDict);
-          // Lip-sync: drive the あ (mouth-open) morph across all face primitives.
-          vrmLipSync.setMeshes(faceMeshes, faceDict);
-          if (!vrmLipSync.hasMouth()) {
-            console.warn("[VRM] no 'あ' mouth morph found for lip-sync");
+        // Audition surface for whatever THIS model's face can do. Bound from the
+        // meshes themselves rather than from a preset list, because the naming
+        // is per-pipeline: Miku carries Japanese PMX morphs, the Avaturn .glb
+        // carries ARKit/Oculus ones, and neither knows about the other.
+        faceMotion.bind(faceMeshes, gltf.animations || [], vrm.scene);
+        disposeFaceMotionPanel = buildFaceMotionPanel();
+        // LIP SYNC IS BOUND FOR ANY MODEL WITH A FACE.
+        //
+        // It used to be bound only inside the `faceDict` branch below, and
+        // faceDict is only set when the model has まばたき — a Miku/PMX morph. So
+        // a model with a perfectly good mouth got no lip sync at all and simply
+        // never opened it while speaking, with nothing logged. Resolution of
+        // WHICH morph to drive now happens inside setMeshes against the names
+        // each model actually has (あ / jawOpen / aa / ...).
+        if (faceMeshes.length) {
+          vrmLipSync.setMeshes(faceMeshes, faceDict || {});
+          if (vrmLipSync.hasMouth()) {
+            console.info(`[VRM] lip-sync morph: ${vrmLipSync.mouthMorph()}`);
+          } else {
+            console.warn("[VRM] no mouth-open morph found for lip-sync");
           }
-          disposeFacePanel = buildFacePanel(faceDict); // 🎭 resting-face tuning panel
+        }
+        // EXPRESSIONS ARE BOUND FOR ANY MODEL WITH A FACE, for the same reason
+        // lip sync above is: this was gated on `faceDict`, which is only set for
+        // a model carrying まばたき, so the Avaturn .glb got no expression system
+        // at all — and therefore not even a blink (measured: peak eyeBlinkLeft
+        // 0.000 over five seconds). Which preset table applies is decided inside
+        // setMeshes from the morph names the model actually has, so a model with
+        // neither vocabulary still binds and simply finds nothing to drive.
+        if (faceMeshes.length) {
+          vrmExpression.setMeshes(faceMeshes, faceDict || {});
+          // The picker is useful for ANY model now that the rotation is per
+          // character — it is how a character's own set gets built in the first
+          // place. "" restores the element default; "flex" would left-align the
+          // glyph because this button has no flex centering in its own cssText.
+          pickBtn.style.display = "";
+          // The idle SOURCE is decided by the server, not by the face vocabulary:
+          // a character plays the library only if it has a rotation of its own.
+          // Start off so the embedded-clip fallback below is set up either way,
+          // then switch over asynchronously if the server does have clips for it.
+          // (This used to key off `profile === "pmx"`, which hard-wired "ARKit =>
+          // no library" and made a Chancelor idle set unreachable by construction.)
+          vrmMotionPlayer.idleEnabled = false;
+          // The model's own idle takes over from the KAWAII library. Named match
+          // first, then the single embedded clip: Chancelor has exactly one, and a
+          // future model that ships several should not get an arbitrary pick.
+          // Rebuilt only when the MODEL changes. This block runs on every bind,
+          // and creating a fresh AnimationMixer each time stacked one per turn
+          // (each still holding the skeleton) instead of replacing it.
+          if (idleMixerRef.current) {
+            idleMixerRef.current.stopAllAction();
+            idleMixerRef.current.uncacheRoot(idleMixerRef.current.getRoot() as THREE.Object3D);
+          }
+          idleMixerRef.current = null;
+          if (!vrmMotionPlayer.idleEnabled) {
+            const clips = (gltf.animations || []) as THREE.AnimationClip[];
+            const own = clips.find((c) => /idle/i.test(c.name))
+              || (clips.length === 1 ? clips[0] : undefined);
+            if (own) {
+              // RETARGET onto the NORMALIZED humanoid bones. The clip animates the
+              // raw skeleton, but three-vrm's humanoid.update() copies
+              // normalized -> raw every frame, so anything written straight to the
+              // raw nodes is erased before it is ever drawn — the clip played and
+              // nothing moved.
+              const rawToNorm = new Map<string, string>();
+              for (const b of Object.keys((vrm.humanoid as any).humanBones || {})) {
+                const raw = vrm.humanoid.getRawBoneNode(b as any);
+                const norm = vrm.humanoid.getNormalizedBoneNode(b as any);
+                if (raw && norm) rawToNorm.set(raw.name, norm.name);
+              }
+              const retargeted = own.clone();
+              let hit = 0;
+              retargeted.tracks = retargeted.tracks.filter((t: THREE.KeyframeTrack) => {
+                const dot = t.name.indexOf(".");
+                const node = t.name.slice(0, dot);
+                const prop = t.name.slice(dot);
+                const mapped = rawToNorm.get(node);
+                if (!mapped) return false;      // non-humanoid track: leave the rig alone
+                if (prop !== ".quaternion") return false; // normalized bones take rotation only
+                t.name = `${mapped}${prop}`;
+                hit += 1;
+                return true;
+              });
+              if (!hit) {
+                console.warn("[VRM] embedded idle: no humanoid tracks matched — not played");
+              }
+              const mixer = new THREE.AnimationMixer(vrm.scene);
+              mixer.clipAction(retargeted).play();
+              idleMixerRef.current = hit ? mixer : null;
+              console.info("[VRM] embedded idle clip:", own.name, own.duration.toFixed(2), "tracks:", hit);
+            } else {
+              console.info("[VRM] no embedded idle clip — the body holds its last pose");
+            }
+          }
+          // Does the SERVER have an idle rotation for this character? Asked after the
+          // embedded fallback is already running, so a slow or failed answer simply
+          // leaves the model on its own clip rather than freezing it. A non-empty
+          // rotation wins: stop the embedded mixer and let the library drive.
+          void (async () => {
+            const conf = vrmMotionPlayer.confUid;
+            // NO conf, NO library. Without a character we cannot tell whose rotation
+            // the default set is, and guessing costs far more in one direction than
+            // the other: Chancelor running Miku's anime idles misrepresents a real
+            // public figure, while a Miku that waits one model-bind for her clips is
+            // merely dull. conf_uid is set from set-model-and-conf, which is the same
+            // message that carries the model URL, so it is already there in practice.
+            if (!conf) return;
+            try {
+              const r = await fetch(`/motion/catalog?conf=${encodeURIComponent(conf)}`);
+              if (!r.ok) return;
+              const d = await r.json();
+              // The model may have been swapped while this was in flight.
+              if (vrmMotionPlayer.confUid !== conf) return;
+              if (!(d.active || []).length) return;
+              vrmMotionPlayer.idleEnabled = true;
+              if (idleMixerRef.current) {
+                idleMixerRef.current.stopAllAction();
+                idleMixerRef.current.uncacheRoot(idleMixerRef.current.getRoot() as THREE.Object3D);
+                idleMixerRef.current = null;
+              }
+              console.info(`[VRM] idle library: ${d.active.length} clips for ${d.conf}`
+                + (d.inherited ? " (shared default)" : ""));
+            } catch { /* offline / no motion routes: keep the embedded clip */ }
+          })();
+          disposeFacePanel = buildFacePanel(
+            faceDict || (faceMeshes[0].morphTargetDictionary as Record<string, number>),
+          ); // 🎭 resting-face tuning panel
+        }
+        if (faceMeshes.length) {
           disposeLookPanel = buildLookPanel(); // 🎨 visual (light/grade/effect) panel
         }
         (window as unknown as { __vrm?: VRM }).__vrm = vrm;
+        // Re-frame now that there is a body to measure. Until this existed the
+        // framing was solved once at startup against a hard-coded 1.65 m, so a
+        // taller model was cropped at the head and a shorter one floated.
+        applyFraming();
         // Debug handles for the retarget-accuracy overlay (ground-truth SMPL skeleton).
         (window as any).__three = THREE;
         (window as any).__vrmCam = camera;
@@ -3297,6 +4705,13 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         // __vrmFace(true) brings the emotion presets back (default face only for now).
         (window as any).__vrmFace = (on = true) => { vrmExpression.emotionEnabled = on; if (!on) vrmExpression.relax(); return on; };
         (window as any).__vrmScene = scene;
+        // Toggle the stylised pass (rim light / line art / toon grade) for the
+        // loaded model. Reads LOOK through the same override, so nothing is
+        // written and Miku's saved look cannot be affected either way.
+        (window as any).__vrmPlainStyle = (on?: boolean) => {
+          if (typeof on === "boolean") { plainStyle = on; applyLookState(); }
+          return { plainStyle };
+        };
         // Console helpers: set a resting-face morph (persists), test an emotion,
         // list morphs, reset the resting face.
         (window as any).__vrmFace = (name: string, value = 0.6) => {
@@ -3320,7 +4735,9 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         // msTC mouth narrowing (author's value 0.35). 口横縮小 was one of the 31 morphs the
         // PMX->VRM export dropped and has been re-injected, so this drives the real morph.
         (window as any).__vrmLipNarrow = (v: number) => {
-          localStorage.setItem("vrmLipNarrow", String(v)); // persists across reloads
+          localStorage.setItem("vrmLipNarrow", String(v)); // NOT per-model: the reader in
+          // vrm-expression.ts uses the bare key, and this value only applies to the
+          // PMX lip morphs, so it is already effectively one model's setting.
           const ex = vrmExpression as unknown as { base: Record<string, number>; dict: Record<string, number> };
           if (ex.dict?.["口横縮小"] != null) ex.base["口横縮小"] = v; // applied on the next update()
           return v;
@@ -3352,11 +4769,13 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     };
     const cmpBtn = document.createElement("button");
     cmpBtn.textContent = "🔬";
-    cmpBtn.title = "論文のSMPL素体と並べて比較";
+    cmpBtn.title = L("論文のSMPL素体と並べて比較", "Compare against the paper SMPL body");
     cmpBtn.style.cssText = "position:absolute;top:8px;right:80px;z-index:20;width:32px;height:32px;"
       + "border-radius:8px;border:1px solid rgba(255,255,255,.25);background:rgba(20,24,40,.6);"
       + "color:#fff;cursor:pointer;font-size:15px;line-height:1";
-    container.appendChild(autoHide(cmpBtn));
+    // 論文比較ボタンは非表示（不要との判断）。生成と配線はそのまま残して
+    // あるので、DOM に足す一行を戻せば復活する。
+    // container.appendChild(autoHide(cmpBtn));
     const setCompare = async (on: boolean) => {
       compareOn = on;
       try { localStorage.setItem("motionCompare", on ? "1" : "0"); } catch { /* ignore */ }
@@ -3389,12 +4808,19 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     // real model; the numbers next to each row (foot lift / knee) are just a warning.
     const pickBtn = document.createElement("button");
     pickBtn.textContent = "🎬";
-    pickBtn.title = "アイドルモーションを試聴して選ぶ";
-    pickBtn.style.cssText = "position:absolute;top:8px;right:118px;z-index:20;width:32px;height:32px;"
+    pickBtn.title = L("アイドルモーションを試聴して選ぶ", "Audition and pick idle motions");
+    pickBtn.style.cssText = "position:absolute;top:8px;right:122px;z-index:20;width:32px;height:32px;"
       + "border-radius:8px;border:1px solid rgba(255,255,255,.25);background:rgba(20,24,40,.6);"
       + "color:#fff;cursor:pointer;font-size:15px;line-height:1";
+    // The idle picker belongs to the KAWAII library, so it is shown only for the
+    // models that actually play those clips. Decided from the MODEL (its morph
+    // vocabulary) rather than a character name, so a new PMX model gets it too.
+    pickBtn.style.display = "none";
     container.appendChild(autoHide(pickBtn));
     const panel = document.createElement("div");
+    // Same class as the others: that is what the "close every panel" pass in each
+    // toggle looks for. Without it this one stayed open behind whatever was opened next.
+    panel.className = "vrm-tune-panel";
     panel.style.cssText = "position:absolute;top:48px;right:8px;z-index:21;width:330px;max-height:74%;"
       + "display:none;flex-direction:column;border-radius:10px;border:1px solid rgba(255,255,255,.18);"
       + "background:rgba(14,17,28,.94);color:#e8ecf5;font:12px/1.45 system-ui,sans-serif;"
@@ -3408,16 +4834,16 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       const info = document.createElement("span");
       info.style.cssText = "flex:1;opacity:.85";
       const saveBtn = document.createElement("button");
-      saveBtn.textContent = "保存";
+      SET(saveBtn, "保存", "Save");
       saveBtn.style.cssText = "padding:3px 10px;border-radius:6px;border:1px solid rgba(255,255,255,.25);"
         + "background:rgba(80,140,220,.85);color:#fff;cursor:pointer";
       const stopBtn = document.createElement("button");
-      stopBtn.textContent = "停止";
+      SET(stopBtn, "停止", "Stop");
       stopBtn.style.cssText = "padding:3px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.25);"
         + "background:rgba(60,64,80,.9);color:#fff;cursor:pointer";
       head.append(info, stopBtn, saveBtn);
       const filter = document.createElement("input");
-      filter.placeholder = "絞り込み (例: look, dance, pose)";
+      filter.placeholder = L("絞り込み (例: look, dance, pose)", "Filter (e.g. look, dance, pose)");
       filter.style.cssText = "margin:8px 10px 4px;padding:5px 8px;border-radius:6px;"
         + "border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#e8ecf5;flex:0 0 auto";
       const list = document.createElement("div");
@@ -3439,11 +4865,11 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
           cb.type = "checkbox"; cb.checked = chosen.has(c.key); cb.style.cssText = "cursor:pointer";
           cb.addEventListener("change", () => {
             if (cb.checked) chosen.add(c.key); else chosen.delete(c.key);
-            info.textContent = `${chosen.size} 個を採用 / 全 ${clips.length}`;
+            info.textContent = L(`${chosen.size} 個を採用 / 全 ${clips.length}`, `${chosen.size} in use / ${clips.length} total`);
           });
           const play = document.createElement("button");
           play.textContent = "▶";
-          play.title = "このモーションを今すぐ再生";
+          play.title = L("このモーションを今すぐ再生", "Play this motion now");
           play.style.cssText = "width:24px;padding:1px 0;border-radius:5px;cursor:pointer;"
             + "border:1px solid rgba(255,255,255,.22);background:rgba(255,255,255,.08);color:#fff";
           play.addEventListener("click", async () => {
@@ -3465,12 +4891,12 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
           const meta = document.createElement("span");
           meta.textContent = `${c.secs}s`;
           meta.title = `foot lift ${c.footLift ?? "?"}m / knee ${c.kneeMax ?? "?"}°`
-            + (c.warn ? " — 脚が大きく動くので崩れやすい" : "");
+            + (c.warn ? L(" — 脚が大きく動くので崩れやすい", " — large leg travel, prone to breaking") : "");
           meta.style.cssText = "opacity:.6;font-variant-numeric:tabular-nums";
           row.append(cb, play, name, meta);
           list.appendChild(row);
         }
-        if (!shown) list.textContent = "該当なし";
+        if (!shown) SET(list, "該当なし", "No matches");
       };
       filter.addEventListener("input", render);
       stopBtn.addEventListener("click", () => {
@@ -3478,37 +4904,56 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         vrmMotionPlayer.idleClips = true; // resume the normal rotation
       });
       saveBtn.addEventListener("click", async () => {
-        saveBtn.disabled = true; saveBtn.textContent = "保存中";
+        saveBtn.disabled = true; SET(saveBtn, "保存中", "Saving");
         try {
+          // conf: saves THIS character's rotation. Without it the save would edit
+          // the shared default and hand Miku's set to Chancelor as well.
           const r = await fetch("/motion/idle-set", {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ active: [...chosen] }),
+            body: JSON.stringify({ active: [...chosen], conf: vrmMotionPlayer.confUid || undefined }),
           });
           const d = await r.json();
-          info.textContent = `保存しました (${(d.active || []).length} 個)`;
+          info.textContent = L(`保存しました (${(d.active || []).length} 個)`, `Saved (${(d.active || []).length})`);
           vrmMotionPlayer.idleClips = true;
-        } catch { info.textContent = "保存に失敗"; }
-        saveBtn.disabled = false; saveBtn.textContent = "保存";
+          // A character that had no set now has one, so the library takes over from
+          // whatever it was doing (embedded clip / held pose) without a reload —
+          // and un-ticking everything hands it straight back.
+          vrmMotionPlayer.idleEnabled = (d.active || []).length > 0;
+        } catch { SET(info, "保存に失敗", "Save failed"); }
+        saveBtn.disabled = false; SET(saveBtn, "保存", "Save");
       });
       return {
         load: async () => {
-          info.textContent = "読み込み中...";
+          SET(info, "読み込み中...", "Loading...");
           try {
-            const r = await fetch("/motion/catalog");
+            const conf = vrmMotionPlayer.confUid;
+            const r = await fetch(`/motion/catalog${conf ? `?conf=${encodeURIComponent(conf)}` : ""}`);
             const d = await r.json();
             clips = d.clips || [];
             chosen.clear();
             for (const k of d.active || []) chosen.add(k);
-            info.textContent = `${chosen.size} 個を採用 / 全 ${clips.length}`;
+            // `inherited` = these ticks are the shared default, not this character's
+            // own set. Saying so matters: the first save FORKS it, and the default
+            // stops following this character from then on.
+            const scope = d.inherited
+              ? L(" — 共有の既定値", " — shared default")
+              : L(` — ${d.conf} 専用`, ` — ${d.conf} only`);
+            info.textContent = L(`${chosen.size} 個を採用 / 全 ${clips.length}`, `${chosen.size} in use / ${clips.length} total`) + scope;
             render();
-          } catch { info.textContent = "カタログを取得できません"; }
+          } catch { SET(info, "カタログを取得できません", "Could not load the catalogue"); }
         },
       };
     };
     pickBtn.addEventListener("click", () => {
       const open = panel.style.display === "none";
+      // Close every other tuning panel first, exactly as the 🎭 and 🎨
+      // toggles do. This one used to just toggle itself, so it appeared
+      // on top of an already-open panel instead of replacing it.
+      retranslate(container);
+        container.querySelectorAll(".vrm-tune-panel").forEach((p) => {
+        (p as HTMLElement).style.display = "none";
+      });
       panel.style.display = open ? "flex" : "none";
-      pickBtn.style.background = open ? "rgba(80,140,220,.75)" : "rgba(20,24,40,.6)";
       if (open) {
         if (!picker) picker = buildPicker();
         picker.load();
@@ -3519,6 +4964,11 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
 
     const animate = () => {
       raf = requestAnimationFrame(animate);
+      // Single-step gate for measurement. A no-op (one boolean) unless
+      // __AI_DEBUG__.stepFrame() is driving, in which case the loop must not draw
+      // an unrequested frame — the temporal resolve accumulates, so a spare
+      // redraw of the same pose is not free the way it used to be.
+      if (!aiDebug.beginFrame()) return;
       // Per-FRAME draw stats. three resets info on every render() call, so with
       // a multi-pass composer the numbers otherwise only describe the final
       // fullscreen quad — read back via __space().render.
@@ -3527,7 +4977,9 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       // integration (hair/skirt exploding on a big gesture). Cap at ~1/30 s.
       // Single point of control for the whole frame: freeze/seek for automated
       // capture happens here, so no system needs its own debug flag.
-      const dt = aiDebug.step(Math.min(clock.getDelta(), 1 / 30));
+      // RAW delta: the long-stall clamp moved inside step(), so that frameStats()
+      // can see the true frame time instead of a value already flattened to 1/30.
+      const dt = aiDebug.step(clock.getDelta());
       controls.update(); // orbit damping
       // Head-coupled perspective. MUST run after controls.update(), which writes
       // the camera transform from its own orbit state and would otherwise undo
@@ -3538,8 +4990,43 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       // near and far structure separate, and separation is what "3D" is.
       framing.update(dt);
       applyOffAxis(camera, currentPanel(container));
+      // TAA jitter goes HERE and nowhere else. off-axis.ts has just overwritten
+      // projectionMatrix via makePerspective(); anything applied earlier is gone.
+      // Everything downstream — the normal pre-pass, GTAO, the composer — reads
+      // the camera after this point, so they all share one jitter and their
+      // buffers stay mutually consistent for free.
+      // Jitter in units of the INTERNAL raster — with taaUpscale active the
+      // scene renders fewer pixels, and the sub-pixel offsets must walk that
+      // grid, not the output one.
+      taa.apply(
+        camera,
+        Math.floor(container.clientWidth * pixelRatio * upscaleNow()),
+        Math.floor(container.clientHeight * pixelRatio * upscaleNow()),
+        dt,
+      );
+      // __space({ taa: 0 }) has to be a real escape hatch: the resolve is
+      // skipped and the bridge feeds the scene composer's output straight into
+      // the post chain, untouched. The resize() puts the internal scale back to
+      // 1 in the same breath — a low-res render with no accumulator to
+      // reconstruct it would just be a blur.
+      if (taaWasOn !== taa.enabled()) {
+        taaWasOn = taa.enabled();
+        taa.reset();
+        resize();
+      }
       if (vrm) {
+        // EMBEDDED IDLE (Chancelor's Female_Animation_Idle). It is a glTF clip of
+        // bone ROTATIONS, so it cannot go through vrmMotionPlayer (which consumes
+        // SMPL joint POSITIONS) — it needs its own mixer. The two must never run
+        // together: they write the same bones, so whichever runs last wins and the
+        // result is a fight, not a blend. The gesture player has priority; the
+        // mixer fills the gaps.
         vrmMotionPlayer.update(dt); // pose from the current gesture frame
+        // The mixer runs AFTER the player when the player is not driving, so the
+        // held pose it would otherwise keep writing does not overwrite the idle.
+        if (idleMixerRef.current && !vrmMotionPlayer.bodyBusy) {
+          idleMixerRef.current.update(dt);
+        }
         if (refFig) refFig.update(vrmMotionPlayer.getCurrentFrame()); // sync the reference body
         vrmMotionPlayer.updateIdle(dt); // breathing/sway when no gesture is playing
         // Re-drive the MMD append (付与親) chains the VRM export dropped — this rig skins
@@ -3577,7 +5064,31 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
             if (t != null) j.settings.dragForce = 1 - Math.pow(1 - t, 1 / subN);
           }
         }
-        for (let i = 0; i < subN; i += 1) vrm.update(dt / subN); // springs, constraints, look-at
+        // DECOMPOSED vrm.update(). Only the spring integrator needs sub-stepping;
+        // everything else vrm.update() calls is a direct solve that produces the
+        // same answer however many times it is asked, so running it 4-6x a frame
+        // was pure repetition — humanoid.update() over 55 bones, the look-at
+        // solve, expressionManager.update() (which allocates a weight object per
+        // expression on every call), and a loop over all 41 materials.
+        //
+        // Same call order as three-vrm's own update(): humanoid -> lookAt ->
+        // expressions -> constraints -> springs -> materials. Sub-steps see a
+        // pose that does not change between them, so the moved calls would have
+        // recomputed identical values; the material UV animation advances by
+        // delta, so one call at dt totals exactly what N calls at dt/N did.
+        const vc = vrm as unknown as {
+          humanoid?: { update(): void };
+          lookAt?: { update(d: number): void };
+          expressionManager?: { update(): void };
+          nodeConstraintManager?: { update(): void };
+          materials?: { update?(d: number): void }[];
+        };
+        vc.humanoid?.update();
+        vc.lookAt?.update(dt);
+        vc.expressionManager?.update();
+        vc.nodeConstraintManager?.update();
+        if (sbm) for (let i = 0; i < subN; i += 1) sbm.update(dt / subN);
+        if (vc.materials) for (const m of vc.materials) m.update?.(dt);
         // Real MMD hair physics (Bullet). Needs fresh world matrices: the pose above only
         // set local transforms. Steps the sim in PMX space and writes the twintail bones.
         if (mmdHairPhysics.enabled) {
@@ -3586,8 +5097,18 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         }
         vrmExpression.update(); // AFTER vrm.update so it overrides the expressionManager
         vrmLipSync.update(); // mouth-open morph from speech volume (no-op when silent)
+        // LAST, so the 😀 audition panel wins while it is open: on Miku the two
+        // above write every frame and would otherwise erase whatever is being
+        // previewed. No-op when nothing is held or sweeping.
+        faceMotion.update(dt);
       }
       neuralSpace.update(dt); // environment: floor pulse, drifting geometry, particles
+      // THE frame's world-matrix walk (see scene.matrixWorldAutoUpdate above).
+      // Everything that writes a transform — the pose, body depth, the camera
+      // drift, every environment module — has run by now, and nothing below
+      // moves anything, so every render after this point sees the same matrices
+      // the six separate walks used to produce.
+      scene.updateMatrixWorld();
       gradePass.uniforms.uTime.value += dt; // animate film grain
       if (bokehPass.enabled) {
         (bokehPass.uniforms as any).focus.value = camera.position.distanceTo(controls.target);
@@ -3619,9 +5140,40 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
           subUList[i].uPointPos.value.copy(pointViewPos);
         }
       }
-      composer.render();
+      // Motion vectors for this frame, rendered just before the resolve
+      // consumes them. Skipped while the history is latched (the hold path
+      // reads nothing) and while TAA is off (the resolve that samples them is
+      // skipped too, so the buffer would be dead weight).
+      if (taa.enabled() && !taa.holding()) taaVelocity.render(renderer, scene, camera);
+      // Shadow map: rendered by the NEXT render() call and only that one (see
+      // shadowMap.autoUpdate at setup). Armed here — after the velocity and
+      // normal pre-passes, which do not sample it — so the one map that gets
+      // built is the one the visible pass uses, at this frame's pose.
+      renderer.shadowMap.needsUpdate = true;
+      sceneComposer.render();
+      // The seam: scene side -> temporal resolve -> post side. With TAA off the
+      // resolve stands down and the bridge carries the scene output through
+      // untouched. readBuffer is re-read every frame because the composer's
+      // internal swaps change which target holds the final image.
+      const sceneOut = (sceneComposer as unknown as {
+        readBuffer: THREE.WebGLRenderTarget
+      }).readBuffer.texture;
+      if (taa.enabled()) taaResolve.render(renderer, camera, sceneOut);
+      taaResolve.updateCopy(taa.enabled() ? taaResolve.output : sceneOut, taa.enabled());
+      postComposer.render();
+      // Bone snapshot MUST come after the scene render: Skeleton.update() runs
+      // 2-5x inside it with identical values, and "previous frame" has to mean
+      // the pose this frame was drawn with, captured before the next
+      // vrm.update() moves the bones.
+      if (taa.enabled()) taaVelocity.snapshot();
+      aiDebug.endFrame(); // release a single-step waiter, once the frame exists
     };
     animate();
+    // Black box for the unreproducible under-skirt flash: rolling frame ring,
+    // "9" uploads it. Its own rAF, registered after animate()'s, so it copies
+    // each frame AFTER it is drawn. __flashRec(0) disables.
+    flashRecorder.start();
+    (window as any).__flashRec = (on: number | boolean = 1) => flashRecorder.setEnabled(!!on);
 
     // Resize on CONTAINER changes (not just window) so toggling the sidebar —
     // which resizes the canvas without a window resize event — doesn't stretch
@@ -3635,21 +5187,31 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setPixelRatio(pixelRatio);
-      composer.setPixelRatio(pixelRatio);
       renderer.setSize(w, h);
-      composer.setSize(w, h);
+      // Two composers, two resolutions: the scene side carries the TAAU scale,
+      // the post side is always full output resolution.
+      const s = upscaleNow();
+      sceneComposer.setPixelRatio(pixelRatio * s);
+      sceneComposer.setSize(w, h);
+      postComposer.setPixelRatio(pixelRatio);
+      postComposer.setSize(w, h);
       bloomPass.setSize(w, h);
       diffPass.setSize(w, h);
       // WebGLRenderTarget.setSize doesn't resize an attached DepthTexture —
       // update it (drawing-buffer size) or the line pass samples a stale size.
       const dw = Math.max(1, Math.floor(w * pixelRatio));
       const dh = Math.max(1, Math.floor(h * pixelRatio));
-      normalRT.setSize(dw, dh);
+      // Everything the SCENE side reads or writes lives at the internal scale.
+      const iw = Math.max(1, Math.floor(w * pixelRatio * s));
+      const ih = Math.max(1, Math.floor(h * pixelRatio * s));
+      normalRT.setSize(iw, ih);
       if (normalRT.depthTexture) {
-        (normalRT.depthTexture as any).image.width = dw;
-        (normalRT.depthTexture as any).image.height = dh;
+        (normalRT.depthTexture as any).image.width = iw;
+        (normalRT.depthTexture as any).image.height = ih;
       }
-      linePass.uniforms.uTexel.value.set(1 / dw, 1 / dh);
+      linePass.uniforms.uTexel.value.set(1 / iw, 1 / ih);
+      taaVelocity.setSize(iw, ih);
+      taaResolve.setSize(dw, dh, iw, ih); // history out, current-frame taps in
     };
     const ro = new ResizeObserver(resize);
     ro.observe(container);
@@ -3666,9 +5228,12 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       controls.dispose();
       disposeFacePanel?.();
       disposeLookPanel?.();
+      disposeFaceMotionPanel?.();
+      faceMotion.clear();
       mmdHairPhysics.dispose();
       delete (window as any).__vrmHairPhys;
       delete (window as any).__vrmMask;
+      delete (window as any).__vrmCost;
       delete (window as any).__vrmForceHi;
       delete (window as any).__vrmDebug;
       delete (window as any).__vrmPreset;
@@ -3697,7 +5262,6 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         }
         VRMUtils.deepDispose(vrm.scene);
       }
-      disposeAutoHide();
       neuralSpace.dispose();
       delete (window as any).__space;
       delete (window as any).__spaceRebuild;
@@ -3723,7 +5287,14 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       delete (window as any).__offAxis;
       delete (window as any).__headCalibrate;
       delete (window as any).__protoCalibrate;
-      composer.dispose();
+      sceneComposer.dispose();
+      postComposer.dispose();
+      // EffectComposer.dispose() frees its own two targets and nothing else — it
+      // never calls dispose() on the passes. The history buffers are full-size
+      // RGBA16F, so leaving them behind leaks tens of MB every time this effect
+      // re-runs, which it does on every model switch.
+      taaResolve.dispose();
+      taaVelocity.dispose();
       bgTex.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === container) {

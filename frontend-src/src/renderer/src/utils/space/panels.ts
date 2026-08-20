@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { FullScreenQuad } from "three/examples/jsm/postprocessing/Pass.js";
 import { SPACE } from "./space-config";
 import { driftBase, driftTarget, orbitPose } from "./framing";
 import { SPACE_LAYER } from "./layers";
@@ -31,6 +32,7 @@ void main() {
 
 const FROST_FRAG = /* glsl */ `
 uniform sampler2D uBack;
+uniform sampler2D uBlurTex;
 uniform vec2 uResolution;
 uniform vec2 uTexel;
 uniform float uBlur;
@@ -77,18 +79,29 @@ void main() {
   float soft = e * e * (3.0 - 2.0 * e);
   if (soft <= 0.002) discard;
 
-  float radius = uBlur * soft;
-  vec3 acc = vec3(0.0);
-  float wsum = 0.0;
-  for (int j = -2; j <= 2; j++) {
-    for (int i = -2; i <= 2; i++) {
-      vec2 o = vec2(float(i), float(j)) * uTexel * radius;
-      float w = exp(-float(i * i + j * j) * 0.35);
-      acc += texture2D(uBack, su + o).rgb * w;
-      wsum += w;
-    }
-  }
-  vec3 c = acc / wsum;
+  /**
+   * TWO TAPS, not twenty-six.
+   *
+   * This used to run a 5x5 kernel per fragment with the radius scaled by "soft".
+   * Six of these quads overlap ~174% of the frame, so at the panel's native
+   * resolution that was ~10^8 dependent texture fetches per frame — by a wide
+   * margin the most expensive thing the environment did, and the first thing to
+   * fall over on a phone.
+   *
+   * The kernel is separable (exp(-(i*i+j*j)*0.35) factorises), and it samples a
+   * target that is IDENTICAL for all six panels, so the blur is now done ONCE
+   * into uBlurTex by two 5-tap passes at the backdrop target's own quarter
+   * resolution — the same Gaussian, a sixteenth of the pixels, computed once
+   * instead of six times over.
+   *
+   * What changes: "soft" used to widen the radius from 0, and now cross-fades
+   * from the sharp image to the fully blurred one. The property that mattered is
+   * kept exactly — at soft = 0 the result IS the background, so the blob still
+   * reaches zero with no seam to join (see the note above) — and the falloff
+   * between is a fade rather than a widening.
+   */
+  vec3 sharpTap = texture2D(uBack, su).rgb;
+  vec3 c = mix(sharpTap, texture2D(uBlurTex, su).rgb, soft);
 
   /**
    * Show the frost ONLY where it has something to blur.
@@ -112,8 +125,7 @@ void main() {
    * all three vanish for the same reason. Where there ARE lines behind the glass
    * the gate opens and they soften, which is the whole point of the effect.
    */
-  vec3 sharp = texture2D(uBack, su).rgb;
-  float detail = length(c - sharp);
+  float detail = length(c - sharpTap);
   float gate = smoothstep(0.0, max(uDetail, 1e-4), detail);
   float a = uOpacity * soft * gate;
   if (a <= 0.002) discard;
@@ -537,6 +549,59 @@ export function createPanels(
   const rtSize = new THREE.Vector2(4, 4);
   const drawSize = new THREE.Vector2();
 
+  /**
+   * The pre-blurred copy of `backRT`, and the ping-pong buffer that produces it.
+   *
+   * Same quarter resolution as the source, so the whole prefilter is a sixteenth
+   * of the frame's pixels done twice — against the six full-size 26-tap panel
+   * quads it replaces (see FROST_FRAG). Half float to match backRT: the chain is
+   * linear HDR, and going through an 8-bit intermediate would band the gradients
+   * the frost exists to show.
+   */
+  const makeBlurRT = () => {
+    const rt = new THREE.WebGLRenderTarget(4, 4, {
+      depthBuffer: false,
+      stencilBuffer: false,
+      type: THREE.HalfFloatType,
+    });
+    rt.texture.minFilter = THREE.LinearFilter;
+    rt.texture.magFilter = THREE.LinearFilter;
+    rt.texture.generateMipmaps = false;
+    return rt;
+  };
+  const blurTmpRT = makeBlurRT();
+  const blurRT = makeBlurRT();
+  // Weights are exactly the separable factors of the kernel the fragment shader
+  // used to evaluate inline: exp(-(i*i+j*j)*0.35) = exp(-i*i*0.35)*exp(-j*j*0.35).
+  // Run once horizontally and once vertically, this reproduces that 5x5 blur.
+  const blurMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uSrc: { value: null as THREE.Texture | null },
+      uStep: { value: new THREE.Vector2() },
+    },
+    vertexShader: `
+varying vec2 vUv;
+void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+`,
+    fragmentShader: `
+uniform sampler2D uSrc;
+uniform vec2 uStep;
+varying vec2 vUv;
+void main() {
+  float w0 = 1.0;
+  float w1 = exp(-0.35);
+  float w2 = exp(-1.4);
+  vec3 acc = texture2D(uSrc, vUv).rgb * w0;
+  acc += (texture2D(uSrc, vUv + uStep).rgb + texture2D(uSrc, vUv - uStep).rgb) * w1;
+  acc += (texture2D(uSrc, vUv + 2.0 * uStep).rgb + texture2D(uSrc, vUv - 2.0 * uStep).rgb) * w2;
+  gl_FragColor = vec4(acc / (w0 + 2.0 * w1 + 2.0 * w2), 1.0);
+}
+`,
+    depthTest: false,
+    depthWrite: false,
+  });
+  const blurQuad = new FullScreenQuad(blurMat);
+
   PANELS.forEach((spec, i) => {
     const group = new THREE.Group();
     group.position.set(spec.x, spec.y, spec.z);
@@ -548,6 +613,7 @@ export function createPanels(
     const frostMat = new THREE.ShaderMaterial({
       uniforms: {
         uBack: { value: backRT.texture },
+        uBlurTex: { value: blurRT.texture },
         uResolution: { value: new THREE.Vector2(1, 1) },
         uTexel: { value: new THREE.Vector2(1, 1) },
         uBlur: { value: SPACE.panelBlur },
@@ -651,8 +717,15 @@ export function createPanels(
     if (w !== rtSize.x || h !== rtSize.y) {
       rtSize.set(w, h);
       backRT.setSize(w, h);
+      blurTmpRT.setSize(w, h);
+      blurRT.setSize(w, h);
     }
 
+    // The scene's automatic walk is off (see vrm-viewer's scene setup), and this
+    // render happens BEFORE the frame's own walk — the modules after this one in
+    // the build list have not moved yet either way. Walk here so the backdrop
+    // sees exactly what it saw when three did this implicitly.
+    scene.updateMatrixWorld();
     const prevTarget = renderer.getRenderTarget();
     const prevMask = camera.layers.mask;
     root.visible = false;              // no feedback: the glass must not sample itself
@@ -660,6 +733,18 @@ export function createPanels(
     renderer.setRenderTarget(backRT);
     renderer.clear();
     renderer.render(scene, camera);
+    // Prefilter while the target is still bound-and-warm, before restoring the
+    // caller's state: two separable passes at backRT's own size.
+    const radius = Math.max(0, SPACE.panelBlur);
+    blurMat.uniforms.uSrc.value = backRT.texture;
+    (blurMat.uniforms.uStep.value as THREE.Vector2).set(radius / Math.max(1, w), 0);
+    renderer.setRenderTarget(blurTmpRT);
+    blurQuad.render(renderer);
+    blurMat.uniforms.uSrc.value = blurTmpRT.texture;
+    (blurMat.uniforms.uStep.value as THREE.Vector2).set(0, radius / Math.max(1, h));
+    renderer.setRenderTarget(blurRT);
+    blurQuad.render(renderer);
+
     renderer.setRenderTarget(prevTarget);
     camera.layers.mask = prevMask;
     root.visible = true;
@@ -712,6 +797,7 @@ export function createPanels(
         u.uResolution.value.copy(drawSize);
         u.uTexel.value.set(1 / Math.max(1, rtSize.x), 1 / Math.max(1, rtSize.y));
         u.uBlur.value = SPACE.panelBlur;
+        u.uBlurTex.value = blurRT.texture;
         u.uOpacity.value = frosted ? SPACE.panelFrost * gain : 0;
         u.uTintAmt.value = SPACE.panelTintAmt;
         u.uEdge.value = SPACE.panelFrostEdge;
@@ -738,6 +824,10 @@ export function createPanels(
         p.group.children.forEach((ch: THREE.Object3D) => (ch as THREE.Mesh).geometry?.dispose());
       });
       backRT.dispose();
+      blurTmpRT.dispose();
+      blurRT.dispose();
+      blurQuad.dispose();
+      blurMat.dispose();
       root.clear();
     },
   };

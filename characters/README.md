@@ -4,7 +4,7 @@ This directory is where you store all your custom character configurations. By c
 
 ## 🚀 How It Works
 
-When you launch Open-LLM-VTuber, the application loads the `conf.yaml` file from the project root as the **base configuration**. Then, when you switch characters from the front-end UI,it **overrides** the base settings with the values from your selected character's `.yaml` file in this `characters` directory.
+When you launch KEHAI, the application loads the `conf.yaml` file from the project root as the **base configuration**. Then, when you switch characters from the front-end UI,it **overrides** the base settings with the values from your selected character's `.yaml` file in this `characters` directory.
 
 This means:
 **You only need to specify the settings you want to change in your character's configuration file.**

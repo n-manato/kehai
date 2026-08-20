@@ -43,9 +43,22 @@ export function resolvePixelRatio(cssW?: number, cssH?: number): number {
   // sqrt because the ratio scales BOTH axes.
   const budgetRatio = Math.sqrt(SPACE.maxDrawPixels / area);
 
-  // Never exceed the device ratio: past native, extra samples buy nothing but
-  // cost everything.
-  return Math.max(0.5, Math.min(dpr, SPACE.pixelRatioCap, budgetRatio));
+  // `superSample` deliberately allows going PAST the device ratio.
+  //
+  // This used to be a hard `min(dpr, …)` on the reasoning that "past native,
+  // extra samples buy nothing but cost everything". That holds for texture
+  // detail — it does not hold for a thin, high-contrast edge. Her outline is an
+  // extruded hull about a pixel wide; at exactly 1.0 it lands differently on the
+  // pixel grid every frame she moves, and the eye reads that as the line
+  // crawling and flickering. MSAA cannot fix it (it samples geometry coverage,
+  // not the sub-pixel motion of a line between frames) and SMAA cannot either
+  // (it is a single-frame spatial filter on the finished image). Rendering above
+  // native and letting the downscale average is the one thing that does.
+  //
+  // Still bounded by pixelRatioCap and the total-pixel budget, so it can never
+  // outrun the frame time those exist to protect.
+  const ss = Math.max(1, SPACE.superSample || 1);
+  return Math.max(0.5, Math.min(dpr * ss, SPACE.pixelRatioCap, budgetRatio));
 }
 
 /**

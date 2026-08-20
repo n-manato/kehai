@@ -28,7 +28,47 @@ import { mmdExpression } from '@/utils/mmd-expression';
 import { vrmExpression } from '@/utils/vrm-expression';
 import { vrmLipSync } from '@/utils/vrm-lipsync';
 import { StreamingAudioPlayer, streamingPlaybackState } from '@/utils/streaming-audio-player';
+import { WsOpusDecoder } from '@/utils/ws-opus-decoder';
 import { useBrowser } from '@/context/browser-context';
+
+// Watches the first seconds of a reply and, if no sound actually happens, moves
+// the audio off WebRTC. Armed once per turn; the check is cheap and stops as
+// soon as it sees audio.
+//
+// It exists because "she speaks but nothing comes out" is invisible to the app:
+// every other part of a turn (subtitle, mouth, gesture) is driven by control
+// messages that arrive perfectly well while the audio path is dead.
+let silenceWatchdog: number | null = null;
+
+function startSilenceWatchdog(): void {
+  if (silenceWatchdog !== null || !webrtcAudio.active) return;
+  const t0 = performance.now();
+  let sawArriving = false;
+  const tick = () => {
+    if (!webrtcAudio.active) { silenceWatchdog = null; return; }
+    sawArriving = sawArriving || webrtcAudio.playbackHealth().arriving;
+    // ARRIVAL is the only trigger, deliberately.
+    //
+    // `playing` cannot be trusted either way: an element fed a stream carrying
+    // nothing still reports itself as playing, since its clock advances through
+    // the silence — so it does not prove sound. And its absence does not prove
+    // failure either; when audio arrives but the browser will not start it, the
+    // cause is a missing user gesture, which the WebSocket player needs just as
+    // much (its AudioContext starts suspended). Falling back then would swap one
+    // blocked path for another while discarding a working one.
+    //
+    // So this fires only for the unambiguous case: nothing arrived at all. A
+    // session that can hear is never disturbed by it.
+    if (sawArriving) { silenceWatchdog = null; return; }
+    if (performance.now() - t0 < 6000) {
+      silenceWatchdog = window.setTimeout(tick, 300);
+      return;
+    }
+    silenceWatchdog = null;
+    webrtcAudio.fallbackToWebSocket('no audio arrived over WebRTC for 6s of speech');
+  };
+  silenceWatchdog = window.setTimeout(tick, 250);
+}
 
 // Decode a base64 audio-stream-chunk payload to an ArrayBuffer of raw int16 PCM.
 function base64ToArrayBuffer(b64: string): ArrayBuffer {
@@ -100,7 +140,10 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
   const { aiState, setAiState, backendSynthComplete, setBackendSynthComplete } = useAiState();
   const { setModelInfo } = useLive2DConfig();
   const { setSubtitleText } = useSubtitle();
-  const { clearResponse, setForceNewMessage, appendHumanMessage, appendOrUpdateToolCallMessage } = useChatHistory();
+  const {
+    clearResponse, setForceNewMessage, appendHumanMessage, appendAIMessage,
+    appendOrUpdateToolCallMessage,
+  } = useChatHistory();
   const { addAudioTask } = useAudioTask();
   const bgUrlContext = useBgUrl();
   const {
@@ -119,6 +162,16 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
   // per-sentence HTMLAudioElement path (case 'audio') is untouched; only ONE of
   // the two runs, depending on whether the backend streams (GSV_STREAM=1).
   const streamPlayerRef = useRef<StreamingAudioPlayer | null>(null);
+  // ONE Opus decoder per turn, not per sentence. Decoding is asynchronous, so a
+  // second decoder running alongside the first would interleave its output into
+  // the player and scramble the speech. The server restarts its encoder each
+  // sentence, which this side simply reads as a packet-loss-shaped seam — Opus
+  // is designed to survive that, and it costs one 20 ms frame of transient.
+  const opusDecoderRef = useRef<WsOpusDecoder | null>(null);
+  const closeOpusDecoder = useCallback(() => {
+    opusDecoderRef.current?.close();
+    opusDecoderRef.current = null;
+  }, []);
   // AudioContext time at which the CURRENT streamed sentence's audio starts —
   // captured at its audio-stream-start (= player.scheduledEnd, the tail of the
   // buffered audio) so its co-speech gesture gets a per-sentence clock.
@@ -157,9 +210,21 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
       vrmOk: !!(window as any).__vrm,
     });
     wsService.sendMessage({ type: 'frontend-playback-complete' });
+    // Tell the server what this browser did with the audio it was sent, so
+    // "she has no voice" can be placed on one side of the wire from the log
+    // alone. See StreamingAudioPlayer.health().
+    if (streamPlayerRef.current) {
+      wsService.sendMessage({
+        type: 'audio-health',
+        ...streamPlayerRef.current.health(),
+      });
+    }
     setBackendSynthComplete(false);
     clearStreamTimers();
     vrmLipSync.onLiveEnd();
+    // Scheduled mouth shapes outlive the audio otherwise: on an interrupt the
+    // queue would keep articulating a sentence that is no longer being spoken.
+    vrmLipSync.clearVisemes();
     vrmMotionPlayer.cancelGesture(); // invalidate in-flight primary/upgrade polls at turn end
     // endTurn (not stop): keep the pose she finished on and let the first idle clip
     // CROSSFADE out of it — clearing the clip snapped the body toward rest (the ugly
@@ -170,9 +235,10 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
     mmdExpression.relax();
     talkingMotionController.onSpeechEnd();
     streamPlayerRef.current = null;
+    closeOpusDecoder();
     setAiState((s: AiState) => (s === 'thinking-speaking' ? 'idle' : s));
     if (autoStartMicOnConvEndRef.current) startMic();
-  }, [setAiState, startMic, clearStreamTimers, setBackendSynthComplete]);
+  }, [setAiState, startMic, clearStreamTimers, setBackendSynthComplete, closeOpusDecoder]);
 
   const stopStreamingNow = useCallback(() => {
     streamingPlaybackState.active = false;
@@ -181,27 +247,74 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
       streamPlayerRef.current.stop();
       streamPlayerRef.current = null;
     }
+    closeOpusDecoder();
     vrmLipSync.onLiveEnd();
+    // Scheduled mouth shapes outlive the audio otherwise: on an interrupt the
+    // queue would keep articulating a sentence that is no longer being spoken.
+    vrmLipSync.clearVisemes();
     vrmMotionPlayer.cancelGesture(); // invalidate in-flight primary/upgrade polls
     vrmMotionPlayer.interrupt(); // hold the pose across the handover (see interrupt())
     vrmMotionPlayer.stopTalking();
-  }, [clearStreamTimers]);
+  }, [clearStreamTimers, closeOpusDecoder]);
 
   // Interrupt (barge-in / user spoke): kill the stream immediately.
   useEffect(() => {
     if (aiState === 'interrupted') stopStreamingNow();
   }, [aiState, stopStreamingNow]);
 
+  // The browser is refusing to play her voice until this page gets a click.
+  // Surfaced as a toast because nothing else about it is visible: the reply
+  // streams, the body moves, the subtitles run, and only the sound is missing —
+  // which reads as "the server broke" and sends you debugging the wrong end.
+  useEffect(() => {
+    const onBlocked = () => toaster.create({
+      title: t('error.audioBlocked', 'Click anywhere to enable sound'),
+      type: 'warning',
+      duration: 6000,
+    });
+    window.addEventListener('kehai-audio-blocked', onBlocked);
+    return () => window.removeEventListener('kehai-audio-blocked', onBlocked);
+  }, [t]);
+
   useEffect(() => {
     autoStartMicOnConvEndRef.current = autoStartMicOnConvEnd;
   }, [autoStartMicOnConvEnd]);
 
+  // HOLD the first model load while a saved character is waiting to be restored.
+  // conf.yaml's default is Miku, so a session whose last character was Chancelor
+  // loaded Miku's model, then switched and loaded Chancelor's — visible as Miku
+  // flashing up first. Seeded from localStorage at mount (before any message can
+  // arrive) and cleared the moment we know no switch is coming, or the switch has
+  // landed.
+  //
+  // The timeout is only a backstop for a switch that never completes; it must NOT
+  // be tight enough to fire during a normal startup or it re-creates the very bug
+  // it guards. Measured on this machine: config-files -> switch-config ->
+  // config-switched lands ~12s after navigation on a cold load (a 6s backstop fired
+  // first, Miku loaded at 8.9s, and the flash was still there). 25s is well clear of
+  // that while still bounding a blank stage if the backend never answers.
+  const [restorePending, setRestorePending] = useState(() => {
+    try {
+      return !!localStorage.getItem('lastConfigFile');
+    } catch {
+      return false;
+    }
+  });
   useEffect(() => {
-    if (pendingModelInfo && confUid) {
+    if (!restorePending) return undefined;
+    const t2 = setTimeout(() => {
+      console.warn('[restore] character switch did not land — showing the default model');
+      setRestorePending(false);
+    }, 25000);
+    return () => clearTimeout(t2);
+  }, [restorePending]);
+
+  useEffect(() => {
+    if (pendingModelInfo && confUid && !restorePending) {
       setModelInfo(pendingModelInfo);
       setPendingModelInfo(undefined);
     }
-  }, [pendingModelInfo, setModelInfo, confUid]);
+  }, [pendingModelInfo, setModelInfo, confUid, restorePending]);
 
   const {
     setCurrentHistoryUid, setMessages, setHistoryList,
@@ -216,6 +329,13 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
       case 'stop-mic':
         console.log('Stopping microphone...');
         stopMic();
+        break;
+      case 'restart-mic':
+        // The server has not received a mic frame for several seconds while the peer
+        // still reports 'connected' — the media stalled without any state change, so
+        // only the far end can tell. Rebuild the peer; the mic track comes back with it.
+        console.warn('Server reports a stalled mic — restarting the WebRTC peer');
+        webrtcAudio.forceReconnect();
         break;
       case 'conversation-chain-start':
         setAiState('thinking-speaking');
@@ -308,6 +428,11 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
         if (message.conf_uid) {
           setConfUid(message.conf_uid);
           console.log('confUid', message.conf_uid);
+          // The idle rotation is per character, and the motion player is a plain
+          // class outside React, so it cannot read the config context. Hand it the
+          // uid here — this is the one place the server announces which character
+          // the session is now running.
+          vrmMotionPlayer.confUid = message.conf_uid;
         }
         if (message.client_uid) {
           setSelfUid(message.client_uid);
@@ -335,6 +460,7 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
         break;
       case 'config-switched':
         setAiState('idle');
+        setRestorePending(false); // the restore landed — this model may now load
         setSubtitleText(t('notification.characterLoaded'));
 
         toaster.create({
@@ -413,6 +539,14 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
           if (aiState === 'interrupted') break;
           if (!streamingPlaybackState.active) { vrmMotionPlayer.statsReset(); gestureFramesRef.current = 0; appliedGestureRef.current.clear(); }
           streamingPlaybackState.active = true;
+          // SILENCE WATCHDOG. The server has just said "I am speaking now", so
+          // audio must start arriving AND playing within a couple of seconds.
+          // If it does neither, the turn is silent and nothing else in the app
+          // notices — subtitles, mouth and gestures all run off these control
+          // messages, so the only symptom is no sound. Rather than leave that
+          // for someone to discover, drop to the WebSocket audio path, which
+          // the server uses whenever no WebRTC peer exists.
+          startSilenceWatchdog();
           vrmLipSync.onLiveStart(() => webrtcAudio.mouthValue(2.4));
           vrmMotionPlayer.suspendIdle(); // a turn is starting — no idle clips over speech
           vrmMotionPlayer.startTalkingLive(() => webrtcAudio.mouthValue(2.4));
@@ -421,9 +555,19 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
           webrtcOriginRef.current = performance.now() + playInMs;
           {
             const dtxt = message.display_text?.text;
+            const dname = message.display_text?.name;
+            const davatar = message.display_text?.avatar;
             const emo = message.actions?.emotions?.[0];
             const tid = setTimeout(() => {
               if (dtxt) setSubtitleText(dtxt);
+              // ...and into the chat panel. Only the per-file 'audio' path fed the
+              // history (via addAudioTask -> appendAIMessage), so with TRUE TTS
+              // STREAMING on, every reply was spoken but never written down.
+              // Appended on the same timer as the subtitle so the panel follows the
+              // voice, and so a barge-in that clears these timers also drops the
+              // lines she never got to say. appendAIMessage merges consecutive AI
+              // text, so the sentences of one turn land as one message.
+              if (dtxt) appendAIMessage(dtxt, dname, davatar);
               if (emo) vrmExpression.playEmotion(emo);
             }, playInMs);
             streamTimersRef.current.push(tid);
@@ -460,23 +604,53 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
           }
           break;
         }
-        if (aiState === 'interrupted' || aiState === 'listening') break;
+        // Same race the WebRTC branch above already gave up on, but here it
+        // costs the VOICE, not just the visuals: with no player built, every
+        // audio-stream-chunk of the turn is dropped on the floor while motion
+        // and subtitles (which ride audio-stream-end) keep running — "she moves
+        // but makes no sound". The two VADs end a turn independently, and the
+        // server's is FASTER: measured TTFA 600-800ms against a client VAD that
+        // still needs its redemption frames, so audio-stream-start routinely
+        // lands while aiState is 'listening' and the whole reply is lost. Only
+        // a REAL barge-in ('interrupted', set by use-interrupt) may drop audio;
+        // the server has already stopped sending for that turn anyway.
+        if (aiState === 'interrupted') break;
         if (!streamPlayerRef.current) {
           const player = new StreamingAudioPlayer({
             sampleRate: message.sample_rate || 32000,
             // Buffer lead before playback starts. Lower = faster first audio
             // (TTFA); too low = underrun (gaps) if the stream stalls. GSV streams
-            // at ~2x realtime so the buffer refills fast — 0.5s is a safe default
-            // (down from 1.5s, which was sized for the first co-speech clip to
-            // land; gesture is being decoupled to a procedural base layer). Tune
-            // live WITHOUT a rebuild: localStorage.streamPreroll = '0.3'; reload.
+            // at ~2x realtime so the buffer refills fast — 0.5s was the safe
+            // default (down from 1.5s, which was sized for the first co-speech
+            // clip to land; gesture is being decoupled to a procedural base
+            // layer). 0.25s now that the audio is Opus: the same speech is ~1/8
+            // the bytes, so a chunk clears the link far faster and the jitter
+            // this lead exists to absorb is correspondingly smaller. Straight
+            // 250ms off the time to first word. Tune live WITHOUT a rebuild:
+            // localStorage.streamPreroll = '0.5'; reload.
             prerollSec: (() => {
               const v = parseFloat(localStorage.getItem('streamPreroll') || '');
-              return Number.isFinite(v) && v >= 0 ? v : 0.5;
+              return Number.isFinite(v) && v >= 0 ? v : 0.25;
             })(),
             onEnded: () => finishStreamingTurn(),
+            // Opus decoding is asynchronous, so "nothing left to play" and
+            // "nothing has arrived yet" look identical to the drain check. The
+            // decoder is built just below and lives in a ref, so read it lazily.
+            morePending: () => (opusDecoderRef.current?.inFlight ?? 0) > 0,
           });
           streamPlayerRef.current = player;
+          // The server picks the codec per sentence and says so here; it only
+          // sends Opus to a client that declared it can decode (see audio-caps
+          // in websocket-service). Decoder outlives the sentence — see the ref.
+          if (message.codec === 'opus' && !opusDecoderRef.current) {
+            const dec = new WsOpusDecoder((samples) => {
+              streamPlayerRef.current?.enqueueFloat32(samples);
+            });
+            opusDecoderRef.current = dec.ok ? dec : null;
+            if (!dec.ok) {
+              console.warn('[ws-opus] server sent Opus but this client cannot decode it');
+            }
+          }
           vrmMotionPlayer.statsReset();
           streamingPlaybackState.active = true;
           // scale 2.4: live PCM RMS runs lower than the old normalized volumes[],
@@ -500,9 +674,12 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
           // of all flashing up front.
           const delayMs = Math.max(0, (origin - sp.currentTime()) * 1000);
           const dtxt = message.display_text?.text;
+          const dname = message.display_text?.name;
+          const davatar = message.display_text?.avatar;
           const emo = message.actions?.emotions?.[0];
           const tid = setTimeout(() => {
             if (dtxt) setSubtitleText(dtxt);
+            if (dtxt) appendAIMessage(dtxt, dname, davatar); // see the WebRTC branch
             if (emo) vrmExpression.playEmotion(emo);
           }, delayMs);
           streamTimersRef.current.push(tid);
@@ -511,10 +688,31 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
       }
       case 'audio-stream-chunk': {
         const p = streamPlayerRef.current;
-        if (p && message.data) p.enqueuePCM(base64ToArrayBuffer(message.data));
+        if (!p || !message.data) break;
+        // Codec is read off EACH chunk, not off the start frame: if the encoder
+        // throws mid-sentence the server drops back to PCM rather than going
+        // silent, and this follows it without needing to be told.
+        if (message.codec === 'opus') {
+          opusDecoderRef.current?.decode(base64ToArrayBuffer(message.data));
+        } else {
+          p.enqueuePCM(base64ToArrayBuffer(message.data));
+        }
         break;
       }
       case 'audio-stream-end': {
+        // MOUTH SHAPES for this sentence, if the TTS backend produced them.
+        // They ride the END frame because the character timings only complete
+        // with the last audio chunk — but they are timed from the sentence's
+        // START, and webrtcOriginRef is exactly when that start plays. Same
+        // reference the co-speech gesture below uses, for the same reason.
+        // Absent (GPT-SoVITS has no timings) leaves the volume-driven jaw alone.
+        {
+          const vis = (message as any).visemes;
+          if (Array.isArray(vis) && vis.length) {
+            const startAtS = (webrtcOriginRef.current || performance.now()) / 1000;
+            vrmLipSync.setVisemes(vis, startAtS);
+          }
+        }
         // All of this sentence's PCM is queued now. Its co-speech gesture id rode
         // the end frame. PREFETCH the clip immediately (max lead while the sentence
         // is still buffered ahead — clips take ~2s to generate), then APPLY it
@@ -560,6 +758,15 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
         }
         const pe = streamPlayerRef.current;
         const gm = message.actions?.motion;
+        // Count the gesture-carrying end frames on THIS path too. The increment
+        // used to exist only in the WebRTC branch above, so on any box where ICE
+        // fails and the frontend falls back to WS audio — which is every run on
+        // PC-B, see docs/PCB-HANDOFF.md — [motion-usage] reported gesture-frames 0
+        // for three days while the gestures were in fact playing. A metric that
+        // reads 0 on the transport it is measured on is worse than no metric: it
+        // was read as "co-speech motion is dead" and sent us looking for a fault
+        // that was not there.
+        if (gm?.id && gm.key === 'gesture') gestureFramesRef.current += 1;
         if (pe && gm?.id && gm.key === 'gesture' && (window as any).__vrm) {
           const origin = streamSentenceOriginRef.current;
           const dur = Math.max(0.1, pe.scheduledEnd() - origin);
@@ -755,7 +962,7 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
       default:
         console.warn('Unknown message type:', message.type);
     }
-  }, [aiState, addAudioTask, appendHumanMessage, baseUrl, bgUrlContext, setAiState, setConfName, setConfUid, setConfigFiles, setCurrentHistoryUid, setHistoryList, setMessages, setModelInfo, setSubtitleText, startMic, stopMic, setSelfUid, setGroupMembers, setIsOwner, backendSynthComplete, setBackendSynthComplete, clearResponse, handleControlMessage, appendOrUpdateToolCallMessage, interrupt, setBrowserViewData, t]);
+  }, [aiState, addAudioTask, appendHumanMessage, appendAIMessage, setRestorePending, baseUrl, bgUrlContext, setAiState, setConfName, setConfUid, setConfigFiles, setCurrentHistoryUid, setHistoryList, setMessages, setModelInfo, setSubtitleText, startMic, stopMic, setSelfUid, setGroupMembers, setIsOwner, backendSynthComplete, setBackendSynthComplete, clearResponse, handleControlMessage, appendOrUpdateToolCallMessage, interrupt, setBrowserViewData, t]);
 
   useEffect(() => {
     wsService.connect(wsUrl);
@@ -775,10 +982,14 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
     } catch {
       saved = null;
     }
-    if (!saved) return;
-    if (!configFiles.some((c) => c.filename === saved)) return;
+    // Every path that does NOT switch has to release the model-load hold above,
+    // or a stale/removed lastConfigFile would leave the stage empty for 6s.
+    if (!saved) { setRestorePending(false); return; }
+    if (!configFiles.some((c) => c.filename === saved)) { setRestorePending(false); return; }
     if (saved !== getFilenameByName(confName)) {
       wsService.sendMessage({ type: 'switch-config', file: saved });
+    } else {
+      setRestorePending(false); // already the right character — show it now
     }
   }, [confName, configFiles, getFilenameByName]);
 

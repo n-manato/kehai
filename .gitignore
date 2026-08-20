@@ -42,7 +42,7 @@ third_party/miniconda3/
 .env
 .motion_gateway_key
 api_keys.py
-src/open_llm_vtuber/llm/user_credentials.json
+src/kehai/llm/user_credentials.json
 
 # Database files
 memory.db
@@ -56,10 +56,10 @@ logs/*
 
 # Cache and models
 cache/*
-src/open_llm_vtuber/tts/asset
-src/open_llm_vtuber/tts/config
-src/open_llm_vtuber/asr/models*
-!src/open_llm_vtuber/asr/models/silero_vad.onnx
+src/kehai/tts/asset
+src/kehai/tts/config
+src/kehai/asr/models*
+!src/kehai/asr/models/silero_vad.onnx
 asset
 models/*
 !models/piper_voice
@@ -108,3 +108,26 @@ cache/motion/
 
 # Local reference video (too large for GitHub; keep only in the working tree)
 /videos/【MMD】トゥーン調エフェクトメイキング【msToonCoordinator】.mp4
+
+# ElevenLabs API key (same convention as .motion_gateway_key)
+.elevenlabs_key
+
+# --- 2026-08-20: push 前整理 ---
+# conf.yaml の作業用バックアップ。実キー (sk-proj- / lag_) が入っているので絶対に追跡しない。
+# 既存の `*.bak` ルールは `conf.yaml.bak-cloud-openai` のような接尾辞つきに当たらない。
+conf.yaml.bak-*
+# サーバのローテートログ
+server.err.log
+server.err.prev*.log
+server.prev*.log
+# 動画フレーム抽出の一時出力
+tmp_vidframes/
+tmp_vidframes2/
+# ASR 手動検証の残骸
+_asr_payload.json
+_asr_test.wav
+# Playwright の実行結果
+frontend-src/test-results/
+# 他エージェントのローカル設定
+.cursor/
+.gemini/

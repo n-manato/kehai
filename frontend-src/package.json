@@ -1,5 +1,5 @@
 {
-  "name": "open-llm-vtuber",
+  "name": "kehai",
   "version": "1.2.1",
   "description": "An Electron application with React and TypeScript",
   "main": "./out/main/index.js",
@@ -22,7 +22,9 @@
     "build:linux": "electron-vite build && electron-builder --linux",
     "dev:web": "vite serve src/renderer --config vite.config.ts",
     "build:web": "vite build --config vite.config.ts --mode web",
-    "extract-translations": "i18next-scanner --config i18next-scanner.config.js"
+    "extract-translations": "i18next-scanner --config i18next-scanner.config.js",
+    "render:chrome": "bash ../scripts/gpu-chrome.sh",
+    "render:metrics": "node ../scripts/render-metrics.mjs"
   },
   "dependencies": {
     "@chakra-ui/react": "^3.2.3",

@@ -62,14 +62,41 @@ interface SimBody {
   Oinvm: THREE.Matrix4;
 }
 
-/** btTransform -> three Matrix4 without allocating on the WASM heap. */
-function btToMatrix(Ammo: any, tf: any, qScratch: THREE.Quaternion, out: THREE.Matrix4): THREE.Matrix4 {
-  const q = tf.getRotation(); // allocates — destroyed below
-  qScratch.set(q.x(), q.y(), q.z(), q.w());
-  Ammo.destroy(q);
-  const o = tf.getOrigin(); // reference — no alloc
-  out.makeRotationFromQuaternion(qScratch);
-  out.setPosition(o.x(), o.y(), o.z());
+/**
+ * btTransform -> three Matrix4, genuinely without touching the WASM heap.
+ *
+ * The previous version went through `tf.getRotation()`, which returns a NEW
+ * btQuaternion — an allocation and a matching `Ammo.destroy()` for every
+ * physics body, every frame. With 273 bodies driven at 60 fps that is ~33,000
+ * WASM alloc/free pairs a second, purely to read three numbers.
+ *
+ * `getBasis()` returns a reference INTO the transform and `getRow()` a
+ * reference into that, so nothing is created and nothing has to be freed. It
+ * also skips reconstructing the rotation matrix from a quaternion, since the
+ * basis already is that matrix. btMatrix3x3 rows and Matrix4.set() are both
+ * row-major, so the rows map straight across.
+ *
+ * EACH ROW MUST BE READ BEFORE THE NEXT `getRow()` CALL. Emscripten hands back
+ * const-references through ONE shared wrapper per type, so `getRow(0)`,
+ * `getRow(1)` and `getRow(2)` are the same JS object: holding all three and
+ * reading them afterwards yields row 2 three times, and the hair comes out as
+ * spaghetti. Verified in the browser — the three handles compare `===`.
+ */
+function btToMatrix(tf: any, out: THREE.Matrix4): THREE.Matrix4 {
+  const b = tf.getBasis();
+  let r = b.getRow(0);
+  const a00 = r.x(); const a01 = r.y(); const a02 = r.z();
+  r = b.getRow(1);
+  const a10 = r.x(); const a11 = r.y(); const a12 = r.z();
+  r = b.getRow(2);
+  const a20 = r.x(); const a21 = r.y(); const a22 = r.z();
+  const o = tf.getOrigin();
+  out.set(
+    a00, a01, a02, o.x(),
+    a10, a11, a12, o.y(),
+    a20, a21, a22, o.z(),
+    0, 0, 0, 1,
+  );
   return out;
 }
 
@@ -131,6 +158,35 @@ export class MMDHairPhysics {
       });
       vrm.scene.updateMatrixWorld(true);
 
+      /**
+       * SKIRT-ONLY THIGH PADDING.
+       *
+       * The authored thigh capsules are 0.86 PMX = 6.88 cm in radius, but the
+       * VISIBLE thigh is fatter than that near the hip. Measured on this model
+       * (CPU-skinned body01 vertices whose dominant bone is 足D[RL], radial
+       * distance from the 足D→ひざD axis, bind pose):
+       *
+       *     p50 5.34 cm   p75 6.11   p90 6.65   p99 7.44   max 7.67
+       *
+       * So the top ~10% of the thigh surface pokes out past the collider by up
+       * to 7.7 mm. Cloth resting correctly ON the capsule is therefore buried
+       * that deep INSIDE the leg — which, on the skirt's thin cyan hem trim seen
+       * at a grazing angle from below, reads as a bright blade embedded in the
+       * flesh. Confirmed by measurement: a skirt bone sits inside the capsule
+       * radius in 100% of frames (median 6.38 cm vs the 6.90 cm capsule), i.e.
+       * the physics is doing its job and the collider is simply too thin.
+       *
+       * Fixed by ADDING a fatter twin capsule rather than growing the authored
+       * one: the twintails also collide with 足[RL], and 9 mm of extra radius
+       * there would change hair that is currently tuned. The twin is put in its
+       * own collision group and its mask allows ONLY the skirt (group 9), so
+       * nothing else in the world can see it.
+       */
+      const SKIRT_LEG_GROUP = 1; // unused by the bake (it has 0, 4, 6, 7, 9, 14)
+      const SKIRT_GROUP = 9;
+      const SKIRT_LEG_RADIUS = 0.98; // PMX units = 7.84 cm: covers max 7.67 + margin
+      const legTwins: { b: any; bone: THREE.Object3D; X: THREE.Matrix4; Om: THREE.Matrix4; rbM: THREE.Matrix4 }[] = [];
+
       const rbFormsM: (THREE.Matrix4 | null)[] = []; // bind body forms (three, PMX space)
       const euler = new THREE.Euler(); // PMX euler = THREE 'XYZ' order (matches MMDPhysics.js
       const one = new THREE.Vector3(1, 1, 1); // — Bullet's setEulerZYX composes DIFFERENTLY and
@@ -191,12 +247,33 @@ export class MMDHairPhysics {
         //    and shading; rejected on sight.
         // The accidental behaviour is what this VRM has been tuned around (legs support
         // the cloth, panels layer without fighting), so the raw mask is kept deliberately.
+        //
+        // NECKTIE MASK EXPERIMENTS — all reverted, do not re-apply without asking.
+        // Two shapes of change were tried on the tie chain (D1..D8, group 7) and
+        // both were rejected on sight by the user, so the raw mask stands here too:
+        //   * mask = self-only (the PMX author's design). Fixed the flap popping
+        //     through the hips, but the chain then has NOTHING holding it out and
+        //     falls into the dress — measured, radial distance from the spine axis
+        //     went D8 2.49cm / D7 4.03cm against a dress front at 7.1cm median.
+        //     The joints limit bending, not where the chain hangs.
+        //   * clearing the tie from 下半身辅 (it is baked ~3cm inside that r=20.8cm
+        //     hip sphere) while adding 上半身2 + Dx so the chest could hold it out.
+        //     Measured as working (D8 back out to 8.95cm, in front of the dress),
+        //     but rejected too.
+        // The numbers above are kept because they are expensive to re-derive; see
+        // docs/skirt-flicker-investigation.md for how they were measured.
         this.world.addRigidBody(body, 1 << b.group, b.mask);
         this.bodies.push({
           body, bone, mode: b.mode, X, Xinv: new THREE.Matrix4().copy(X).invert(),
           Om, Oinvm: new THREE.Matrix4().copy(Om).invert(),
         });
         if (b.hair && b.mode !== 0) this.hairBoneNames.add(bone.name);
+        // Remember the thigh colliders so a skirt-only fat twin can be added
+        // once the joints are wired (see SKIRT_LEG_RADIUS above). Deferred
+        // because the joint list indexes this.bodies positionally.
+        if (b.mode === 0 && /^(右足|左足)$/.test(b.name)) {
+          legTwins.push({ b, bone, X, Om, rbM });
+        }
       }
 
       // ---- constraints (btGeneric6DofSpringConstraint, MMDPhysics semantics) ---
@@ -223,8 +300,38 @@ export class MMDHairPhysics {
         this.world.addConstraint(c, true);
         this.constraints.push(c);
       }
+      // ---- skirt-only fat thigh capsules (see SKIRT_LEG_RADIUS above) --------
+      // Appended AFTER the joint loop on purpose: `data.joints` addresses
+      // this.bodies by index, so nothing may be inserted before it runs. These
+      // are kinematic, so step()'s first loop drives them from their bone and
+      // the write-back loop skips them (mode 0).
+      for (const t of legTwins) {
+        const shape = new Ammo.btCapsuleShape(SKIRT_LEG_RADIUS, t.b.size[1]);
+        const motion = new Ammo.btDefaultMotionState(this.matrixToNewBt(t.rbM));
+        const info = new Ammo.btRigidBodyConstructionInfo(
+          0, motion, shape, new Ammo.btVector3(0, 0, 0),
+        );
+        const twin = new Ammo.btRigidBody(info);
+        twin.setFriction(t.b.friction);
+        twin.setRestitution(t.b.restitution);
+        twin.setActivationState(4); // DISABLE_DEACTIVATION
+        twin.setSleepingThresholds(0, 0);
+        twin.setCollisionFlags(twin.getCollisionFlags() | 2); // CF_KINEMATIC_OBJECT
+        // Group of its own, and a mask that admits ONLY the skirt — the hair,
+        // the tie and the body cannot collide with this at all.
+        this.world.addRigidBody(twin, 1 << SKIRT_LEG_GROUP, 1 << SKIRT_GROUP);
+        this.bodies.push({
+          body: twin,
+          bone: t.bone,
+          mode: 0,
+          X: t.X,
+          Xinv: new THREE.Matrix4().copy(t.X).invert(),
+          Om: t.Om,
+          Oinvm: new THREE.Matrix4().copy(t.Om).invert(),
+        });
+      }
       this.enabled = true;
-      console.info(`[vrm] MMD hair physics ON: ${this.bodies.length} bodies, ${this.constraints.length} joints (Bullet/ammo)`);
+      console.info(`[vrm] MMD hair physics ON: ${this.bodies.length} bodies (incl. ${legTwins.length} skirt-only thigh pads), ${this.constraints.length} joints (Bullet/ammo)`);
       return true;
     } catch (e) {
       console.error("[vrm] MMD hair physics init failed — springbone fallback stays:", e);
@@ -266,12 +373,24 @@ export class MMDHairPhysics {
     }
     // 2) step at 120Hz fixed substeps — raising the physics rate is THE standard MMD fix
     // for skirt penetration (contacts get resolved before the leg moves through a panel).
-    this.world.stepSimulation(Math.min(dt, 0.1), 8, 1 / 120);
+    //
+    // The substep CEILING is what stops this becoming a death spiral. 296 bodies
+    // and 381 constraints are not cheap, so a slow frame hands Bullet a bigger
+    // dt, which buys more substeps, which makes the next frame slower again: at
+    // 60 fps the old (0.1s, 8) ceiling asked for 2 substeps, at 30 fps for 4, at
+    // 15 fps for 8 — accelerating away from recovery exactly when recovery
+    // matters. Two substeps is precisely what 60 fps needs at 120 Hz, so the
+    // steady state is bit-identical to before; below 60 the sim runs slow rather
+    // than dragging the frame rate down with it, and hair easing off is a far
+    // better failure than a stall.
+    const FIXED_HZ = 1 / 120;
+    const MAX_SUBSTEPS = 2;
+    this.world.stepSimulation(Math.min(dt, MAX_SUBSTEPS * FIXED_HZ), MAX_SUBSTEPS, FIXED_HZ);
     // 3) physics bodies drive their bones (root -> tip order = baked order)
     for (const sb of this.bodies) {
       if (!sb || sb.mode === 0) continue;
       sb.body.getMotionState().getWorldTransform(this._tf);
-      btToMatrix(this.Ammo, this._tf, this._q, this._m1);
+      btToMatrix(this._tf, this._m1);
       this._m1.multiply(sb.Oinvm); // boneForm_pmx = bodyForm * O^-1
       // target world (VRM) = A * boneForm_pmx * X^-1
       this._m2.copy(this.A).multiply(this._m1).multiply(sb.Xinv);

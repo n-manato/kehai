@@ -14,8 +14,8 @@ import uvicorn
 from loguru import logger
 from upgrade_codes.upgrade_manager import UpgradeManager
 
-from src.open_llm_vtuber.server import WebSocketServer
-from src.open_llm_vtuber.config_manager import Config, read_yaml, validate_config
+from src.kehai.server import WebSocketServer
+from src.kehai.config_manager import Config, read_yaml, validate_config
 
 os.environ["HF_HOME"] = str(Path(__file__).parent / "models")
 os.environ["MODELSCOPE_CACHE"] = str(Path(__file__).parent / "models")
@@ -310,7 +310,7 @@ def start_gpt_sovits_if_needed(raw_config: dict) -> None:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Open-LLM-VTuber Server")
+    parser = argparse.ArgumentParser(description="KEHAI Server")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     parser.add_argument(
         "--hf_mirror", action="store_true", help="Use Hugging Face mirror"
@@ -326,7 +326,7 @@ def parse_args():
 @logger.catch
 def run(console_log_level: str, auto_sovits: bool = True):
     init_logger(console_log_level)
-    logger.info(f"Open-LLM-VTuber, version v{get_version()}")
+    logger.info(f"KEHAI, version v{get_version()}")
 
     # Get selected language
     lang = upgrade_manager.lang
@@ -372,7 +372,7 @@ def run(console_log_level: str, auto_sovits: bool = True):
     ssl_kwargs = {}
     scheme = "http"
     if getattr(server_config, "enable_https", False):
-        from src.open_llm_vtuber.ssl_utils import ensure_self_signed_cert
+        from src.kehai.ssl_utils import ensure_self_signed_cert
 
         certfile, keyfile = ensure_self_signed_cert(
             server_config.ssl_certfile, server_config.ssl_keyfile

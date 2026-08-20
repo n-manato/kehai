@@ -8,6 +8,8 @@
  * space settings in their own key means the two can never reset each other.
  */
 
+import { deviceProfile } from "./device-profile";
+
 export type Quality = "low" | "medium" | "high";
 
 export const SPACE = {
@@ -494,7 +496,22 @@ export const SPACE = {
    * has to spend, and the reference framing leaves almost none.
    */
   fitBottomY: 0.0,
+  /**
+   * Top of the range that must stay in frame, metres.
+   *
+   * MEASURED FROM THE MODEL when `fitAutoHeight` is on, not assumed. 1.65 is
+   * Hatsune Miku's height in this scene and was hard-coded while she was the
+   * only 3D character; the first plain-.glb avatar stands 1.80 m and had its
+   * head cropped off the top of the frame, because the solver was still framing
+   * a 1.65 m subject. Anything model-specific has to come from the model.
+   */
   fitTopY: 1.65,
+  /** Re-derive fitTopY from the loaded character's own bounding box. Off pins
+   *  the value above, which is what you want when hand-tuning a crop. */
+  fitAutoHeight: true,
+  /** Headroom above the measured top, as a fraction of the model's height.
+   *  Hair and antennae usually sit outside the mesh bounds people think of. */
+  fitHeadroom: 0.012,
   /**
    * How far above the bottom edge her soles sit, as a fraction of the frame
    * height. Small on purpose — the brief is "just short of being cut off" — and
@@ -569,6 +586,161 @@ export const SPACE = {
   // --- Resolution -----------------------------------------------------------
   pixelRatioCap: 3.0,
   maxDrawPixels: 8_300_000,
+  /**
+   * Render ABOVE the display's own pixel ratio, then let the downscale average.
+   * 1 = native (previous behaviour). 1.5 costs 2.25x the pixels, 2 costs 4x.
+   *
+   * This is the lever for outline shimmer. On a dpr-1 monitor the character is
+   * drawn at exactly 1.0, where her ~1px outline hull re-lands on a different
+   * pixel every frame she moves and reads as a crawling, flickering edge.
+   * Supersampling is the only thing that actually removes it — MSAA antialiases
+   * geometry coverage within a frame, and the final SMAA pass is a spatial
+   * filter on an already-flickering image; neither addresses motion.
+   *
+   * Live-tunable, no rebuild:  __space({ superSample: 1.5 })
+   * The total-pixel budget above still caps it, so a big window quietly gets
+   * less of it rather than dropping frames.
+   *
+   * Back to 1.0 (2026-08-10). It was briefly 1.25, which measurably reduced the
+   * outline flicker — but that was treating a symptom. The line was sub-pixel
+   * because it was specified in metres; supersampling only meant more pixels for
+   * a line that should never have been that thin. The cause is fixed at
+   * SCREEN_OUTLINE in vrm-viewer.tsx, so there is no reason to charge every
+   * machine 1.56x the pixels for a workaround that is no longer doing anything.
+   *
+   * Still here, still live-tunable, if a display ever wants it.
+   */
+  superSample: 1.0,
+  /**
+   * Temporal antialiasing. 0 = off (the pre-TAA pipeline, exactly: the pass is
+   * skipped by the composer, so the chain is bit-for-bit what it was).
+   *
+   * This is the fix for the crawling edges, where supersampling was only ever a
+   * mitigation. Nothing in the pipeline looked at more than one frame at a time,
+   * so every edge recomputed itself from scratch each frame; see utils/space/taa.ts.
+   *
+   * ON: reprojection (bone-exact motion vectors + closest-depth dilation) is in,
+   * and with it the edge instability drops on every axis that was measured when
+   * this was the complaint. Per-frame changed pixels, taa=0 -> taa=1, one render
+   * per frame:
+   *
+   *          outline        internal edges   flat
+   *   t=6    2.04 -> 0.34   1.74 -> 0.30     0.097 -> 0.006
+   *   t=12   0.79 -> 0.72   0.52 -> 0.23     0.018 -> 0.003
+   *   t=20   0.97 -> 0.64   0.77 -> 0.27     0.035 -> 0.004
+   *
+   * Checked for the failure mode that would have vetoed it: consecutive frames
+   * of the swinging twintails show no trailing and no double image.
+   */
+  taa: 1,
+  /**
+   * How much of the reprojected history to keep, 0..1. Higher is steadier and
+   * ghostier. Was a conservative 0.85 while there was no reprojection — then the
+   * history was ALWAYS slightly wrong under motion, and keeping less of it was
+   * the only defence. With motion vectors the aligned history is right, and at
+   * 0.85 the 15%-per-frame ingest of the still-walking jitter kept thin ink
+   * lines oscillating (measured: raising this to 0.95 cut outline-pixel change
+   * by 69-76% at the low-motion times where that oscillation dominates). Ghost
+   * risk is carried by the clamp + reject + dilation instead, and the swinging
+   * twintails were checked frame-by-frame at this value: no tails.
+   */
+  taaFeedback: 0.95,
+  /**
+   * Neighbourhood clamp width, in standard deviations of the 3x3 colour
+   * distribution. Lower rejects history sooner — that is the anti-ghost knob.
+   */
+  taaClamp: 1.0,
+  /**
+   * How far the clamp may drag the history before it is thrown away outright,
+   * as a fraction of the local neighbourhood's own width. A history that has to
+   * travel most of the way across the box is not a slightly-stale version of this
+   * pixel — it is a different surface, uncovered since last frame. Clipping it
+   * would leave a plausible-looking wrong colour; binning it costs one aliased
+   * frame. Lower = more ghost-averse.
+   */
+  taaReject: 0.5,
+  /**
+   * Reprojection sanity ceiling, in pixels of motion per frame. Past it the
+   * history fetch is a guess, not a track — a gesture snap, a traffic mover
+   * wrapping from END_Z back to START_Z — so the history is discarded outright
+   * rather than fetched from wherever the vector happens to land.
+   */
+  taaMaxVel: 80,
+  /**
+   * Feedback ceiling for pixels that are moving fast (faded in between 2 and
+   * 20 px/frame). Reprojection puts old colour in the right PLACE but cannot
+   * give a surface its new silhouette, so a long history on something swinging
+   * hard keeps drawing the old shape — measured on her tie under a body swing,
+   * TAA's frame differed from the true frame on 9.1% of the region with the tie
+   * visibly the wrong width. Slow and still pixels keep the full `taaFeedback`,
+   * which is where the crawling-edge win actually comes from.
+   */
+  taaFastFeedback: 0.6,
+  /**
+   * Post-resolve contrast-adaptive sharpen, 0 = off. What CAS is to a game's
+   * TAA: the resolve trades a little sharpness for stability even with a
+   * bicubic history fetch, and this buys it back after the accumulator so it
+   * can never compound. Clamped to the local extremes, so no halos. 0.001 steps
+   * matter less than they look — the useful range is roughly 0.2..0.7.
+   */
+  taaSharpen: 0.4,
+  /**
+   * Thin-feature lock strength (FSR2's "locks", simplified), 0 disables. A
+   * sub-pixel ink line or hair strand only rasterises on the frames the jitter
+   * catches it; the clamp then erases on the misses what the hits accumulated,
+   * and the feature blinks. A pixel whose luma pokes past all four neighbours
+   * is locked for ~8 frames: it keeps more history and a wider clamp box.
+   * Ghost bound: a lock dies on motion (>4px/frame), on depth disocclusion,
+   * and by expiry — so the worst case is a wrong thin feature for ~133 ms.
+   */
+  taaLock: 1,
+  /**
+   * How much a depth disocclusion kills the history, 0..1. The clamp rejects
+   * by colour, so a newly-uncovered surface that resembles its old occluder
+   * ghosts; comparing this frame's depth against last frame's (stored by the
+   * resolve) catches that geometrically. Also the safety net that lets
+   * taaLock hold history as hard as it does.
+   */
+  taaDisocc: 1,
+  /**
+   * Internal render scale while TAA is on (TAAU), 0.5..1. The scene side —
+   * RenderPass, ink lines, GTAO, velocity — renders at this scale; the TAA
+   * history and everything after it (grade, DOF, bloom, SMAA) stay at full
+   * resolution, and the jittered low-res samples land on different output
+   * pixels each frame, so the accumulator reconstructs the difference. This is
+   * how current games buy their frame budget (DLSS/FSR quality mode = 0.67).
+   * Ignored (forced to 1) while taa is 0 — without the accumulator there is
+   * nothing to reconstruct with, only a bilinear stretch.
+   */
+  taaUpscale: 1.0,
+  /**
+   * Frames of a completely still scene after which the history LATCHES and stops
+   * accumulating. Determinism, not performance: `freeze()` stops the clock but not
+   * the renderer, and the jitter keeps walking, so a frozen scene never produces
+   * two identical frames — see the `converged` note in utils/space/taa.ts.
+   *
+   * Set to 0 to disable the latch. A measurement run MUST do that: latched frames
+   * are byte-identical by construction, so they report a perfect stability score
+   * whether or not the accumulation underneath works at all.
+   */
+  taaSettle: 24,
+  /**
+   * Diagnostic views, painted instead of the image.
+   *   1 = the resolve's decision: red = how far the history had to be clipped,
+   *       green = how much of it survived. Shows WHERE history is rejected.
+   *   2 = the velocity buffer: 0.5 grey = still, R/G offset = screen motion
+   *       (saturating at ±5 px/frame), blue marks skinned — her — pixels.
+   * Turn the blurring passes off with `__vrmLook({ bloomStrength: 0,
+   * diffusion: 0, dofAperture: 0 })` first, or bloom and DOF smear the readout.
+   */
+  taaDebug: 0,
+  /**
+   * MSAA samples on the main composer target. Was hard-coded to 4; most desktop
+   * GPUs report 8 or 16 for MAX_SAMPLES, and geometry edges (the outline hull is
+   * geometry) are exactly what MSAA is good at. Clamped to what the driver
+   * actually supports. Changing this needs a viewer rebuild, not just __space.
+   */
+  msaaSamples: 8,
 };
 
 export type SpaceConfig = typeof SPACE;
@@ -629,7 +801,12 @@ export const BUDGETS: Record<Quality, {
  * build is discarded so what ships is what you see — same guard the viewer's
  * LOOK uses, for the same reason ("directly why 変わってない keeps happening").
  */
-export const SPACE_BUILD = "s38"; // s38: frost only where it has something to blur
+// Bumped to discard TAA experiment state left in localStorage. A sweep writes its
+// last value back, and a stale entry is silently load-bearing: a persisted
+// taaSettle of 0 keeps the determinism latch off for every later run, and a
+// persisted taaDebug of 1 leaves the app showing the green/red diagnostic instead
+// of the character until someone thinks to clear it.
+export const SPACE_BUILD = "s42"; // s42: TAA locks + depth disocclusion + TAAU split
 const LS_SPACE = "vrmSpace1";
 
 /** Pick a starting quality from the hardware, so a weak PROTO box isn't crushed. */
@@ -656,16 +833,48 @@ export function setQualityValue(q: Quality) {
   quality = q;
 }
 
+/**
+ * One-time migration of individual keys onto an already-saved space config —
+ * the space twin of the look's GRADE_FIX. A saved blob with a matching _build
+ * overrides the shipped defaults verbatim, so editing a default here never
+ * reaches a browser that already persisted the old value; bumping SPACE_BUILD
+ * would deliver it only by discarding every other saved knob with it.
+ *
+ * Stamped (_rev) and re-saved immediately, so it applies once and a later
+ * deliberate hand-set of the same key sticks.
+ *
+ * rev 1: taa 0 -> 1. A stored taa:0 (from the TAA experiments) pins the
+ * temporal pass off and brings back exactly the crawling edges it was built to
+ * fix; shipped default is 1 and nothing in the sweeps depends on 0 anymore.
+ */
+const SPACE_REV = 1;
+const SPACE_FIX: Partial<SpaceConfig> = { taa: 1 };
+
 export function loadSpaceConfig() {
+  // The device budget goes on FIRST, so a saved blob can still override it: the
+  // tuning panel has to stay authoritative on whatever box it is being used on.
+  // Desktop values are identical to the shipped defaults, so this is a no-op
+  // anywhere that is not a phone.
+  const dev = deviceProfile();
+  if (dev.mobile) {
+    SPACE.maxDrawPixels = dev.maxDrawPixels;
+    SPACE.pixelRatioCap = dev.pixelRatioCap;
+    SPACE.msaaSamples = dev.msaaSamples;
+    // The particle fields are the one thing the quality tier actually scales.
+    quality = "low";
+  }
   try {
     const raw = localStorage.getItem(LS_SPACE);
     const saved = raw ? JSON.parse(raw) : null;
     if (saved && saved._build === SPACE_BUILD) {
-      const { _build, _quality, ...rest } = saved;
+      const { _build, _quality, _rev, ...rest } = saved;
+      const migrate = _rev !== SPACE_REV;
+      if (migrate) Object.assign(rest, SPACE_FIX);
       Object.assign(SPACE, rest);
       if (_quality === "low" || _quality === "medium" || _quality === "high") {
         quality = _quality;
       }
+      if (migrate) saveSpaceConfig();
     }
   } catch {
     /* ignore — fall back to the shipped defaults */
@@ -676,7 +885,7 @@ export function saveSpaceConfig() {
   try {
     localStorage.setItem(
       LS_SPACE,
-      JSON.stringify({ ...SPACE, _build: SPACE_BUILD, _quality: quality }),
+      JSON.stringify({ ...SPACE, _build: SPACE_BUILD, _quality: quality, _rev: SPACE_REV }),
     );
   } catch {
     /* ignore — private mode / quota */

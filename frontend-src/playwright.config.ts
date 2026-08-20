@@ -23,7 +23,7 @@ export default defineConfig({
   use: {
     baseURL: process.env.APP_URL || "https://localhost:12394",
     // The app server generates its own certificate for LAN HTTPS access
-    // (src/open_llm_vtuber/ssl_utils.py), so a browser has nothing to trust it against.
+    // (src/kehai/ssl_utils.py), so a browser has nothing to trust it against.
     ignoreHTTPSErrors: true,
     // A WebGL scene has no "networkidle": the render loop never stops issuing
     // frames, and model/texture loads continue well past DOMContentLoaded.

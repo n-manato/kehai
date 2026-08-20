@@ -1,7 +1,7 @@
 [project]
-name = "open-llm-vtuber"
+name = "kehai"
 version = "1.2.1"
-description = "Talk to any LLM with hands-free voice interaction, voice interruption, and Live2D taking face running locally across platforms"
+description = "KEHAI — a voice-interactive AI companion with a real-time VRM/Live2D body, running locally"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
@@ -54,7 +54,7 @@ channels = ["conda-forge"]
 platforms = ["win-64", "linux-64"]
 
 [tool.pixi.pypi-dependencies]
-open-llm-vtuber = { path = ".", editable = true }
+kehai = { path = ".", editable = true }
 
 [tool.pixi.dependencies]
 cudnn = ">=8.0,<9"

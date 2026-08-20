@@ -17,7 +17,7 @@ character_config:
       language: "ja"
   tts_config:
     gsv_stream:
-      ref_audio_path: "/home/ai-ccore/Documents/DEV/voice/refs/f02_025.wav"
+      ref_audio_path: "/home/ai-ccore/Documents/DEV/AICCORE-Nexus/stack/voice/refs/f02_025.wav"
       prompt_text: "今日はレーって始まってムーで終わる名前の女の子と一緒にいるといいことがありますよ。"
       text_lang: "ja"
       prompt_lang: "ja"

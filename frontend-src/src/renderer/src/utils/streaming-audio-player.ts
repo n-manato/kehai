@@ -28,6 +28,11 @@ export const streamingPlaybackState = { active: false };
 // stop/drain.
 let activePlayer: StreamingAudioPlayer | null = null;
 
+/** One pending autoplay unlock at a time — see armAutoplayUnlock. A player is
+ *  built per turn, so re-arming blindly would pile up listeners for the whole
+ *  session on a page that never gets clicked. */
+let unlockArmed = false;
+
 /** Duck/restore the streaming output (user started/stopped speaking). Safe
  *  no-op when nothing is playing. */
 export function duckStreamingAudio(on: boolean): void {
@@ -43,6 +48,13 @@ export interface StreamingAudioPlayerOpts {
   // playback starts a couple seconds behind, else the first sentences play before
   // their clip is ready. Trades a little first-audio latency for working motion.
   prerollSec?: number;
+  // True while audio for this turn is still upstream of `enqueue*` — packets
+  // sitting in the Opus decoder. An empty playback queue means "the turn
+  // finished" only when this is false; otherwise it means the decoder has not
+  // caught up yet, and calling the turn there throws the rest of the reply
+  // away. That was the whole of "she stops talking mid-sentence": see
+  // ws-opus-decoder.worker.ts for the starvation that made it routine.
+  morePending?: () => boolean;
 }
 
 export class StreamingAudioPlayer {
@@ -72,6 +84,12 @@ export class StreamingAudioPlayer {
 
   private preroll = 0;
 
+  private morePending?: () => boolean;
+
+  /** performance.now() past which a stalled decoder stops holding the turn
+   *  open. Without a stop the turn could never end if the upstream wedged. */
+  private drainDeadline = 0;
+
   /** Trailing byte of a chunk when its length is odd — an int16 sample split
    *  across the (TCP) chunk boundary. Carried into the next chunk so samples stay
    *  aligned; dropping it byte-shifts everything after = continuous noise. */
@@ -80,6 +98,7 @@ export class StreamingAudioPlayer {
   constructor(opts: StreamingAudioPlayerOpts) {
     this.sampleRate = opts.sampleRate;
     this.onEnded = opts.onEnded;
+    this.morePending = opts.morePending;
     this.preroll = Math.max(0, opts.prerollSec ?? 0);
     const Ctx =
       window.AudioContext ||
@@ -101,11 +120,51 @@ export class StreamingAudioPlayer {
     this.gain.connect(this.ctx.destination);
     // Resume if the context started suspended (autoplay policy). The mic gesture
     // usually unlocks it already; resume() is a no-op then.
-    if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    if (this.ctx.state === 'suspended') this.armAutoplayUnlock();
     // Start the clock prerollSec in the future so a buffer lead builds before
     // playback — gives co-speech gestures time to generate ahead of their sentence.
     this.nextStartTime = this.ctx.currentTime + this.preroll;
     activePlayer = this;
+  }
+
+  /**
+   * A suspended AudioContext is the one failure on this path that leaves
+   * NOTHING to look at. Chunks decode, buffers schedule, gestures and subtitles
+   * run off their own clocks — the only symptom is silence, and the bare
+   * `resume().catch(() => {})` this replaced swallowed the reason.
+   *
+   * resume() alone is not enough: the browser wants a user GESTURE, and a
+   * voice-only session never produces one — speaking into the microphone does
+   * not count, and neither does a mic that was switched on in an earlier page
+   * load. So try now, retry on the next click/keypress, and if the context is
+   * still held after that, say so instead of playing to a stopped clock.
+   */
+  private armAutoplayUnlock(): void {
+    this.ctx.resume().catch(() => {});
+    if (unlockArmed) return;
+    unlockArmed = true;
+    const events = ['pointerdown', 'keydown', 'touchstart'];
+    const unlock = () => {
+      for (const e of events) window.removeEventListener(e, unlock);
+      unlockArmed = false;
+      this.ctx.resume().catch(() => {});
+    };
+    for (const e of events) window.addEventListener(e, unlock);
+    window.setTimeout(() => {
+      if (this.ctx.state !== 'suspended') return;
+      console.warn(
+        '[audio] the browser is holding the AI voice — this page has had no '
+        + `user gesture, so its AudioContext is suspended (${location.origin}). `
+        + 'Click anywhere on the page once; talking into the mic does not count.',
+      );
+      // ...and SAY it on screen. A console warning is invisible to someone who
+      // is just talking to her, and this failure has no other symptom: she
+      // gestures, the subtitles run, the server logs a healthy turn, and the
+      // only thing missing is the sound. Autoplay permission is per ORIGIN, so
+      // moving between 127.0.0.1 / localhost / a forwarded port lands on a
+      // fresh, blocked one even though the previous URL worked for months.
+      window.dispatchEvent(new CustomEvent('kehai-audio-blocked'));
+    }, 500);
   }
 
   /** Duck (attenuate) the output while the USER is speaking so speaker echo
@@ -142,7 +201,44 @@ export class StreamingAudioPlayer {
     const nSamples = evenLen / 2;
     const float32 = new Float32Array(nSamples);
     for (let i = 0; i < nSamples; i += 1) float32[i] = dv.getInt16(i * 2, true) / 32768;
+    this.schedule(float32);
+  }
 
+  /** Feed already-decoded mono float samples — the Opus path (WebCodecs hands
+   *  back f32), which carries the same speech at ~1/8 the bytes of raw PCM. */
+  enqueueFloat32(samples: Float32Array): void {
+    if (this.stopped || samples.length === 0) return;
+    this.schedule(samples);
+  }
+
+  private scheduledBuffers = 0;
+
+  private scheduledSeconds = 0;
+
+  /**
+   * What this player actually DID with the turn, for the server log.
+   *
+   * "No sound" is the one complaint that cannot be answered from the server
+   * side alone: it can prove it sent the audio, but not that any browser
+   * decoded, scheduled or played it — and asking someone to open a console
+   * mid-conversation is how a five-minute fault becomes an hour. `ctx` is the
+   * whole answer in one field: 'running' means the samples reached the output
+   * and the fault is past this app (device, tab mute, OS mixer), 'suspended'
+   * means the browser is holding them for a user gesture.
+   */
+  health(): Record<string, unknown> {
+    return {
+      ctx: this.ctx.state,
+      buffers: this.scheduledBuffers,
+      seconds: +this.scheduledSeconds.toFixed(2),
+      rate: this.ctx.sampleRate,
+      gain: this.gain.gain.value,
+      origin: location.origin,
+    };
+  }
+
+  /** Append one mono buffer to the gapless schedule. */
+  private schedule(float32: Float32Array): void {
     const buffer = this.ctx.createBuffer(1, float32.length, this.sampleRate);
     buffer.copyToChannel(float32, 0);
     const src = this.ctx.createBufferSource();
@@ -152,6 +248,8 @@ export class StreamingAudioPlayer {
     // the clock from now so we don't drop audio into an already-elapsed slot.
     const startAt = Math.max(this.ctx.currentTime, this.nextStartTime);
     src.start(startAt);
+    this.scheduledBuffers += 1;
+    this.scheduledSeconds += buffer.duration;
     this.nextStartTime = startAt + buffer.duration;
     this.liveSources.add(src);
     src.onended = () => {
@@ -163,23 +261,35 @@ export class StreamingAudioPlayer {
    *  already-queued audio finishes playing. */
   end(): void {
     this.ended = true;
+    // Cap how long a wedged upstream may hold the turn open. Generous: the
+    // stream is complete by now, so this only has to cover a decoder finishing
+    // what it already holds, and ending the turn early is the failure being
+    // fixed here — a late idle pose costs nothing next to a truncated reply.
+    this.drainDeadline = performance.now() + 30000;
     this.scheduleDrainCheck();
   }
 
-  private scheduleDrainCheck(): void {
+  private scheduleDrainCheck(delayMs?: number): void {
     if (!this.ended || this.stopped) return;
     if (this.drainTimer !== null) clearTimeout(this.drainTimer);
-    const remainingMs = Math.max(0, (this.nextStartTime - this.ctx.currentTime) * 1000);
+    const wait = delayMs
+      ?? Math.max(0, (this.nextStartTime - this.ctx.currentTime) * 1000) + 30;
     this.drainTimer = setTimeout(() => {
       this.drainTimer = null;
       if (this.stopped) return;
-      if (this.ctx.currentTime >= this.nextStartTime - 0.02) {
-        if (activePlayer === this) activePlayer = null;
-        this.onEnded?.();
-      } else {
+      if (this.ctx.currentTime < this.nextStartTime - 0.02) {
         this.scheduleDrainCheck(); // more arrived after end() — re-arm
+        return;
       }
-    }, remainingMs + 30);
+      // The queue is empty — but empty because it was PLAYED, or because the
+      // samples have not arrived yet? Only the first is the end of the turn.
+      if (this.morePending?.() && performance.now() < this.drainDeadline) {
+        this.scheduleDrainCheck(50);
+        return;
+      }
+      if (activePlayer === this) activePlayer = null;
+      this.onEnded?.();
+    }, wait);
   }
 
   /** 0..1 mouth openness from the live signal RMS (call each animation frame). */

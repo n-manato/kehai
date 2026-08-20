@@ -6,6 +6,7 @@ import { ModelInfo } from '@/context/live2d-config-context';
 import { HistoryInfo } from '@/context/websocket-context';
 import { ConfigFile } from '@/context/character-config-context';
 import { toaster } from '@/components/ui/toaster';
+import { opusDecodeSupported } from '@/utils/ws-opus-decoder';
 
 export interface DisplayText {
   text: string;
@@ -64,6 +65,10 @@ export interface MessageEvent {
   volumes?: number[];
   slice_length?: number;
   sample_rate?: number; // audio-stream-start: raw PCM sample rate (streaming TTS)
+  // 'opus' | 'pcm'. On audio-stream-start it says what the sentence will be;
+  // on each audio-stream-chunk it says what THAT chunk is, so the server can
+  // drop back to PCM mid-sentence if the encoder fails instead of going silent.
+  codec?: string;
   data?: string; // audio-stream-chunk: base64 raw int16 PCM (streaming TTS)
   files?: BackgroundFile[];
   actions?: Actions;
@@ -142,6 +147,26 @@ class WebSocketService {
     this.sendMessage({
       type: 'create-new-history',
     });
+    this.declareAudioCaps();
+  }
+
+  /**
+   * Tell the server we can take Opus on the WebSocket audio path.
+   *
+   * Raw PCM costs 683 kbps after base64; the same speech in Opus is ~86 kbps.
+   * That only matters on the WS path — the WebRTC track is already Opus — but
+   * the WS path is the one that runs whenever ICE cannot complete, which is
+   * exactly the constrained-link case.
+   *
+   * NEGOTIATED, not assumed: WebCodecs is not everywhere, and the support probe
+   * is async. Saying nothing (or saying so late that a reply has already begun)
+   * simply leaves the server on PCM, which is what it does today — so there is
+   * no race to lose, only an optimisation to arrive slightly late for.
+   */
+  private declareAudioCaps() {
+    opusDecodeSupported()
+      .then((opus) => this.sendMessage({ type: 'audio-caps', opus }))
+      .catch(() => this.sendMessage({ type: 'audio-caps', opus: false }));
   }
 
   connect(url: string) {

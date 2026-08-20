@@ -56,7 +56,7 @@
       "allowButtonTrigger": "挙手ボタンでAIに発話を促す"
     },
     "about": {
-      "title": "Open LLM VTuber フロントエンド",
+      "title": "KEHAI フロントエンド",
       "version": "バージョン",
       "projectLinks": "プロジェクトリンク",
       "github": "GitHub",
@@ -125,7 +125,8 @@
     "failedCapture": "{{source}} フレームのキャプチャに失敗しました",
     "failedParseWebSocket": "WebSocketメッセージの解析に失敗しました",
     "websocketNotOpen": "WebSocketが開いていません。",
-    "vadMisfire": "音声を検出しましたが短すぎます。大きく/長く話すか、設定を調整してください（音声しきい値を下げる、ネガティブしきい値を下げる、確定フレーム数を減らす）。"
+    "vadMisfire": "音声を検出しましたが短すぎます。大きく/長く話すか、設定を調整してください（音声しきい値を下げる、ネガティブしきい値を下げる、確定フレーム数を減らす）。",
+    "audioBlocked": "クリックすると音声が再生されます"
   },
   "aiState": {
     "idle": "待機中",

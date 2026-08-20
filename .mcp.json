@@ -1,0 +1,45 @@
+{
+  "_comment": [
+    "MCP servers for CLAUDE CODE (the coding agent) — NOT the same thing as",
+    "mcp_servers.json, which is the tool set the on-screen character's LLM calls.",
+    "Different file, different key name (mcpServers vs mcp_servers), different",
+    "consumer. Adding to one does nothing for the other.",
+    "",
+    "2026-08-10: ported from the PC-A (Windows) version, which declared",
+    "  chrome-devtools: cmd /c npx ...        <- 'cmd' does not exist on Linux",
+    "  spector:         node C:\\DEV\\...       <- Windows path",
+    "so neither had ever started on this box.",
+    "",
+    "chrome-devtools attaches to an ALREADY-RUNNING browser via --browserUrl",
+    "instead of launching its own. That is deliberate: its own launcher cannot be",
+    "given ANGLE flags, and headless Chrome without them silently renders on",
+    "SwiftShader — no error, correct-looking screenshots, and every measurement",
+    "taken from it worthless for judging a GPU render. Start the browser first:",
+    "",
+    "    bash scripts/gpu-chrome.sh",
+    "",
+    "which refuses to hand back a browser that is not on the GPU.",
+    "",
+    "'spector' (WebGL frame capture, draw-call level) is deliberately NOT here",
+    "yet: it is not published on npm (spectorjs-mcp / spector-mcp both 404) and",
+    "the PC-A entry pointed at a local source build. Add it once a Linux build is",
+    "verified — pixel-level work does not need it."
+  ],
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--browserUrl",
+        "http://127.0.0.1:9222"
+      ]
+    },
+    "render-probe": {
+      "command": "node",
+      "args": [
+        "/home/ai-ccore/Documents/DEV/KEHAI/scripts/mcp-render-probe/server.mjs"
+      ]
+    }
+  }
+}

@@ -2,10 +2,20 @@
 # away from the EDI-english default. Selecting this switches the WHOLE pipeline
 # back to Japanese (whisper hint ja, latin->katakana ON, JA speech rules) and
 # hot-swaps the RemGSV weights on the shared PC-B GSV server.
-# conf_uid keeps the ORIGINAL Rem uid so the existing chat history stays attached.
+# 2026-08-10: conf_uid was "miku_yyb_001" — the SAME uid as hatsune_miku.yaml.
+# The uid keys the chat history directory, so the two characters were writing
+# into one thread: a single conversation file held Rem's polite replies and
+# Miku's detached ones alternating, and every turn was answered with the other
+# character's lines in context. It also meant Miku inherited 200 conversations
+# of Rem's that were never hers.
+# Split by the `name` field the history already records on every AI message:
+# 200 Rem-only conversations moved to chat_history/rem_ja_001/, 194 Miku-only
+# left under miku_yyb_001 (which matches her model id and her yaml). Nothing was
+# deleted, and `switch-config` identifies characters by FILE name, so no client's
+# saved selection is affected by the uid change.
 character_config:
   conf_name: "レム"
-  conf_uid: "miku_yyb_001"
+  conf_uid: "rem_ja_001"
   live2d_model_name: "yyb_miku_10th"
   character_name: "Rem"
   language: "ja"
@@ -17,7 +27,7 @@ character_config:
       language: "ja"
   tts_config:
     gsv_stream:
-      ref_audio_path: "/home/ai-ccore/Documents/DEV/voice/refs/f02_025.wav"
+      ref_audio_path: "/home/ai-ccore/Documents/DEV/AICCORE-Nexus/stack/voice/refs/f02_025.wav"
       prompt_text: "今日はレーって始まってムーで終わる名前の女の子と一緒にいるといいことがありますよ。"
       text_lang: "ja"
       prompt_lang: "ja"

@@ -38,33 +38,61 @@ export const sidebarStyles = {
       top: 0,
       height: '100%',
       width: '440px',
-      bg: 'gray.900',
+      // Collapsed, the panel parks with 24px still on screen so the arrow has
+      // somewhere to live — transparent, or that sliver reads as a black strip
+      // down the left edge. Mirrors footerStyles.footer.container.
+      bg: isCollapsed ? 'transparent' : 'gray.900',
       transform: isCollapsed
         ? 'translateX(calc(-100% + 24px))'
         : 'translateX(0)',
-      transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+      // Named properties rather than `all`: collapsing fades the background out
+      // over the whole slide, but opening has to restore it fast or the panel
+      // spends 300ms showing its own text over the wallpaper.
+      transition: isCollapsed
+        ? 'transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), background-color 0.3s cubic-bezier(0.4, 0, 0.2, 1)'
+        : 'transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), background-color 0.12s ease',
       display: 'flex',
       flexDirection: 'column' as const,
       gap: 4,
       overflow: isCollapsed ? 'visible' : 'hidden',
+      // Collapsed, 24px of this 440px box still lies over the character at full
+      // height. Transparent is not enough — it would keep swallowing every
+      // OrbitControls drag that starts near the left edge. The box goes inert
+      // and the arrow opts back in below.
+      pointerEvents: isCollapsed ? ('none' as const) : ('auto' as const),
       pb: '4',
     }),
-    toggleButton: {
-      position: 'absolute',
+    // Open, this is the grab edge down the seam of the panel. Collapsed, that
+    // same strip is an invisible full-height column lying on top of the
+    // character, so it shrinks to the glyph.
+    // Centred with `top`, NOT `translateY`: sidebar.tsx sets `transform` inline
+    // for the rotation, and an inline style beats the Emotion class — any
+    // transform written here would be silently dropped.
+    toggleButton: (isCollapsed: boolean) => ({
+      position: 'absolute' as const,
       right: 0,
-      top: 0,
+      top: isCollapsed ? 'calc(50% - 24px)' : 0,
       width: '24px',
-      height: '100%',
+      height: isCollapsed ? '48px' : '100%',
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'center',
       cursor: 'pointer',
-      color: 'whiteAlpha.700',
+      // Open, the glyph sits on gray.900 and 70% white is plenty. Collapsed it
+      // sits on whatever the wallpaper happens to be — measured at 0.64 alpha
+      // over a light lavender background it is invisible. Full white plus a
+      // shadow is what makes it read on a light background and a dark one
+      // without putting a plate back under it.
+      color: isCollapsed ? 'white' : 'whiteAlpha.700',
+      filter: isCollapsed ? 'drop-shadow(0 1px 3px rgba(0, 0, 0, 0.75))' : 'none',
       _hover: { color: 'white' },
       bg: 'transparent',
+      // The container above is inert when collapsed; the arrow is the one thing
+      // inside it that still has to be clickable.
+      pointerEvents: 'auto' as const,
       transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
       zIndex: 1,
-    },
+    }),
     content: {
       flex: 1,
       width: '100%',

@@ -38,6 +38,10 @@ interface VADState {
   /** Auto stop mic feature state */
   autoStopMic: boolean;
 
+  /** True when the mic must stay open for the session (server VAD / WebRTC track).
+   *  Check before any side-effect call to stopMic(). */
+  isContinuousMic: () => boolean;
+
   /** Microphone active state */
   micOn: boolean;
 
@@ -161,6 +165,17 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   // turn-end only waits for the last short segment. Opt out (legacy client
   // batch path): localStorage.serverVad = '0' + conf.yaml vad_model: null.
   const serverVadRef = useRef(localStorage.getItem('serverVad') !== '0');
+
+  /** True when the mic is meant to stay OPEN for the whole session: the server's VAD
+   *  (or the WebRTC track) decides where turns end, and feedback is handled by AEC +
+   *  ducking rather than by closing the mic. Anything that would call stopMic() as a
+   *  side effect must check this first — exported so there is ONE definition; having
+   *  it inline here meant the text-input path could (and did) miss it and leave the
+   *  microphone dead after a single typed message. */
+  const isContinuousMic = useCallback(
+    () => serverVadRef.current || webrtcAudio.active,
+    [],
+  );
   const aiStateRef = useRef<AiState>(aiState);
   const setSubtitleTextRef = useRef(setSubtitleText);
   const setAiStateRef = useRef(setAiState);
@@ -281,7 +296,7 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
     // autoStopMic (a legacy anti-feedback setting) only applies to the old
     // client-VAD batch path; honoring it here made the mic die after every
     // utterance ("話し終えたらマイクがOFFになる").
-    const continuousMic = serverVadRef.current || webrtcAudio.active;
+    const continuousMic = isContinuousMic();
     if (autoStopMicRef.current && !continuousMic) {
       stopMic();
     } else {
@@ -426,6 +441,7 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   const contextValue = useMemo(
     () => ({
       autoStopMic: autoStopMicRef.current,
+      isContinuousMic,
       micOn,
       setMicOn,
       setAutoStopMic,

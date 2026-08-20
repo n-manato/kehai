@@ -33,6 +33,7 @@ import Background from "./components/canvas/background";
 import WebSocketStatus from "./components/canvas/ws-status";
 import Subtitle from "./components/canvas/subtitle";
 import { ModeProvider, useMode } from "./context/mode-context";
+import { installAutoHide } from "./utils/space/auto-hide";
 
 function AppContent(): JSX.Element {
   const [showSidebar, setShowSidebar] = useState(true);
@@ -46,7 +47,11 @@ function AppContent(): JSX.Element {
   // the three.js MMD viewer instead of the Live2D canvas. A `.vrm` URL means a VRM
   // avatar (three-vrm viewer). UI is identical for all three.
   const isMMD = !!modelInfo?.url && modelInfo.url.toLowerCase().includes(".pmx");
-  const isVRM = !!modelInfo?.url && modelInfo.url.toLowerCase().includes(".vrm");
+  // `.glb` goes to the same viewer: a plain glTF gets a VRM humanoid built over
+  // its Mixamo-style bones at load (glb-humanoid.ts), so from here down there is
+  // one 3D character path, not two.
+  const isVRM = !!modelInfo?.url
+    && /\.(vrm|glb)(\?|$)/.test(modelInfo.url.toLowerCase());
   // "smplx-body" sentinel URL = render the raw GestureLSM SMPL-X motion as a body
   // figure (zero retarget, ground-truth reference).
   const isSMPL = !!modelInfo?.url && modelInfo.url.toLowerCase().includes("smplx");
@@ -60,6 +65,13 @@ function AppContent(): JSX.Element {
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
   }, []);
+
+  // Fade the overlay chrome on idle. Installed here rather than in the VRM
+  // viewer because the sidebar and footer arrows are chrome in *every* model
+  // mode, and because two install sites race: the viewer's effect runs first
+  // (children before parents), so on a model switch its unmount would tear the
+  // shared stylesheet down while this one holds only the guard's no-op.
+  useEffect(() => installAutoHide(), []);
 
     
   document.documentElement.style.overflow = 'hidden';
@@ -85,13 +97,15 @@ function AppContent(): JSX.Element {
     top: isElectron ? "30px" : "0px",
     height: `calc(100% - ${isElectron ? "30px" : "0px"})`,
     zIndex: 5, // Ensure it's layered correctly below UI but above background
+    // Collapsed, the sidebar keeps no column at all: she reaches the left edge
+    // and only the toggle arrow floats over her.
     left: {
       base: "0px", // Column layout (base): Start from left edge
-      md: sidebarVisible ? "440px" : "24px", // Row layout (md+): Offset by sidebar width
+      md: sidebarVisible ? "440px" : "0px", // Row layout (md+): Offset by sidebar width
     },
     width: {
       base: "100%", // Column layout (base): Full width
-      md: `calc(100% - ${sidebarVisible ? "440px" : "24px"})`, // Row layout (md+): Adjust width based on sidebar
+      md: sidebarVisible ? "calc(100% - 440px)" : "100%", // Row layout (md+): Adjust width based on sidebar
     },
   });
 
@@ -134,7 +148,15 @@ function AppContent(): JSX.Element {
           <Flex {...layoutStyles.appContainer}>
             <Box
               {...layoutStyles.sidebar}
-              {...(!showSidebar && { width: "24px" })}
+              {...(!showSidebar && {
+                // No residual column, no dark strip, no hairline border — the
+                // panel is gone and `overflow: visible` lets the toggle arrow
+                // hang outside this zero-width box, over the wallpaper.
+                width: "0px",
+                bg: "transparent",
+                borderRight: "none",
+                overflow: "visible",
+              })}
             >
               <Sidebar
                 isCollapsed={!showSidebar}

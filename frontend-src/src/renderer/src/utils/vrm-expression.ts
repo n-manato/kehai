@@ -13,6 +13,10 @@ import { aiDebug } from "./debug/ai-debug";
 // default ("だいぶ近い"). Sharp cool eye via ｷﾘｯ２ + じと目 + 笑い２ (lower-lid lift is
 // safe now that the eye/face MToon outline is off — no dark lower ring).
 const LS_FACE = "vrmBaseFace10";
+// The ARKit resting face is stored separately: the two profiles share no morph
+// names, so one key would mean whichever model loaded last wrote a base the
+// other cannot address, and the 🎭 panel would silently tune nothing.
+const LS_FACE_ARKIT = "vrmBaseFaceArkit1";
 
 // Morph CHANNELS. Inside a channel the resting face and a preset are MUTUALLY EXCLUSIVE.
 // The base sets one eye shape (ｷﾘｯ２ + 笑い２ + じと目) and one pupil look (瞳小); if a preset
@@ -65,6 +69,133 @@ const EMOTION_PRESETS: Record<string, Record<string, number>> = {
   smug: { ウィンク２: 0.85, にやり: 0.5, "上 右": 0.45, 照れ: 0.2 },
   love: { はぁと: 0.8, 照れ: 0.6, 赤面: 0.5, "赤面３": 0.3, 笑い: 0.4 },
 };
+
+// ---------------------------------------------------------------------------
+// ARKIT PROFILE
+//
+// The presets above are written against Miku's Japanese PMX morph names, so they
+// address nothing at all on a model exported from a different pipeline. The
+// Avaturn .glb (Chancelor) carries the ARKit 52 blendshapes — browInnerUp,
+// eyeSquintLeft, mouthSmileLeft, cheekPuff, noseSneerLeft — plus the Oculus
+// visemes. Measured before this existed: five seconds of sampling gave a peak
+// eyeBlinkLeft of 0.000, i.e. that face never moved at all, not even a blink.
+//
+// Rather than translate one vocabulary into the other (the sets do not
+// correspond — there is no ARKit 星目) the system carries two PROFILES and picks
+// by which names the model actually has.
+//
+// THE MOUTH IS NOT AVAILABLE. Lip sync owns jawOpen and the visemes, and it runs
+// after this, so anything written there is either overwritten or fights the
+// speech. These presets therefore express with the BROWS, EYES, CHEEKS and NOSE,
+// plus the mouth-CORNER morphs (smile/frown/dimple/stretch) which read as mood
+// and coexist with a moving mouth instead of contradicting it.
+const ARKIT_PRESETS: Record<string, Record<string, number>> = {
+  neutral: {},
+  happy: {
+    mouthSmileLeft: 0.55, mouthSmileRight: 0.55, cheekSquintLeft: 0.35, cheekSquintRight: 0.35,
+    eyeSquintLeft: 0.3, eyeSquintRight: 0.3, browInnerUp: 0.12,
+  },
+  joy_smile: {
+    mouthSmileLeft: 0.38, mouthSmileRight: 0.38, cheekSquintLeft: 0.22, cheekSquintRight: 0.22,
+    eyeSquintLeft: 0.18, eyeSquintRight: 0.18,
+  },
+  joy_big: {
+    mouthSmileLeft: 0.8, mouthSmileRight: 0.8, cheekSquintLeft: 0.55, cheekSquintRight: 0.55,
+    eyeSquintLeft: 0.45, eyeSquintRight: 0.45, browOuterUpLeft: 0.3, browOuterUpRight: 0.3,
+    browInnerUp: 0.25,
+  },
+  joy_grin: {
+    mouthSmileLeft: 0.7, mouthSmileRight: 0.7, mouthDimpleLeft: 0.4, mouthDimpleRight: 0.4,
+    cheekSquintLeft: 0.4, cheekSquintRight: 0.4, eyeSquintLeft: 0.35, eyeSquintRight: 0.35,
+  },
+  sad: {
+    browInnerUp: 0.7, mouthFrownLeft: 0.5, mouthFrownRight: 0.5,
+    eyeLookDownLeft: 0.3, eyeLookDownRight: 0.3, mouthShrugLower: 0.25,
+  },
+  sadness_worry: {
+    browInnerUp: 0.6, mouthFrownLeft: 0.28, mouthFrownRight: 0.28,
+    eyeSquintLeft: 0.15, eyeSquintRight: 0.15, mouthShrugLower: 0.2,
+  },
+  sadness_tearful: {
+    browInnerUp: 0.85, mouthFrownLeft: 0.6, mouthFrownRight: 0.6,
+    eyeSquintLeft: 0.3, eyeSquintRight: 0.3, eyeLookDownLeft: 0.35, eyeLookDownRight: 0.35,
+  },
+  angry: {
+    browDownLeft: 0.75, browDownRight: 0.75, eyeSquintLeft: 0.4, eyeSquintRight: 0.4,
+    noseSneerLeft: 0.3, noseSneerRight: 0.3, mouthPressLeft: 0.35, mouthPressRight: 0.35,
+  },
+  anger_rage: {
+    browDownLeft: 0.95, browDownRight: 0.95, eyeSquintLeft: 0.55, eyeSquintRight: 0.55,
+    noseSneerLeft: 0.6, noseSneerRight: 0.6, mouthPressLeft: 0.5, mouthPressRight: 0.5,
+    cheekSquintLeft: 0.3, cheekSquintRight: 0.3,
+  },
+  anger_glare: {
+    browDownLeft: 0.8, browDownRight: 0.8, eyeSquintLeft: 0.5, eyeSquintRight: 0.5,
+    mouthPressLeft: 0.3, mouthPressRight: 0.3,
+  },
+  anger_pout: {
+    browDownLeft: 0.35, browDownRight: 0.35, mouthPucker: 0.3,
+    cheekPuff: 0.25, eyeSquintLeft: 0.3, eyeSquintRight: 0.3,
+  },
+  surprised: {
+    eyeWideLeft: 0.75, eyeWideRight: 0.75, browInnerUp: 0.6,
+    browOuterUpLeft: 0.65, browOuterUpRight: 0.65,
+  },
+  surprise_shock: {
+    eyeWideLeft: 0.95, eyeWideRight: 0.95, browInnerUp: 0.8,
+    browOuterUpLeft: 0.85, browOuterUpRight: 0.85, mouthStretchLeft: 0.2, mouthStretchRight: 0.2,
+  },
+  surprise_amazed: {
+    eyeWideLeft: 0.7, eyeWideRight: 0.7, browOuterUpLeft: 0.6, browOuterUpRight: 0.6,
+    browInnerUp: 0.4, mouthSmileLeft: 0.4, mouthSmileRight: 0.4,
+  },
+  fear: {
+    eyeWideLeft: 0.8, eyeWideRight: 0.8, browInnerUp: 0.85,
+    mouthStretchLeft: 0.4, mouthStretchRight: 0.4, mouthFrownLeft: 0.25, mouthFrownRight: 0.25,
+  },
+  disgust: {
+    noseSneerLeft: 0.7, noseSneerRight: 0.7, browDownLeft: 0.4, browDownRight: 0.4,
+    mouthUpperUpLeft: 0.35, mouthUpperUpRight: 0.35, eyeSquintLeft: 0.4, eyeSquintRight: 0.4,
+  },
+  shy: {
+    eyeLookDownLeft: 0.45, eyeLookDownRight: 0.45, eyeSquintLeft: 0.3, eyeSquintRight: 0.3,
+    mouthSmileLeft: 0.3, mouthSmileRight: 0.3, browInnerUp: 0.3,
+    cheekSquintLeft: 0.3, cheekSquintRight: 0.3,
+  },
+  thinking: {
+    browDownLeft: 0.3, browInnerUp: 0.25, eyeLookUpLeft: 0.35, eyeLookUpRight: 0.35,
+    eyeSquintLeft: 0.25, eyeSquintRight: 0.25, mouthPressLeft: 0.3, mouthPressRight: 0.3,
+  },
+  look: { eyeLookUpLeft: 0.3, eyeLookUpRight: 0.3, browOuterUpLeft: 0.25, browOuterUpRight: 0.25 },
+  smug: {
+    mouthSmileLeft: 0.55, mouthDimpleLeft: 0.45, eyeSquintLeft: 0.4, eyeSquintRight: 0.25,
+    browOuterUpLeft: 0.35, browDownRight: 0.2,
+  },
+  love: {
+    mouthSmileLeft: 0.6, mouthSmileRight: 0.6, eyeSquintLeft: 0.45, eyeSquintRight: 0.45,
+    cheekSquintLeft: 0.5, cheekSquintRight: 0.5, browInnerUp: 0.25,
+  },
+};
+
+// A composed, alert resting face — the secretary is attentive, not blank. Small
+// values on purpose: this is the face UNDER every emotion, so anything strong
+// here reads as a permanent expression.
+const ARKIT_BASE: Record<string, number> = {
+  mouthSmileLeft: 0.12,
+  mouthSmileRight: 0.12,
+  eyeSquintLeft: 0.08,
+  eyeSquintRight: 0.08,
+};
+
+// Lids and gaze are mutually exclusive with a preset that names any of them —
+// stacking a resting squint under a preset's wide eye is what "目がバグる" means
+// on this face too.
+const ARKIT_CH_LID = new Set([
+  "eyeSquintLeft", "eyeSquintRight", "eyeWideLeft", "eyeWideRight",
+  "eyeBlinkLeft", "eyeBlinkRight",
+]);
+const ARKIT_EYE_MORPHS = new Set([...ARKIT_CH_LID]);
+const ARKIT_BLINK = ["eyeBlinkLeft", "eyeBlinkRight"];
 
 function resolveFacePreset(keyword: string): string {
   const k = keyword.toLowerCase();
@@ -126,6 +257,9 @@ class VRMExpression {
 
   private dict: Record<string, number> = {};
 
+  /** morph name -> its index in EACH bound mesh (-1 where the mesh lacks it). */
+  private idxPerMesh: Record<string, number[]> = {};
+
   private base: Record<string, number> = {};
 
   private cur: Record<string, number> = {};
@@ -155,16 +289,82 @@ class VRMExpression {
 
   private emphasis = NEUTRAL_EMPHASIS;
 
+  /** Which morph vocabulary the bound model speaks — see ARKIT_PRESETS. */
+  profile: "pmx" | "arkit" = "pmx";
+
+  private get presets(): Record<string, Record<string, number>> {
+    return this.profile === "arkit" ? ARKIT_PRESETS : EMOTION_PRESETS;
+  }
+
+  private get lidChannel(): Set<string> {
+    return this.profile === "arkit" ? ARKIT_CH_LID : CH_LID;
+  }
+
+  private get eyeMorphs(): Set<string> {
+    return this.profile === "arkit" ? ARKIT_EYE_MORPHS : EYE_MORPHS;
+  }
+
   /** Bind all VRM face meshes (each has its own morphTargetInfluences, shared order). */
   setMeshes(meshes: THREE.Mesh[], dict: Record<string, number>) {
     this.meshes = meshes || [];
-    this.dict = dict || {};
+    // Resolve every morph this face has against EACH mesh once, here, so the
+    // per-frame writes are a lookup rather than a search — and so a mesh that
+    // does not carry a morph is skipped instead of having some other morph at
+    // that index written by mistake.
+    //
+    // `dict` from the caller is only a hint now. What the rest of this class asks
+    // of `this.dict` is "does the face have this morph at all", so it is the
+    // UNION over the meshes: on the Avaturn face the brows live on AvatarHead
+    // and nowhere else, and a single mesh's dictionary would have reported half
+    // the expression vocabulary as missing.
+    this.idxPerMesh = {};
+    for (let i = 0; i < this.meshes.length; i += 1) {
+      const d = (this.meshes[i].morphTargetDictionary || {}) as Record<string, number>;
+      for (const name of Object.keys(d)) {
+        if (!this.idxPerMesh[name]) {
+          this.idxPerMesh[name] = new Array(this.meshes.length).fill(-1);
+        }
+        this.idxPerMesh[name][i] = d[name];
+      }
+    }
+    this.dict = {};
+    for (const name of Object.keys(this.idxPerMesh)) {
+      this.dict[name] = this.idxPerMesh[name].find((v) => v >= 0) ?? 0;
+    }
+    if (dict) for (const k of Object.keys(dict)) if (this.dict[k] == null) this.dict[k] = dict[k];
     this.cur = {};
     this.emotion = "neutral";
     this.emoLevel = 0;
     this.emoTarget = 0;
     this.blinking = false;
     this.nextBlinkAt = this.now() + BLINK_MIN_MS;
+    // Pick the vocabulary from the model itself. まばたき is Miku's PMX blink and
+    // eyeBlinkLeft is the ARKit one; a model has one or the other, never both.
+    this.profile = this.dict["まばたき"] != null ? "pmx" : "arkit";
+    this.base = {};
+    // Set for BOTH profiles, every bind. This instance outlives a character
+    // switch, so leaving it alone on the PMX path meant that once Chancelor had
+    // turned emotions on, switching back to Miku kept them on — and drove her
+    // with the preset table that was deliberately disabled pending its rework.
+    this.emotionEnabled = this.profile === "arkit";
+    if (this.profile === "arkit") {
+      try {
+        const s = localStorage.getItem(LS_FACE_ARKIT);
+        if (s) this.base = JSON.parse(s);
+      } catch {
+        /* ignore */
+      }
+      if (Object.keys(this.base).length === 0) {
+        this.base = Object.fromEntries(
+          Object.entries(ARKIT_BASE).filter(([n]) => this.dict[n] != null),
+        );
+      }
+      console.info(
+        `[vrm-face] ARKit profile: ${Object.keys(ARKIT_PRESETS).length} presets, `
+        + `blink ${ARKIT_BLINK.filter((n) => this.dict[n] != null).join("+") || "MISSING"}`,
+      );
+      return;
+    }
     try {
       const s = localStorage.getItem(LS_FACE);
       if (s) this.base = JSON.parse(s);
@@ -225,9 +425,12 @@ class VRMExpression {
     return b;
   }
 
-  /** Emotion presets OFF: hold the model's default face. Requested while the emotion ->
-   *  face mapping is reworked; blink and lip-sync are untouched, so she still looks alive.
-   *  Re-enable live with __vrmFace(true), or flip this default when the rework lands. */
+  /** Whether emotion presets are applied at all; blink and lip-sync are
+   *  independent, so the face still looks alive when this is off.
+   *
+   *  setMeshes decides it PER PROFILE on every bind: on for ARKit, off for PMX
+   *  while Miku's Japanese preset table is being reworked. This initialiser only
+   *  covers the window before the first bind. Override live with __vrmFace(true). */
   emotionEnabled = false;
 
   playEmotion(emotion: string | null | undefined) {
@@ -266,10 +469,19 @@ class VRMExpression {
     return -1;
   }
 
+  /** Where THIS profile's resting face is persisted. */
+  private get baseKey(): string {
+    return this.profile === "arkit" ? LS_FACE_ARKIT : LS_FACE;
+  }
+
   resetBase() {
-    this.base = this.defaultBase();
+    this.base = this.profile === "arkit"
+      ? Object.fromEntries(
+        Object.entries(ARKIT_BASE).filter(([n]) => this.dict[n] != null),
+      )
+      : this.defaultBase();
     try {
-      localStorage.setItem(LS_FACE, JSON.stringify(this.base));
+      localStorage.setItem(this.baseKey, JSON.stringify(this.base));
     } catch {
       /* ignore */
     }
@@ -291,7 +503,7 @@ class VRMExpression {
     if (value <= 0) delete this.base[name];
     else this.base[name] = Math.min(1, value);
     try {
-      localStorage.setItem(LS_FACE, JSON.stringify(this.base));
+      localStorage.setItem(this.baseKey, JSON.stringify(this.base));
     } catch {
       /* ignore */
     }
@@ -320,11 +532,23 @@ class VRMExpression {
     return t < 0.5 ? t * 2 : (1 - t) * 2;
   }
 
-  /** Write a morph value to ALL face meshes (shared morph order). */
+  /**
+   * Write a morph value to every face mesh that HAS that morph.
+   *
+   * The index is resolved per mesh, not taken from one shared dictionary. Miku's
+   * PMX primitives happen to share a morph order, so a single index worked for
+   * her — but the Avaturn face does not: AvatarHead has 149 morphs,
+   * AvatarEyelashes 67, AvatarTeethLower 20. Reusing the head's index there
+   * writes the value into whatever unrelated morph sits at that slot. The same
+   * assumption broke lip sync on this model, which is why it is gone here too
+   * rather than special-cased.
+   */
   private write(name: string, value: number) {
-    const idx = this.dict[name];
-    if (idx == null) return;
+    const per = this.idxPerMesh[name];
+    if (!per) return;
     for (let i = 0; i < this.meshes.length; i += 1) {
+      const idx = per[i];
+      if (idx < 0) continue;
       const inf = this.meshes[i].morphTargetInfluences;
       if (inf && idx < inf.length) inf[idx] = value;
     }
@@ -341,17 +565,18 @@ class VRMExpression {
     this.emphasis += (energyTarget - this.emphasis) * 0.18;
     const lvl =
       this.emoLevel * (PROSODY_FLOOR + (1 - PROSODY_FLOOR) * this.emphasis);
-    const preset = EMOTION_PRESETS[this.emotion] || {};
+    const preset = this.presets[this.emotion] || {};
+    const alwaysOn = this.profile === "arkit" ? {} : ALWAYS_ON;
     const names = new Set<string>([
       ...Object.keys(this.base),
       ...Object.keys(this.cur),
       ...Object.keys(preset),
-      ...Object.keys(ALWAYS_ON),
+      ...Object.keys(alwaysOn),
     ]);
     // does this preset define its own eye shape / pupil? then it owns that whole channel
     let lidTaken = false; let pupilTaken = false;
     for (const k of Object.keys(preset)) {
-      if (CH_LID.has(k)) lidTaken = true;
+      if (this.lidChannel.has(k)) lidTaken = true;
       if (CH_PUPIL.has(k)) pupilTaken = true;
     }
     const blink = this.blinkAmount(now);
@@ -368,7 +593,7 @@ class VRMExpression {
       // normally (so `angry` can override `笑い` etc.); morphs it says nothing about keep
       // `emotionBaseKeep` of their resting value. Live: __vrmFaceKeep(v).
       const owned = Object.prototype.hasOwnProperty.call(preset, name)
-        || (lidTaken && CH_LID.has(name))
+        || (lidTaken && this.lidChannel.has(name))
         || (pupilTaken && CH_PUPIL.has(name));
       // The PUPIL is structural, like the eye highlight: it is the character's eye, not a
       // mood. Emotions fire on nearly every sentence, so even the 20% decay left by
@@ -379,21 +604,32 @@ class VRMExpression {
       let target = owned
         ? restVal * (1 - lvl) + emoVal * lvl
         : restVal * (1 - lvl * (1 - keep));
-      if (ALWAYS_ON[name] != null) {
+      if (alwaysOn[name] != null) {
         const off = ALWAYS_ON_SUPPRESS[name];
         const suppressed = off ? (preset[off] || 0) * lvl : 0;
-        target = Math.max(target, ALWAYS_ON[name] * (1 - suppressed));
+        target = Math.max(target, alwaysOn[name] * (1 - suppressed));
       }
       const c = this.cur[name] || 0;
       this.cur[name] = c + (target - c) * 0.25;
       // まばたき is the resting "hood" — handled below so the blink adds on top.
       if (name === "まばたき") return;
+      // The ARKit blink morphs are written by the blink block below; letting the
+      // preset loop write them too would fight it every frame.
+      if (this.profile === "arkit" && ARKIT_BLINK.includes(name)) return;
       // blink shuts the lids over whatever eye shape is showing
-      const out = blink > 0 && EYE_MORPHS.has(name)
+      const out = blink > 0 && this.eyeMorphs.has(name)
         ? this.cur[name] * (1 - blink)
         : this.cur[name];
       this.write(name, out);
     });
+    if (this.profile === "arkit") {
+      // A real blink, which this face did not have: measured peak eyeBlinkLeft
+      // over five seconds was 0.000 before this. Written straight from the blink
+      // curve — the emotion's squint lives on eyeSquint*, a separate morph, so
+      // the two stack rather than needing to be combined here.
+      for (const n of ARKIT_BLINK) this.write(n, blink);
+      return;
+    }
     // Resting hood (まばたき in the base) + blink on top: rest .. 1.0 during a blink.
     if (this.dict["まばたき"] != null) {
       const rb = this.cur["まばたき"] || 0;

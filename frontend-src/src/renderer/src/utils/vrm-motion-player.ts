@@ -189,6 +189,28 @@ type Clip = {
 class VRMMotionPlayer {
   private vrm: VRM | null = null;
 
+  /** Play the idle library between turns. Set from the viewer when the model binds:
+   *  on when the server has a rotation for THIS character, off when it has none (that
+   *  model then keeps its own embedded idle, or its last pose). */
+  idleEnabled = true;
+
+  /** Which character's idle rotation to ask for. The library is shared but the
+   *  ROTATION is per character — set from websocket-handler on set-model-and-conf.
+   *  Empty until the server announces one, which just means "the default set". */
+  confUid = "";
+
+  /** True while a gesture clip owns the skeleton. An embedded glTF idle must
+   *  not run at the same time — both write the same bones every frame, and the
+   *  loser is whichever ran first. */
+  get bodyBusy(): boolean {
+    // `clip` STAYS SET after a reply — the player holds the last frame so the
+    // body does not snap. Treating that as busy left the embedded idle mixer
+    // permanently blocked and the avatar frozen in its final gesture pose.
+    // `_turnOver` is the existing signal for exactly this: a held clip that idle
+    // is allowed to replace.
+    return this._talking || (!!this.clip && !this._turnOver);
+  }
+
   private restWQ: Record<string, THREE.Quaternion> = {};
 
   private restDir: Record<string, THREE.Vector3> = {};
@@ -287,6 +309,11 @@ class VRMMotionPlayer {
   private _prevElapsed = 0;
   private _fadeT = 1; // 1 = no crossfade in progress
   private _fadeDur = 0.6;  // gentler clip reorient -> less twintail whip at seams
+  /** Crossfade for the IDLE -> SPEECH seam specifically (see _prepareClip). Live-tunable
+   *  as `__vrmMotion.idleToSpeechFade` because how fast this reads is a judgement call
+   *  that has to be made by watching it — raise it if the body still snaps into speech,
+   *  lower it if the gesture feels like it starts late. Idle->idle is 1.0 for reference. */
+  idleToSpeechFade = 0.9;
   /** The outgoing side is a single-frame SNAPSHOT (a seam landed mid-fade), so it has no
    *  velocity of its own. Smoothstep's flat head would read as a stall there — shorten
    *  the fade for that case only, so the quiet part is 2-3 frames instead of ~0.15s.
@@ -1678,13 +1705,22 @@ class VRMMotionPlayer {
       const ctrl = new AbortController();
       const to = setTimeout(() => ctrl.abort(), 4000);
       fetch(url, { signal: ctrl.signal })
-        .then((r) => (r.status === 200 ? r.json() : null))
+        // 410 = never coming (failed, or already delivered), so stop rather than
+        // spend the remaining tries on it. This is the GestureLSM upgrade path,
+        // which is exactly the one that fails when that service is saturated.
+        .then((r) => (r.status === 200 ? r.json() : Promise.reject(new Error(String(r.status)))))
         .then((data) => {
           if (seq !== this.gestureSeq) return;
-          if (data && data.joints && data.joint_names) this.setClip(data, audio);
+          if (data && data.joints && data.joint_names) {
+            this._stats.lsm += 1; // a GestureLSM upgrade reached the body
+            this.setClip(data, audio);
+          }
           else if (++attempt < tries) setTimeout(poll, intervalMs);
         })
-        .catch(() => { if (++attempt < tries) setTimeout(poll, intervalMs); })
+        .catch((e) => {
+          if (String(e?.message) === '410') return;
+          if (++attempt < tries) setTimeout(poll, intervalMs);
+        })
         .finally(() => clearTimeout(to));
     };
     poll();
@@ -1769,6 +1805,14 @@ class VRMMotionPlayer {
             return d;
           }
         }
+        // 410: the backend knows this clip is never coming — the generation
+        // failed, or it was already delivered. 202 means "ask again", and
+        // treating those two the same is what made a failed gesture stall the
+        // body for the whole timeout instead of a single poll.
+        if (r.status === 410) {
+          console.debug(`[motion] ${url} is done for: ${r.headers.get('X-Motion-Reason')}`);
+          return null;
+        }
       } catch { /* transient; retry until the deadline */ }
       // Pace the polls. /motion/clip-smpl long-polls (~1s) once the id is registered,
       // but 202s INSTANTLY for an id it hasn't seen yet — so without a sleep we flood
@@ -1809,6 +1853,13 @@ class VRMMotionPlayer {
   private _prepareClip(clipObj: Clip, data: any) {
     this._holdT = 0;
     const overlap = Number(data.seed_overlap) || 0;
+    // Is the OUTGOING clip an idle? (_prepareClip runs before this.clip is swapped.)
+    // Speech fades are kept short so the body tracks the voice — but that reasoning is
+    // about sentence-TO-sentence seams. The first clip of a turn has no prior speech to
+    // stay in sync with, and it is the most visible seam there is: a calm idle stepping
+    // into an animated gesture in 0.35s reads as the body snapping/bouncing
+    // ("アイドルから話モーションが速すぎる / はねてる"). Blend that one at idle speed.
+    const outgoingIdle = !!this.clip?.idle;
     if (data.chained && this.clip && this._frame.length) {
       // Seeded from the previous clip's latents -> the motion CONTINUES it. Start at the
       // replay frame (overlap-1) if the gateway gave an explicit overlap, else at frame 0
@@ -1822,7 +1873,9 @@ class VRMMotionPlayer {
       // (A "verify the chain by pose distance" experiment lived here briefly — it compared
       // the wrong frame, because setClip used to add audio.currentTime on top of the pad it
       // validated. With the landing fixed to the pad itself, plain trust is correct again.)
-      this._fadeDur = overlap > 0 ? 0.2 : 0.45;
+      // ...unless we are leaving an idle, where the "exact replay" the short fade
+      // assumes does not hold anyway (the idle pose is unrelated to the seed frame).
+      this._fadeDur = outgoingIdle ? this.idleToSpeechFade : (overlap > 0 ? 0.2 : 0.45);
       return;
     }
     const match = this._matchStart(clipObj);
@@ -1839,7 +1892,9 @@ class VRMMotionPlayer {
     // frame, and the fade must be LONG ENOUGH to blend the residual travel or the jump
     // reads as "継ぎ目でがくがく". Both playheads keep advancing through the fade, so a
     // longer fade smooths the seam WITHOUT lagging/desyncing the motion vs the voice.
-    this._fadeDur = Math.min(0.7, Math.max(0.35, 0.25 + match.dist * 2.2));
+    this._fadeDur = outgoingIdle
+      ? this.idleToSpeechFade
+      : Math.min(0.7, Math.max(0.35, 0.25 + match.dist * 2.2));
   }
 
   // Clips pre-fetched by id the moment their payload arrives (while the PRIOR line is
@@ -1961,9 +2016,15 @@ class VRMMotionPlayer {
       this._idleSuspended = false;
     }
     if (now < this._idleNextAt) return;
+    // Idle clips arrive by a SEPARATE route (/motion/idle) from the speaking
+    // gestures, so the character's gesture_lsm_only setting never reached them —
+    // the gate is idleEnabled, which the viewer sets from whether the server has a
+    // rotation for THIS character. A model with none keeps its own embedded idle
+    // (Chancelor ships one) or holds its last pose.
+    if (!this.idleEnabled) return;
     this._idleFetching = true;
     const seq = this.gestureSeq;
-    fetch('/motion/idle')
+    fetch(`/motion/idle${this.confUid ? `?conf=${encodeURIComponent(this.confUid)}` : ''}`)
       .then((r) => (r.status === 200 ? r.json() : null))
       .then((d) => {
         // a turn may have started while we were fetching — never stomp a LIVE clip
@@ -2168,9 +2229,12 @@ class VRMMotionPlayer {
 
   /** Advance + apply the current gesture frame. Call once per frame BEFORE vrm.update(). */
   // --- usage ledger: which layer actually drove the body, per turn ---------
-  private _stats = { clip: 0, hold: 0, proc: 0, idle: 0, applies: 0 };
+  // `lsm` counts GestureLSM co-speech UPGRADES that actually landed on the body
+  // (incremented at the setClip in upgradeGesture, not where one is scheduled).
+  // Scheduling was never the uncertain part — arrival is.
+  private _stats = { clip: 0, hold: 0, proc: 0, idle: 0, applies: 0, lsm: 0 };
 
-  statsReset() { this._stats = { clip: 0, hold: 0, proc: 0, idle: 0, applies: 0 }; }
+  statsReset() { this._stats = { clip: 0, hold: 0, proc: 0, idle: 0, applies: 0, lsm: 0 }; }
 
   statsSnapshot() { return { ...this._stats }; }
 

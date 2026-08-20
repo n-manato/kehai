@@ -30,7 +30,7 @@
 ## アーキテクチャ（3層）
 
 ```
-[PC-A: open_llm_vtuber]                       [PC-B: 2×RTX3090]
+[PC-A: kehai]                       [PC-B: 2×RTX3090]
  LLM→感情抽出→TTS(既存)                        HY-Motion 常駐サービス(新規 motion-service/)
    │ motion cue(感情/プロンプト) ─ LAN(HTTP/WS) ─▶ 生成→SMPL→MMDリターゲット→.vmd
    │ ◀── .vmd(またはURL) ───────────────────────  感情別ウォームプール/キャッシュ
@@ -58,7 +58,7 @@
    - `WS   /events` → 非同期 job 完了 push。
    - `GET  /healthz`。
 
-### B. PC-A — backend（`src/open_llm_vtuber/`）
+### B. PC-A — backend（`src/kehai/`）
 1. **MotionClient** `motion/hy_motion_client.py`: PC-B への async クライアント。タイムアウト/失敗時はフォールバック指示。
 2. **プロンプト導出**: 感情→英語プロンプト雛形（`motion-service/prompts.py` と共有）。
 3. **会話統合**: 既存感情抽出（`agent/transformers.py`, `live2d_model.resolve_*`）に相乗り。

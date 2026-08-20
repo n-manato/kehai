@@ -1,6 +1,7 @@
 /* eslint-disable no-underscore-dangle */
 import * as THREE from "three";
 import { SPACE } from "../space/space-config";
+import { taa } from "../space/taa";
 
 /**
  * `window.__AI_DEBUG__` — the hooks that let an automated viewer (Claude driving
@@ -79,13 +80,50 @@ class AiDebug {
 
   private rngState: number | null = null;
 
+  /**
+   * Rolling window of REAL frame deltas in ms, for `frameStats()`. ~4s at 60fps.
+   *
+   * Recorded here because `step()` is the one place the true wall-clock delta is
+   * known, and it is called once per frame whether or not the clock is frozen —
+   * so the cost of a render can be measured on a FROZEN scene, which is the only
+   * way to compare two settings without the animation itself moving the number.
+   */
+  private frameMs: number[] = [];
+
+  /** Single-step mode: the loop renders only when a frame has been asked for. */
+  private paused = false;
+
+  private pending = 0;
+
+  private stepping = false;
+
+  private frameResolvers: (() => void)[] = [];
+
   // --- clock -------------------------------------------------------------
 
   /**
    * Convert the real frame delta into the delta the scene should advance by.
-   * Call exactly once per frame, as early as possible in the loop.
+   * Call exactly once per frame, as early as possible in the loop, with the
+   * RAW delta — the long-stall clamp lives in here now.
    */
   step(realDt: number): number {
+    // Sample before clamping. The clamp exists so a tab-switch or a GC pause
+    // cannot teleport the integrators; applying it to the statistics too would
+    // silently cap every frame-time reading at 33.3ms and report a stuttering
+    // scene as a solid 30fps.
+    if (realDt > 0) {
+      this.frameMs.push(realDt * 1000);
+      if (this.frameMs.length > 240) this.frameMs.shift();
+    }
+    // eslint-disable-next-line no-param-reassign
+    realDt = Math.min(realDt, 1 / 30);
+    // Single-stepping: a fixed step for the one frame that was asked for, and no
+    // advance at all otherwise. Checked before the seek branch so a step is never
+    // interpreted as seek progress.
+    if (this.stepping) {
+      this.simMs += FIXED_STEP * 1000;
+      return FIXED_STEP;
+    }
     if (this.seekTo !== null) {
       // Fixed-size steps, never a single big jump: the spring solver and the
       // Bullet sim are integrators, so a 2-second dt does not land where two
@@ -108,6 +146,43 @@ class AiDebug {
     return realDt;
   }
 
+  /**
+   * What a frame currently COSTS, in real time.
+   *
+   * Nothing else in the app reports this. The on-screen HUD computes an fps, but
+   * it is module-local to space-hud.ts and only ever reaches a DOM string, so
+   * judging "did that change make it slower" used to mean showing the HUD and
+   * scraping text. `renderer.info` is exposed and is a true whole-pipeline draw
+   * count, but draw calls are not time: raising the render resolution costs a
+   * lot and changes `calls` by zero.
+   *
+   * Median rather than mean — one GC pause should not decide the verdict — with
+   * p95 alongside so a stutter is still visible. `resetFrameStats()` first, wait
+   * out the window, then read.
+   */
+  frameStats(): {
+    samples: number
+    fps: number | null
+    msMedian: number | null
+    msP95: number | null
+  } {
+    const a = [...this.frameMs].sort((x, y) => x - y);
+    if (!a.length) return { samples: 0, fps: null, msMedian: null, msP95: null };
+    const at = (p: number) => a[Math.min(a.length - 1, Math.floor(a.length * p))];
+    const med = at(0.5);
+    return {
+      samples: a.length,
+      fps: +(1000 / med).toFixed(1),
+      msMedian: +med.toFixed(2),
+      msP95: +at(0.95).toFixed(2),
+    };
+  }
+
+  /** Drop the window, so the next read describes only what happens after now. */
+  resetFrameStats(): void {
+    this.frameMs = [];
+  }
+
   /** Debug-aware wall clock, in ms. Use instead of `performance.now()` for
    *  anything that SCHEDULES itself (blink, gaze) rather than integrating dt. */
   now(): number {
@@ -127,7 +202,74 @@ class AiDebug {
     this.frozen = false;
     this.seekTo = null;
     this.driving = false;
+    this.paused = false;
+    this.pending = 0;
+    this.stepping = false;
+    const rs = this.frameResolvers;
+    this.frameResolvers = [];
+    rs.forEach((r) => r());
     return this.state();
+  }
+
+  // --- single-stepping ----------------------------------------------------
+
+  /**
+   * Render EXACTLY ONE frame, advancing the clock by one fixed step.
+   *
+   * WHY `setTime()` IS NOT THIS. setTime freezes the clock; it does not stop the
+   * render loop, which keeps drawing the frozen pose for as long as the harness
+   * takes to come back and photograph it. That was harmless while every pass was
+   * stateless — the same pose redrawn is the same pixels — but the temporal
+   * resolve carries a history between frames, so those extra redraws let it
+   * converge on a pose the live app only ever renders once. A capture taken that
+   * way flatters TAA on moving content and cannot be compared against a
+   * pre-TAA baseline.
+   *
+   * Here the loop is suspended and each call lets one frame through, so
+   * consecutive captures are consecutive frames in the sense the eye means — and
+   * with a fixed dt, so they are also reproducible, which live playback is not.
+   */
+  stepFrame(): Promise<unknown> {
+    this.driving = true;
+    this.frozen = true;
+    this.paused = true;
+    this.pending += 1;
+    return new Promise<void>((resolve) => {
+      this.frameResolvers.push(resolve);
+    }).then(() => this.state());
+  }
+
+  /** Leave single-step mode but stay frozen where we are. */
+  endStep() {
+    this.paused = false;
+    this.pending = 0;
+    this.stepping = false;
+    const rs = this.frameResolvers;
+    this.frameResolvers = [];
+    rs.forEach((r) => r());
+    return this.state();
+  }
+
+  /**
+   * Gate at the very top of the render loop. Returns false when the loop should
+   * do nothing at all this tick. Always true unless `stepFrame()` is driving, so
+   * normal operation is one boolean test.
+   */
+  beginFrame(): boolean {
+    if (!this.paused) return true;
+    if (this.pending <= 0) return false;
+    this.pending -= 1;
+    this.stepping = true;
+    return true;
+  }
+
+  /** Call after the frame has been presented. Releases whoever asked for it. */
+  endFrame(): void {
+    if (!this.stepping) return;
+    this.stepping = false;
+    const rs = this.frameResolvers;
+    this.frameResolvers = [];
+    rs.forEach((r) => r());
   }
 
   /**
@@ -243,6 +385,28 @@ class AiDebug {
 
   private parallaxLast = 1;
 
+  /**
+   * Put the camera exactly here. The presets cannot express an arbitrary view,
+   * and a mouse-drag orbit is not reproducible — two runs of the same drag
+   * landed on [0,0.036,0.413] and [0.515,0.052,0.426], which makes an A/B of two
+   * settings meaningless because the views differ. Anything that has to compare
+   * two runs frame-by-frame needs this instead.
+   */
+  setCamera(pos: number[], target: number[]) {
+    if (!this.ctx) return { error: "not attached" };
+    const { camera, controls } = this.ctx;
+    controls.target.set(target[0], target[1], target[2]);
+    camera.position.set(pos[0], pos[1], pos[2]);
+    camera.lookAt(controls.target);
+    controls.update();
+    camera.updateMatrixWorld();
+    taa.reset(); // a teleport invalidates every pixel of the temporal history
+    return {
+      position: camera.position.toArray().map((n) => +n.toFixed(4)),
+      target: controls.target.toArray().map((n) => +n.toFixed(4)),
+    };
+  }
+
   setCameraPreset(name: string) {
     const p = CAMERA_PRESETS[name];
     if (!p) return { error: `unknown preset "${name}"`, available: Object.keys(CAMERA_PRESETS) };
@@ -252,6 +416,10 @@ class AiDebug {
     camera.position.set(0, p.ty + 0.07, p.dist);
     camera.lookAt(controls.target);
     controls.update();
+    // A preset TELEPORTS the camera, so every pixel of the temporal history now
+    // belongs to a different view. Tests call this AFTER waitUntilStill, so a kept
+    // history would carry the previous framing straight into the screenshot.
+    taa.reset();
     return { preset: name, ...p };
   }
 
@@ -362,6 +530,10 @@ class AiDebug {
       time: +(this.simMs / 1000).toFixed(4),
       seed: this.rngState,
       grainSuppressed: this.noGrain,
+      // A frozen scene is not a still IMAGE until the temporal history latches —
+      // the jitter keeps walking while the clock is stopped. Existing assertions
+      // only read .frozen / .seeking / .time, so this is additive.
+      taa: taa.state(),
     };
   }
 
@@ -371,6 +543,191 @@ class AiDebug {
 }
 
 export const aiDebug = new AiDebug();
+
+/**
+ * FLASH RECORDER — a black box for the artefact nobody can reproduce on demand.
+ *
+ * The under-skirt "the front flashes for a frame" report survived every
+ * harness-driven hypothesis: TAA one-frame pops (deterministic lockstep:
+ * TAA never changes more per frame than the raw render), transparent-sort
+ * flips (no one-frame pops in 150 deterministic swing frames), z-fighting
+ * (frozen scene + walking jitter: byte-stable), and dt spikes (55 ms stalls
+ * injected live: nothing). The one machine it demonstrably happens on is the
+ * user's, mid-conversation — so the instrument has to live there.
+ *
+ * It keeps a rolling ring of the last ~1.2 s of frames (copied GPU-side each
+ * rAF, cheap) and, when the user presses "9" at the moment they SEE it, POSTs
+ * the ring to the server's /debug/flash-frame drop-box, where the analysis
+ * tooling can actually reach the files. Enabled by default while the hunt is
+ * on; `__flashRec(0)` turns it off, and the ring only exists while enabled.
+ */
+class FlashRecorder {
+  private ring: HTMLCanvasElement[] = [];
+
+  private meta: { f: number; t: number; taa: boolean }[] = [];
+
+  private head = 0;
+
+  private frame = 0;
+
+  // OFF by default since 2026-08-13: the artefact it was hunting (the necktie
+  // flap popping through the hips — see mmd-hair-physics.ts, the group-7 mask
+  // exception) was caught and fixed. `__flashRec(1)` re-arms it.
+  private enabled = false;
+
+  private uploading = false;
+
+  private raf = 0;
+
+  private readonly SLOTS = 72; // ~1.2 s at 60 fps
+
+  /** One-frame-pop auto-detector state: 96x96 luma-ish downsamples of the last
+   *  three frames, and a rolling baseline of frame-to-frame difference. */
+  private small: HTMLCanvasElement | null = null;
+
+  private popData: (Uint8ClampedArray | null)[] = [null, null, null];
+
+  private popBase: number[] = [];
+
+  private popCooldown = 0;
+
+  private autoCount = 0;
+
+  start(): void {
+    if (this.raf) return;
+    const step = () => {
+      this.raf = requestAnimationFrame(step);
+      if (!this.enabled || this.uploading) return;
+      const src = document.querySelector("canvas");
+      if (!src || !(src as HTMLCanvasElement).width) return;
+      const c = src as HTMLCanvasElement;
+      this.frame += 1;
+      if (!this.ring[this.head]) {
+        this.ring[this.head] = document.createElement("canvas");
+        this.ring[this.head].width = 640;
+        this.ring[this.head].height = Math.max(1, Math.round((640 * c.height) / c.width));
+      }
+      const slot = this.ring[this.head];
+      const g = slot.getContext("2d");
+      if (g) g.drawImage(c, 0, 0, slot.width, slot.height);
+      this.meta[this.head] = {
+        f: this.frame,
+        t: aiDebug.now(),
+        taa: (window as any).__AI_DEBUG__?.state?.().taa?.enabled ?? false,
+      };
+      this.head = (this.head + 1) % this.SLOTS;
+      this.detectPop(c);
+    };
+    this.raf = requestAnimationFrame(step);
+    window.addEventListener("keydown", (e) => {
+      // Not while typing — a "9" in the chat box must stay a "9".
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      if (e.key === "9" && !e.repeat) this.dump();
+    });
+  }
+
+  /**
+   * The reflex the human cannot have: something that appears for EXACTLY one
+   * frame is gone 16ms later, long before a hand reaches the "9" key. The
+   * signature is mechanical — prev->cur changes a lot, cur->next changes a
+   * lot, prev->next barely changes (real motion fails the third test: its
+   * prev->next is the sum, not zero). On a hit, the three full-res ring
+   * frames upload themselves, named auto-*.
+   */
+  private detectPop(src: HTMLCanvasElement): void {
+    if (!this.small) {
+      this.small = document.createElement("canvas");
+      this.small.width = 96;
+      this.small.height = 96;
+    }
+    const g = this.small.getContext("2d", { willReadFrequently: true });
+    if (!g) return;
+    g.drawImage(src, 0, 0, 96, 96);
+    this.popData[0] = this.popData[1];
+    this.popData[1] = this.popData[2];
+    this.popData[2] = new Uint8ClampedArray(g.getImageData(0, 0, 96, 96).data);
+    const [a, b, c2] = this.popData;
+    if (!a || !b || !c2) return;
+    const diff = (A: Uint8ClampedArray, B: Uint8ClampedArray) => {
+      let s = 0;
+      for (let i = 0; i < A.length; i += 4) {
+        s += Math.abs(A[i] - B[i]) + Math.abs(A[i + 1] - B[i + 1]) + Math.abs(A[i + 2] - B[i + 2]);
+      }
+      return s / (A.length / 4) / 3;
+    };
+    const d01 = diff(a, b);
+    const d12 = diff(b, c2);
+    const d02 = diff(a, c2);
+    this.popBase.push(d01);
+    if (this.popBase.length > 150) this.popBase.shift();
+    if (this.popCooldown > 0) this.popCooldown -= 1;
+    const med = [...this.popBase].sort((x, y) => x - y)[Math.floor(this.popBase.length / 2)];
+    const hot = Math.max(med * 2.5, med + 3);
+    if (this.popBase.length > 60 && this.popCooldown === 0 && this.autoCount < 8
+      && d01 > hot && d12 > hot && d02 < 0.5 * Math.min(d01, d12)) {
+      this.autoCount += 1;
+      this.popCooldown = 90;
+      // The pop is the MIDDLE of the three; ring head already advanced once.
+      const idx = [
+        (this.head + this.SLOTS - 3) % this.SLOTS,
+        (this.head + this.SLOTS - 2) % this.SLOTS,
+        (this.head + this.SLOTS - 1) % this.SLOTS,
+      ];
+      // eslint-disable-next-line no-console
+      console.log(`[flashRec] one-frame pop auto-detected (d01 ${d01.toFixed(1)} d12 ${d12.toFixed(1)} through ${d02.toFixed(1)} med ${med.toFixed(1)}) — uploading triplet`);
+      void this.uploadSlots(idx, `auto-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+    }
+  }
+
+  private async uploadSlots(indices: number[], stamp: string): Promise<number> {
+    let sent = 0;
+    for (let i = 0; i < indices.length; i += 1) {
+      const slot = this.ring[indices[i]];
+      const m = this.meta[indices[i]];
+      if (!slot || !m) continue;
+      const name = `${stamp}-${String(i).padStart(2, "0")}-f${m.f}-taa${m.taa ? 1 : 0}`;
+      // eslint-disable-next-line no-await-in-loop
+      await fetch("/debug/flash-frame", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, png: slot.toDataURL("image/png") }),
+      }).catch(() => { /* debug path — losing one frame beats breaking the app */ });
+      sent += 1;
+    }
+    return sent;
+  }
+
+  setEnabled(on: boolean): { flashRec: boolean } {
+    this.enabled = on;
+    if (!on) {
+      this.ring = [];
+      this.meta = [];
+    }
+    return { flashRec: this.enabled };
+  }
+
+  /** Ship the whole ring, oldest first. Serialisation is the expensive part,
+   *  so the ring pauses while it runs — the moment is already captured. */
+  async dump(): Promise<{ sent: number } | { error: string }> {
+    if (this.uploading) return { error: "already uploading" };
+    this.uploading = true;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    try {
+      const indices = Array.from({ length: this.SLOTS }, (_, i) => (this.head + i) % this.SLOTS);
+      const sent = await this.uploadSlots(indices, stamp);
+      // eslint-disable-next-line no-console
+      console.log(`[flashRec] ${sent} frames uploaded as ${stamp}-*`);
+      return { sent };
+    } catch (e) {
+      return { error: String(e) };
+    } finally {
+      this.uploading = false;
+    }
+  }
+}
+
+export const flashRecorder = new FlashRecorder();
 
 /** `?debug=1` — present so a capture tool can pin the scene from the URL alone. */
 export function debugParams(): { debug: boolean; t: number | null; seed: number | null } {

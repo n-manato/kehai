@@ -124,6 +124,15 @@ export function createWireframe(): SpaceModule {
       sets[0].uniforms.uInt.value = SPACE.grid * gain;
       sets[1].uniforms.uInt.value = SPACE.portals * gain;
       sets[2].uniforms.uInt.value = SPACE.rails * gain;
+      // An intensity of 0 does NOT mean "not drawn": the shader discards at
+      // a <= 0.002 (lines.ts), so the whole set was still being submitted,
+      // transformed and rasterised every frame just to kill every fragment —
+      // and in FOUR passes, since the space layer is also in the TAA velocity
+      // pass and the panels' backdrop render. grid/portals/rails all ship at 0
+      // (see space-config.ts), so this is three draw calls x four passes of
+      // pure waste on the shipped configuration. Purely a visibility gate: any
+      // non-zero intensity puts the set straight back.
+      for (const set of sets) set.object.visible = set.uniforms.uInt.value > 1e-4;
       // Fade distances live rather than baked, so the ground boundary can be
       // dialled against the real panel without rebuilding the geometry.
       const far = Math.max(SPACE.floorFadeM, 0.5);

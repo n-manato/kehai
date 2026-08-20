@@ -7,8 +7,8 @@ from loguru import logger
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, project_root)
 
-from src.open_llm_vtuber.live.bilibili_live import BiliBiliLivePlatform
-from src.open_llm_vtuber.config_manager.utils import read_yaml, validate_config
+from src.kehai.live.bilibili_live import BiliBiliLivePlatform
+from src.kehai.config_manager.utils import read_yaml, validate_config
 
 
 async def main():
@@ -59,4 +59,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Shutting down BiliBili Live platform")
 
-# Usage: uv run python -m src.open_llm_vtuber.live.run_bilibili_live
+# Usage: uv run python -m src.kehai.live.run_bilibili_live

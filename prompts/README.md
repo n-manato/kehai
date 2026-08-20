@@ -1,6 +1,6 @@
 # Prompts
 
-This directory contains utility prompts used in the Open-LLM-VTuber project. These are general-purpose prompts that are not specific to any character's persona.
+This directory contains utility prompts used in the KEHAI project. These are general-purpose prompts that are not specific to any character's persona.
 
 ## Examples of Utility Prompts
 

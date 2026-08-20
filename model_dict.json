@@ -35,7 +35,7 @@
     "initialXshift": 0,
     "initialYshift": 0,
     "kXOffset": 1150,
-    "idleMotionGroupName": "",
+    "idleMotionGroupName": "Idle",
     "emotionMap": {
       "neutral": 15,
       "idle_normal": 14,
@@ -767,6 +767,33 @@
     "idleMotionGroupName": "",
     "emotionMap": {
       "neutral": 0
+    },
+    "tapMotions": {}
+  },
+  {
+    "name": "chancelor",
+    "description": "Chancelor - plain rigged .glb (Avaturn/Mixamo skeleton). Loaded by the three-vrm viewer: a VRM humanoid is built over its bones at load time (utils/glb-humanoid.ts), so body motion works with no retarget. No spring bones. The face carries the ARKit 52 blendshapes plus the Oculus visemes, so expressions and lip sync are driven from those names (utils/vrm-expression.ts, ARKIT profile) rather than from VRM expression presets, which the file cannot carry.",
+    "url": "/Live2D%20Characters/vrm/chancelor.glb",
+    "kScale": 1.0,
+    "initialXshift": 0,
+    "initialYshift": 0,
+    "kXOffset": 0,
+    "idleMotionGroupName": "",
+    "emotionMap": {
+      "neutral": 0,
+      "joy": 1,
+      "joy_smile": 2,
+      "joy_big": 3,
+      "sadness": 4,
+      "sadness_worry": 5,
+      "anger": 6,
+      "surprise": 7,
+      "surprise_shock": 8,
+      "fear": 9,
+      "disgust": 10,
+      "thinking": 11,
+      "shy": 12,
+      "smug": 13
     },
     "tapMotions": {}
   }

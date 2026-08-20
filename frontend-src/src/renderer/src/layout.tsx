@@ -31,6 +31,14 @@ export const layoutStyles = {
     overflow: 'hidden',
     flexShrink: 0,
     transition: 'all 0.2s',
+    // Collapsed, this box is 0-wide and the toggle arrow floats out of it over
+    // the character canvas — which is an absolutely-positioned SIBLING of the
+    // app container at zIndex 5. Neither appContainer nor mainContent creates a
+    // stacking context (position:relative, z-index:auto), so the arrow is
+    // compared against that 5 directly; at its own zIndex 1 it would be painted
+    // under the canvas and unclickable. 10 puts it on the same layer as the
+    // footer and the connection badge, which it never overlaps.
+    zIndex: 10,
   },
   mainContent: {
     flex: 1,
@@ -58,32 +66,9 @@ export const layoutStyles = {
     position: 'relative',
     zIndex: 1,
   },
-  toggleButton: {
-    position: 'absolute',
-    left: 0,
-    top: '50%',
-    transform: 'translateY(-50%)',
-    height: '60px',
-    bg: 'whiteAlpha.100',
-    _hover: { bg: 'whiteAlpha.200' },
-    borderLeftRadius: 0,
-    borderRightRadius: 'md',
-    zIndex: 10,
-  },
   canvasHeight: (isFooterCollapsed: boolean) => ({
     height: isFooterCollapsed ? 'calc(100% - 24px)' : 'calc(100% - 120px)',
   }),
-  sidebarToggleButton: {
-    position: 'absolute',
-    left: 0,
-    top: '50%',
-    transform: 'translateY(-50%)',
-    height: '60px',
-    bg: 'gray.800',
-    borderLeftRadius: 0,
-    borderRightRadius: 'md',
-    zIndex: 10,
-  },
   collapsedFooter: {
     height: { base: '20px', md: '24px' },
     transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',

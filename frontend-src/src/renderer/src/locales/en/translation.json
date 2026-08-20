@@ -56,7 +56,7 @@
       "allowButtonTrigger": "Prompt AI to Speak via Raise Hand Button"
     },
     "about": {
-      "title": "Open LLM VTuber Frontend",
+      "title": "KEHAI Frontend",
       "version": "Version",
       "projectLinks": "Project Links",
       "github": "GitHub",
@@ -125,7 +125,8 @@
     "failedCapture": "Failed to capture {{source}} frame",
     "failedParseWebSocket": "Failed to parse WebSocket message",
     "websocketNotOpen": "WebSocket is not open.",
-    "vadMisfire": "Voice detected but too brief. Try speaking louder/longer, or adjust settings (lower speech threshold, lower negative threshold, reduce redemption frames)."
+    "vadMisfire": "Voice detected but too brief. Try speaking louder/longer, or adjust settings (lower speech threshold, lower negative threshold, reduce redemption frames).",
+    "audioBlocked": "Click anywhere to enable sound"
   },
   "aiState": {
     "idle": "idle",
@@ -140,4 +141,4 @@
     "connecting": "Connecting",
     "clickToReconnect": "Click to Reconnect"
   }
-} 
+}

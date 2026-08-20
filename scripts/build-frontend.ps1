@@ -3,7 +3,7 @@
   Build the embedded frontend source (frontend-src/) and deploy it to frontend/.
 
 .DESCRIPTION
-  The web UI lives as source under frontend-src/ (a copy of Open-LLM-VTuber-Web
+  The web UI lives as source under frontend-src/ (a copy of KEHAI-Web
   with this project's customizations). The server serves the *built* output from
   frontend/. This script rebuilds from source and swaps the result in, removing
   the previous hashed bundle so only the new one remains.

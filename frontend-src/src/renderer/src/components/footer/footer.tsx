@@ -9,6 +9,7 @@ import { memo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { InputGroup } from '@/components/ui/input-group';
 import { footerStyles } from './footer-styles';
+import { AUTO_HIDE_CLASS } from '@/utils/space/auto-hide';
 import AIStateIndicator from './ai-state-indicator';
 import { useFooter } from '@/hooks/footer/use-footer';
 
@@ -40,9 +41,16 @@ interface MessageInputProps {
 // Reusable components
 const ToggleButton = memo(({ isCollapsed, onToggle }: ToggleButtonProps) => (
   <Box
+    // Collapsed, this arrow is the only thing the footer leaves on screen, so
+    // it fades with the rest of the chrome on idle. Expanded, the input bar is
+    // in use and it stays. See utils/space/auto-hide.ts.
+    className={isCollapsed ? AUTO_HIDE_CLASS : undefined}
     {...footerStyles.footer.toggleButton}
     onClick={onToggle}
-    color="whiteAlpha.500"
+    // Same reason as the sidebar arrow: collapsed, the footer is transparent
+    // and this glyph is over the wallpaper, where 50% white does not read.
+    color={isCollapsed ? 'white' : 'whiteAlpha.500'}
+    filter={isCollapsed ? 'drop-shadow(0 1px 3px rgba(0, 0, 0, 0.75))' : 'none'}
     style={{
       transform: isCollapsed ? 'rotate(180deg)' : 'rotate(0deg)',
     }}

@@ -14,7 +14,7 @@ export function useTextInput() {
   const { aiState } = useAiState();
   const { interrupt } = useInterrupt();
   const { appendHumanMessage } = useChatHistory();
-  const { stopMic, autoStopMic } = useVAD();
+  const { stopMic, autoStopMic, isContinuousMic } = useVAD();
   const { captureAllMedia } = useMediaCapture();
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -37,7 +37,13 @@ export function useTextInput() {
       language: i18n.language, // make the avatar reply in the UI language
     });
 
-    if (autoStopMic) stopMic();
+    // autoStopMic is a LEGACY anti-feedback setting for the old client-VAD batch
+    // path. In continuous-mic mode (server VAD / the WebRTC track) the design is an
+    // always-open mic with AEC and ducking, so killing it here turned typing ONE
+    // message into a permanently dead microphone — she answered that message and
+    // then never heard speech again, with nothing in the UI to say why. vad-context
+    // already carries this guard on the speech-end path; this call site was missed.
+    if (autoStopMic && !isContinuousMic()) stopMic();
     setInputText('');
   };
 

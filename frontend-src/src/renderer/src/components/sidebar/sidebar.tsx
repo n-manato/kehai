@@ -5,6 +5,7 @@ import {
 } from 'react-icons/fi';
 import { memo } from 'react';
 import { sidebarStyles } from './sidebar-styles';
+import { AUTO_HIDE_CLASS } from '@/utils/space/auto-hide';
 import SettingUI from './setting/setting-ui';
 import ChatHistoryPanel from './chat-history-panel';
 import BottomTab from './bottom-tab';
@@ -34,7 +35,11 @@ const ToggleButton = memo(({ isCollapsed, onToggle }: {
   onToggle: () => void
 }) => (
   <Box
-    {...sidebarStyles.sidebar.toggleButton}
+    // Collapsed, this arrow is the only chrome left over the wallpaper, so it
+    // fades with the rest when nobody is touching the screen. Open, the panel
+    // is in use and the arrow stays put. See utils/space/auto-hide.ts.
+    className={isCollapsed ? AUTO_HIDE_CLASS : undefined}
+    {...sidebarStyles.sidebar.toggleButton(isCollapsed)}
     style={{
       transform: isCollapsed ? 'rotate(180deg)' : 'rotate(0deg)',
     }}

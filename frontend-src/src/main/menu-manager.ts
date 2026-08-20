@@ -102,7 +102,7 @@ export class MenuManager {
       },
     ]);
 
-    this.tray.setToolTip('Open LLM VTuber');
+    this.tray.setToolTip('KEHAI');
     this.tray.setContextMenu(contextMenu);
   }
 
