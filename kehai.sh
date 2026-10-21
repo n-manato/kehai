@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # KEHAI on PC-B: start / stop / status / log.
 #
+#   ./kehai.sh up        gateway + ActionPlan + vLLM, then start (what @reboot runs)
 #   ./kehai.sh start     detached; safe to run twice (refuses if already up)
 #   ./kehai.sh stop
 #   ./kehai.sh restart
@@ -40,6 +41,7 @@ case "${1:-status}" in
     [ -n "$(pid)" ] && kill -9 "$(pid)"
     echo "stopped"
     ;;
+  up) mkdir -p logs; bash scripts/pcb-stack-up.sh 2>&1 | tee -a logs/boot.log ;;
   restart) "$0" stop && "$0" start ;;
   status)
     p="$(pid)"
@@ -51,5 +53,5 @@ case "${1:-status}" in
     echo "nexus gateway :3000 -> HTTP $code (200 = healthy)"
     ;;
   log) tail -f logs/server.log ;;
-  *) echo "usage: $0 {start|stop|restart|status|log}"; exit 2 ;;
+  *) echo "usage: $0 {up|start|stop|restart|status|log}"; exit 2 ;;
 esac

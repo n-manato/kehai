@@ -56,3 +56,18 @@ cd ~/Documents/DEV/KEHAI
 `~/Documents/DEV/AICCORE-Nexus` — gateway(:3000) / GSV(:9880) / vLLM(:8807) /
 ActionPlan(:8893) / GestureLSM(:8802)。ActionPlan は On-Demand ではないので
 再起動後は手動起動が要る（`start_server.sh` の warmup がその旨を出力する）。
+
+### 箱の再起動後（2026-10-21 に踏んだ）
+
+crontab の `@reboot` が `./kehai.sh up`（= `scripts/pcb-stack-up.sh`）を走らせ、
+gateway → ActionPlan → vLLM → KEHAI の順に起こす（結果は `logs/boot.log`）。TTS/gesture は
+gateway に任せる。手で戻すときも `./kehai.sh up` だけでよい（上がっているものは触らない）。
+自前で起動するときの罠:
+
+1. vLLM は **venv の bin を PATH に入れること**。無いと flashinfer の JIT が `ninja` を見つけられず
+   エンジン初期化で落ちる。
+2. ActionPlan は **GPU1**（`CUDA_VISIBLE_DEVICES=1`）。省くと GPU0 に載り、GPU0 固定の
+   gesturelsm が gateway の VRAM スケジューラに 507 `gpu_full` で弾かれる。
+3. TTS / gesture は gateway の DB（`prisma/dev.db` の `ModelRuntimeConfig`）で `enabled=1` で
+   なければならない。`enabled=0` だと起動されないうえ、手で起こしても worker が kill する
+   （GSV が出力ゼロで即死するのはこれ）。

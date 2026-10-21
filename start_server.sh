@@ -53,10 +53,17 @@ export MOTION_GATEWAY_FALLBACK="https://gpu.aiccore-uno.ai/v1"
 # Warm the On Demand voice + gesture stacks in the background: after a reboot or
 # an eviction the first request pays the ~13s cold boot — pay it now, not
 # mid-conversation (a cold gesture lands after the frontend stops polling).
+# Every probe uses `curl -f`: without it a gateway 502/503 still exits 0, and on
+# 2026-10-21 all four lines printed "warm" while every backend was down.
 GW="$MOTION_GATEWAY_BASE"
 if [ -n "$MOTION_GATEWAY_KEY" ]; then
   mkdir -p cache
-  ( curl -s -m 120 -X POST "$GW/audio/speech" \
+  # LLM (vLLM, :8807): NOT On Demand and the gateway never starts it (scripts/pcb-stack-up.sh does).
+  # Probed directly — /v1/models answers without running a generation.
+  ( curl -sf -m 5 http://127.0.0.1:8807/v1/models -o /dev/null \
+      && echo "[warmup] LLM (vLLM) is up" \
+      || echo "[warmup] LLM DOWN — run ./kehai.sh up" ) &
+  ( curl -sf -m 120 -X POST "$GW/audio/speech" \
       -H "Authorization: Bearer $MOTION_GATEWAY_KEY" -H "Content-Type: application/json" \
       -d '{"model":"gpt-sovits","input":"起動しました"}' -o /dev/null \
       && echo "[warmup] TTS stack is warm" || echo "[warmup] TTS warmup failed (will cold-start on first use)" ) &
@@ -69,18 +76,18 @@ w.writeframes(b"\x00\x00" * 96000)
 w.close()
 PY
     [ -f cache/warm_silent6s.wav ] || exit 0
-    curl -s -m 120 -X POST "$GW/gesture?format=joints" \
+    curl -sf -m 120 -X POST "$GW/gesture?format=joints" \
       -H "Authorization: Bearer $MOTION_GATEWAY_KEY" \
       -F "audio=@cache/warm_silent6s.wav;type=audio/wav" -F "text=起動" -o /dev/null \
       && echo "[warmup] gesture model is warm" || echo "[warmup] gesture warmup failed (will cold-start on first use)"
     # Text-streaming motion (ActionPlan, resident on GPU1): NOT On Demand — if the
-    # box rebooted it must be relaunched by hand. Probe it so a dead service is
+    # box rebooted, scripts/pcb-stack-up.sh relaunches it. Probe it so a dead service is
     # visible at startup instead of as silently-missing gestures.
-    curl -s -m 30 -X POST "$GW/motion/stream" \
+    curl -sf -m 30 -X POST "$GW/motion/stream" \
       -H "Authorization: Bearer $MOTION_GATEWAY_KEY" -H "Content-Type: application/json" \
       -d '{"text":"a person stands","seconds":1,"session":"warmup","chain":false}' -o /dev/null \
       && echo "[warmup] text-motion (ActionPlan) is up" \
-      || echo "[warmup] text-motion DOWN — cd ~/Documents/DEV/ActionPlan-Code && CUDA_VISIBLE_DEVICES=0 setsid --fork nohup ./venv/bin/python actionplan_service.py --port 8893 </dev/null >/tmp/ap_service.log 2>&1"
+      || echo "[warmup] text-motion DOWN — run ./kehai.sh up"
     # STT (faster-whisper on GPU1 via the gateway sidecar): the first request
     # after a sidecar restart pays the model load — pay it here instead.
     # MUST match conf.yaml's gateway_whisper_asr.model. Warming a different id
@@ -88,7 +95,7 @@ PY
     # measured) against the client's 5s loopback timeout, and a miss there falls
     # over to the PUBLIC gateway — a silent trip to the internet for a service
     # running on this same box.
-    curl -s -m 120 -X POST "$GW/audio/transcriptions" \
+    curl -sf -m 120 -X POST "$GW/audio/transcriptions" \
       -H "Authorization: Bearer $MOTION_GATEWAY_KEY" \
       -F "file=@cache/warm_silent6s.wav;type=audio/wav" -F "model=faster-whisper-large-v3-full" -o /dev/null \
       && echo "[warmup] STT model is warm" || echo "[warmup] STT warmup failed (will cold-start on first use)"
