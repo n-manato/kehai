@@ -1,5 +1,6 @@
 import { headTracker } from "./head-tracker";
 import { viewerTransform } from "./viewer-transform";
+import { autoHide } from "./auto-hide";
 
 /**
  * Camera preview with the detection drawn on top.
@@ -64,7 +65,7 @@ export function showHeadPreview(container: HTMLElement): string {
   label.style.cssText = "margin-top:4px;white-space:pre";
   box.appendChild(label);
 
-  container.appendChild(box);
+  container.appendChild(autoHide(box));
 
   const draw = () => {
     const v = headTracker.getVideo();

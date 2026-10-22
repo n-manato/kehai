@@ -28,6 +28,7 @@ import { buildVrmFromGltf } from "@/utils/glb-humanoid";
 import { dedupeTextures, pruneZeroMorphTargets, describeVrmCost } from "@/utils/vrm-optimize";
 import { faceMotion } from "@/utils/face-motion";
 import { vrmLipSync } from "@/utils/vrm-lipsync";
+import { aiFx } from "@/utils/ai-fx";
 import { SmplReferenceFigure } from "@/utils/smpl-reference-figure";
 import { SmplMeshFigure } from "@/utils/smpl-mesh-figure";
 import { neuralSpace } from "@/utils/space/neural-space";
@@ -1421,6 +1422,7 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
   // so anything captured there would go stale on the first state change.
   useEffect(() => {
     neuralSpace.setAiState(aiState);
+    aiFx.setAiState(aiState);
   }, [aiState]);
 
   useEffect(() => {
@@ -2641,6 +2643,7 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
           u.uFresInt.value = fx(LOOK.fresInt * skinScale, 0);
           u.uFresPow.value = LOOK.fresPow;
           u.uFresColor.value.set(LOOK.fresColor);
+          aiFx.adoptRim(u); // no-op unless the model opted in (overrides the fresnel above)
           u.uSubInt.value = fx(LOOK.subInt * skinScale, 0); // the coloured rim
           u.uSubPow.value = LOOK.subPow;
           u.uSubMix.value = LOOK.subMix;
@@ -2972,11 +2975,15 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     // Live: __vrmGaze({enabled:false}) or ({wander:0.3, hold:0.6}).
     const GAZE = {
       enabled: true,
+      // Held eye contact with whoever is looking at the screen: no glances away,
+      // and only micro-saccades around the camera so the eyes never look frozen.
+      // (The camera follows the viewer's head when off-axis tracking is live,
+      // so this is the viewer's actual eye position.)
       hold: 1.1,      // s: minimum time on one fixation
       holdVar: 2.6,   // s: extra random dwell
-      wander: 0.14,   // m of target offset for a small shift of attention
+      wander: 0.03,   // m of target offset for a small shift of attention
       away: 0.55,     // m for a real glance away
-      awayChance: 0.35,
+      awayChance: 0,
       speed: 0.4,     // per 60Hz frame — saccades are FAST, a slow drift reads as dazed
       // How hard the eyes hold the camera while the HEAD is moving. lookAt is a stabiliser:
       // it keeps the eyes on the target, so a gesture that swings the head 30 deg swings the
@@ -2984,7 +2991,9 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       // 5.0 silent). That over-compensation is what reads as the eyes doing something odd
       // mid-sentence. Blending the target toward wherever the head is already pointing lets
       // the eyes travel WITH the head. 1 = lock on the camera, 0 = always centred in the head.
-      stabilise: 0.55,
+      // Raised from 0.55 for held eye contact: the eyes stay on the viewer
+      // through gestures, at the cost of some counter-rotation mid-sentence.
+      stabilise: 0.9,
     };
     const gazeTarget = new THREE.Object3D();
     const gazeWant = new THREE.Vector3();
@@ -2995,7 +3004,10 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     let gazeNextAt = 0;
     const setupGaze = (v: VRM) => {
       if (!v.lookAt || !v.humanoid) return;
-      if (!(v.lookAt.applier instanceof VRMLookAtBoneApplier)) {
+      // A glb rig arrives with placeholder ranges (see glb-humanoid), so it is
+      // swapped too.
+      const glbRig = (v.meta as { name?: string } | undefined)?.name === "glb-humanoid";
+      if (glbRig || !(v.lookAt.applier instanceof VRMLookAtBoneApplier)) {
         // outputScale is in DEGREES of eye rotation at inputMaxValue. Kept modest: real
         // eyes only travel ~15 deg before the head takes over, and more looks googly.
         v.lookAt.applier = new VRMLookAtBoneApplier(
@@ -3274,12 +3286,16 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     if (migrated) saveLook();
     const applyLookState = () => {
       setBgGrad(LOOK.bgInner, LOOK.bgOuter);
-      ambient.intensity = LOOK.ambient;
-      hemi.intensity = LOOK.hemi;
-      hemi.color.set(LOOK.hemiSky);
-      hemi.groundColor.set(LOOK.hemiGround);
-      keyLight.intensity = LOOK.key;
-      keyLight.color.set(LOOK.keyColor);
+      // The lights were dialled in for Miku's toon shading too: dim, with a violet
+      // ground bounce. On a PBR model that has no rim/subsurface pass to lift it,
+      // that rig turns a white android a dull violet-grey, so plainStyle gets a
+      // neutral white studio instead.
+      ambient.intensity = fx(LOOK.ambient, 0.9);
+      hemi.intensity = fx(LOOK.hemi, 0.6);
+      hemi.color.set(fx(LOOK.hemiSky, 0xffffff));
+      hemi.groundColor.set(fx(LOOK.hemiGround, 0x8a8a8a));
+      keyLight.intensity = fx(LOOK.key, 1.3);
+      keyLight.color.set(fx(LOOK.keyColor, 0xffffff));
       {
         // Key light direction (MMD's 照明方向): world-space azimuth/elevation.
         const kaz = (LOOK.keyAzim * Math.PI) / 180;
@@ -4198,7 +4214,31 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
             `[glb-humanoid] rig mapped from ${built.boneNames.length} nodes`
             + (built.missing.length ? `; unmapped optional: ${built.missing.join(", ")}` : ""),
           );
+        } else {
+          // A VRM can be a PBR asset too. The test above — "is this a plain
+          // .glb" — is a proxy for "did this come from a toon pipeline", and it
+          // held only while every .vrm loaded here was a VRoid/MMD model. It is
+          // the MToon material that actually marks a toon asset, so ask for that
+          // instead: Miku (31/31 MToon) and the VRoid sample (13/13) keep the
+          // stylised pass, and a photoreal export that happens to carry a VRM
+          // extension no longer comes out violet with a cyan edge glow.
+          let mtoon = false;
+          vrm.scene.traverse((o: THREE.Object3D) => {
+            const mat = (o as THREE.Mesh).material;
+            for (const m of Array.isArray(mat) ? mat : [mat]) {
+              if ((m as { isMToonMaterial?: boolean } | undefined)?.isMToonMaterial) mtoon = true;
+            }
+          });
+          if (!mtoon) {
+            plainStyle = true;
+            console.info("[vrm-viewer] no MToon material — PBR asset, stylised pass off");
+          }
         }
+        // Before the look pass below, so the rim uniforms it injects are adopted.
+        aiFx.bind(gltf.scene);
+        // plainStyle is read by applyLookState, which last ran before this model
+        // was known — re-run it or the lights and grade stay on the toon values.
+        if (plainStyle) applyLookState();
         VRMUtils.removeUnnecessaryVertices(gltf.scene);
         // VRM 1.0 faces +Z; VRM 0.x faces -Z -> flip to face the +Z camera.
         if (vrm.meta && (vrm.meta as { metaVersion?: string }).metaVersion === "0") {
@@ -5097,6 +5137,7 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         }
         vrmExpression.update(); // AFTER vrm.update so it overrides the expressionManager
         vrmLipSync.update(); // mouth-open morph from speech volume (no-op when silent)
+        aiFx.update(dt, vrmLipSync.voice); // glow/rim follow state + voice (opt-in models only)
         // LAST, so the 😀 audition panel wins while it is open: on Miku the two
         // above write every frame and would otherwise erase whatever is being
         // previewed. No-op when nothing is held or sweeping.
@@ -5257,6 +5298,7 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         vrmMotionPlayer.clearVRM(vrm);
         vrmExpression.clearMeshes();
         vrmLipSync.clearMeshes();
+        aiFx.unbind();
         if ((window as unknown as { __vrm?: VRM }).__vrm === vrm) {
           delete (window as unknown as { __vrm?: VRM }).__vrm;
         }

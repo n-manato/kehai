@@ -178,7 +178,31 @@ type Clip = {
    *  to be inferred from the joint count, which stopped working once the KAWAII clips
    *  also carried fingers. */
   lsm?: boolean;
+  /** Per-bone posture correction (rad) about the body's [left, forward] axes; see lsmPosture. */
+  lean?: Record<string, [number, number]>;
+  /** A mid-fade SNAPSHOT's idle share (0..1); real clips use `idle`. See _idleW. */
+  idleW?: number;
 };
+
+/** The posture she has standing between turns, measured over three KAWAII idle clips in
+ *  the levelled hip frame (deg). Spine chain: [forward tilt, tilt toward HER left].
+ *  Shoulders (collar -> shoulder joint): [unused, elevation above horizontal]. */
+const POSTURE: Record<string, { kind: "vert" | "down" | "L" | "R"; ref: [number, number] }> = {
+  spine: { kind: "vert", ref: [9.7, 1.5] },
+  chest: { kind: "vert", ref: [-5.1, -1.1] },
+  upperChest: { kind: "vert", ref: [-7.3, -1.5] },
+  neck: { kind: "vert", ref: [8.3, 3.1] },
+  leftShoulder: { kind: "L", ref: [0, -5.1] },
+  rightShoulder: { kind: "R", ref: [0, -5.6] },
+  // Upper arms: SIDEWAYS only — how far forward the arms reach is the gesture itself.
+  // The LSM speaker holds the right arm out 30 deg on average (left 13, idle 9-11).
+  leftUpperArm: { kind: "down", ref: [0, 11.2] },
+  rightUpperArm: { kind: "down", ref: [0, -8.6] },
+};
+
+/** GestureLSM joints that get the temporal smoothing (see _smoothLsm). The arms and
+ *  hands are left alone: their sharpness IS the gesture (beats, emphasis). */
+const LSM_SMOOTH = /^(Pelvis|Spine\d|Neck|Head|Jaw|[LR]_(Hip|Knee|Ankle|Foot|Collar|Eye))$/;
 
 /**
  * Drives a VRM avatar with audio-generated co-speech gestures (GestureLSM). The
@@ -290,6 +314,11 @@ class VRMMotionPlayer {
   // the rest re-captures instantly on a clip change and the hips rotation baseline jumps
   // — the body "swings left->right" at the seam even though the joint positions blend.
   private _frameRestSmplPrev: Record<string, THREE.Quaternion> = {};
+
+  /** FRAME bones' world targets as they were drawn when a mid-fade SNAPSHOT was taken
+   *  (see _beginFade). The snapshot's outgoing side is this, held — re-deriving it from
+   *  the snapshot's landmark positions did not reproduce what was on screen. */
+  private _snapQt: Record<string, THREE.Quaternion> = {};
   private _restBlend = new THREE.Quaternion();
 
   // Hands use ABSOLUTE (not relative) frames so the palm matches the sample exactly
@@ -433,6 +462,25 @@ class VRMMotionPlayer {
   shoulderGain = 1.0;   // was 0.55 — clavicle shrug
 
   gestureGain = 1.0;    // was 0.92 — overall upper body (spine/chest/neck/arms)
+
+  /** How much of a GestureLSM clip's constant posture bias to remove (0 = as generated).
+   *  Measured over 19 LSM clips against the KAWAII idles, every one carries the same
+   *  habits: chest/upper chest/neck tipped ~9-13 deg forward with the lower back leaning
+   *  back (head 2.9cm ahead of the hips — "話すと前に傾く"), the spine and neck tilted
+   *  6-8 deg toward her left (a constant head tilt), and both shoulders shrugged — the
+   *  right one +25 deg, the left +12. Per clip, each segment's MEAN angle is swapped for
+   *  POSTURE; the gesture's movement around that mean is kept. Live: __vrmMotion.lsmPosture. */
+  lsmPosture = 1.0;
+
+  /** Fastest the HEAD may travel in a KAWAII clip (m/s); faster stretches are slowed by
+   *  resampling (see _capHeadSpeed). 0 = off. Live: __vrmMotion.headMaxSpeed. */
+  headMaxSpeed = 0.7;
+
+  /** Temporal smoothing of the GestureLSM body joints (see _smoothLsm). Live toggle. */
+  lsmSmooth = true;
+
+  /** Share of an idle clip's knee bend to keep (see the lowerLeg step in applyFrame). */
+  idleKneeScale = 0.5;
 
   fingerGain = 1.0;     // was 0.12 — finger curl
 
@@ -742,6 +790,19 @@ class VRMMotionPlayer {
 
   private _pvC = new THREE.Vector3(); // planted-feet pelvis offset, blended against _ik0
 
+  // Hips-target CARRY across a rest recapture. captureSmplRest() swaps the pelvis
+  // references (smplPelvis0 / smplHipMid0 / smplPelvisRel) to the NEW clip's frame 0 in
+  // one frame, while the frame being played is still ~all OLD clip (the crossfade has only
+  // just begun) — so the target stepped by the difference between the two clips' refs.
+  // Measured on female_android at a KAWAII->GestureLSM seam: hips +2.6cm in ONE frame
+  // (0.79 m/s), feet with them, then a 5cm settle = the "話し始めに跳ねる". Rotations
+  // already blend their old rest (_frameRestSmplPrev); this does the same for position:
+  // keep the step as an offset and fade it out on the crossfade's own curve.
+  private _hipsCarry = new THREE.Vector3();
+  private _hipsTgtLast = new THREE.Vector3();
+  private _hipsTgtValid = false;
+  private _hipsCarryArm = false;
+
   private _aimLeg: Record<string, THREE.Quaternion> = {}; // pre-IK leg pose, for the IK blend
 
   // Keep her on her spot: high-pass the clip's horizontal root travel (see applyPelvisShift).
@@ -765,6 +826,7 @@ class VRMMotionPlayer {
   setVRM(vrm: VRM) {
     this.vrm = vrm;
     this.clip = null;
+    this._hipsTgtValid = false; // a carry only means something within one clip chain
     this.adaptChains();
     this.captureRest();
     this.applyIdlePose(); // arms-down rest instead of the T-pose
@@ -809,7 +871,12 @@ class VRMMotionPlayer {
    *  for a missing toes bone (then the foot is the leaf). */
   private adaptChains() {
     const has = (b: string) => !!this.node(b);
-    if (has("upperChest")) { AIM.chest = ["Spine2", "Spine3"]; CHILD.chest = "upperChest"; }
+    // WITH upperChest the chest still aims at the neck, not at Spine3: GestureLSM's
+    // skeleton puts Spine3 in FRONT of Spine2, so that short segment sits ~30 deg
+    // forward in every LSM clip (measured 26-52 deg; -2 deg in the KAWAII idles) and
+    // the chest bone held a constant hunch through the whole reply — the android's
+    // rigid bust pointed at the floor. Spine2->Neck is the real lean (~9 deg).
+    if (has("upperChest")) { AIM.chest = ["Spine2", "Neck"]; CHILD.chest = "upperChest"; }
     else { AIM.chest = ["Spine2", "Neck"]; CHILD.chest = "neck"; }
     // No upperChest -> the single chest bone spans the whole upper torso; drive its
     // FULL orientation (roll from the shoulder line) so it doesn't tilt. VRMs WITH
@@ -1454,7 +1521,9 @@ class VRMMotionPlayer {
         if (!rsNew || !this.quatFromFrame(this._frameNewC, idx, cfg, this._qf, bone)) return;
         this._qtN.copy(this._qf).multiply(this._qA.copy(rsNew).invert()).multiply(rm);
         const rsPrev = this._frameRestSmplPrev[bone] || rsNew;
-        if (this.quatFromFrame(this._frame2mC, idx, cfg, this._qf, bone)) {
+        if (this._fadeStatic && this._snapQt[bone]) {
+          this._qt.copy(this._snapQt[bone]).slerp(this._qtN, t);
+        } else if (this.quatFromFrame(this._frame2mC, idx, cfg, this._qf, bone)) {
           this._qtP.copy(this._qf).multiply(this._qA.copy(rsPrev).invert()).multiply(rm);
           this._qt.copy(this._qtP).slerp(this._qtN, t);
         } else {
@@ -1562,6 +1631,15 @@ class VRMMotionPlayer {
     else if (planted) this._ik0.copy(this._pvC);
     else if (!free) return;
     this._ik1.copy(this.hipsRestPos).add(this._ik0); // target hips position
+    if (this._hipsCarryArm) {
+      this._hipsCarryArm = false;
+      if (this._hipsTgtValid) this._hipsCarry.copy(this._hipsTgtLast).sub(this._ik1);
+    }
+    // Spent once the fade lands — it must not come back with the next fade.
+    if (this._fadeT >= 1) this._hipsCarry.set(0, 0, 0);
+    this._ik1.addScaledVector(this._hipsCarry, 1 - this._fadeW());
+    this._hipsTgtLast.copy(this._ik1);
+    this._hipsTgtValid = true;
     // Ease toward the target so the weight-shift doesn't jump at gesture transitions.
     hipsN.position.lerp(this._ik1, this.smooth);
     hipsN.updateMatrixWorld(true);
@@ -1851,6 +1929,9 @@ class VRMMotionPlayer {
    *  fallback, interrupt) fall back to start-pose matching + adaptive fade.
    *  Runs BEFORE this.clip is swapped (matching compares via the OLD clip's indices). */
   private _prepareClip(clipObj: Clip, data: any) {
+    if (clipObj.lsm && this.lsmSmooth) this._smoothLsm(clipObj);
+    if (!clipObj.lsm && this.headMaxSpeed > 0) this._capHeadSpeed(clipObj);
+    clipObj.lean = clipObj.lsm ? this._leanOf(clipObj) : undefined;
     this._holdT = 0;
     const overlap = Number(data.seed_overlap) || 0;
     // Is the OUTGOING clip an idle? (_prepareClip runs before this.clip is swapped.)
@@ -1885,6 +1966,16 @@ class VRMMotionPlayer {
       // long way round: a slow fade is what makes one idle animation melt into the next
       // instead of stepping. (Speech clips must stay tight — see below.)
       this._fadeDur = 1.0;
+      // ...and longer still when the head has far to go. Coming up out of the bow emote
+      // the head travels ~14cm, and a smoothstep fade peaks at 1.5x its mean speed —
+      // ~1 m/s over 1.0s, a jerk upright after the bow itself was slowed (_capHeadSpeed).
+      const ho = this.clip?.idx.Head; const hn = clipObj.idx.Head;
+      if (this.headMaxSpeed > 0 && ho !== undefined && hn !== undefined && this._frame[ho]) {
+        const f = clipObj.joints[Math.min(clipObj.joints.length - 1, Math.round((clipObj.pad ?? 0) * clipObj.fps))];
+        const a = this._frame[ho]; const b = f[hn];
+        const d = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+        this._fadeDur = Math.max(1.0, (1.5 * d) / this.headMaxSpeed);
+      }
       return;
     }
     // GestureLSM clips DON'T chain on the public gateway (no seed_out), so every
@@ -1946,6 +2037,7 @@ class VRMMotionPlayer {
    *  back toward the ambient pose, so gesture->talk/idle eases instead of snapping. */
   stop() {
     this.clip = null; this._prevClip = null; this._fadeT = 1; this._gestAudio = null;
+    this._hipsTgtValid = false; // idle eases the hips from here; the last target is stale
     this._turnOver = false;
     // Let the body settle for a beat before the between-turns idle cycle picks up, so
     // the turn doesn't end straight into an idle animation.
@@ -2202,6 +2294,122 @@ class VRMMotionPlayer {
     }
   }
 
+  /** Each POSTURE segment's mean angle over the clip, as the rotation (rad) about the
+   *  body's [left, forward] axes that brings it back to the reference. */
+  private _leanOf(c: Clip): Record<string, [number, number]> {
+    const out: Record<string, [number, number]> = {};
+    const li = c.idx.L_Hip; const ri = c.idx.R_Hip;
+    if (li === undefined || ri === undefined) return out;
+    const D = Math.PI / 180;
+    for (const [b, cfg] of Object.entries(POSTURE)) {
+      const a = AIM[b];
+      const i = a && c.idx[a[0]]; const j = a && c.idx[a[1]];
+      if (!a || i === undefined || j === undefined) continue;
+      let s0 = 0; let s1 = 0; let n = 0;
+      for (const f of c.joints) {
+        // levelled hip frame: x = her left, y = up, z = forward (x cross y)
+        let xx = f[li][0] - f[ri][0]; let xz = f[li][2] - f[ri][2];
+        const xl = Math.hypot(xx, xz); if (xl < 1e-6) continue;
+        xx /= xl; xz /= xl;
+        const dx = f[j][0] - f[i][0]; const dy = f[j][1] - f[i][1]; const dz = f[j][2] - f[i][2];
+        const vx = dx * xx + dz * xz; const vz = -dx * xz + dz * xx;
+        if (cfg.kind === "vert" || cfg.kind === "down") { s0 += Math.atan2(vz, Math.abs(dy)); s1 += Math.atan2(vx, Math.abs(dy)); }
+        else s1 += Math.asin(Math.max(-1, Math.min(1, dy / Math.hypot(dx, dy, dz))));
+        n++;
+      }
+      if (!n) continue;
+      const m0 = s0 / n - cfg.ref[0] * D; const m1 = s1 / n - cfg.ref[1] * D;
+      // vert: tip back about +X by the forward excess, about +Z by the leftward excess.
+      // A left shoulder (pointing +X) lowers under -Z rotation, a right one under +Z.
+      // A segment hanging DOWN (upper arm) moves the other way under the same +Z turn.
+      out[b] = cfg.kind === "vert" ? [-m0, m1]
+        : cfg.kind === "down" ? [0, -m1]
+        : [0, cfg.kind === "L" ? -m1 : m1];
+    }
+    return out;
+  }
+
+  /** Binomial [1 4 6 4 1] low-pass over time, in place, on the LSM_SMOOTH joints.
+   *  GestureLSM's frame-to-frame shake is 2-5x the KAWAII idles' (feet 5.1x, knees and
+   *  ankles 3.7x, pelvis/neck ~3x) — joints that barely move while she stands. 30fps, so
+   *  this only takes out content above ~8Hz; the gesture itself is far slower. */
+  private _smoothLsm(c: Clip) {
+    const J = c.joints; const n = J.length;
+    if (n < 5) return;
+    const W = [1, 4, 6, 4, 1];
+    for (const [name, j] of Object.entries(c.idx)) {
+      if (!LSM_SMOOTH.test(name)) continue;
+      const src = J.map((f) => f[j].slice(0, 3));
+      for (let t = 0; t < n; t++) {
+        for (let k = 0; k < 3; k++) {
+          let acc = 0;
+          for (let o = -2; o <= 2; o++) acc += W[o + 2] * src[Math.min(n - 1, Math.max(0, t + o))][k];
+          J[t][j][k] = acc / 16;
+        }
+      }
+    }
+  }
+
+  /** Slow down the parts of a KAWAII clip where the head moves faster than headMaxSpeed,
+   *  by resampling the clip on a stretched timeline. The bow emote drops the head 29cm
+   *  and brings it 46cm forward in 0.3s (1.8 m/s on screen) — a snap, where a person
+   *  takes most of a second. The playhead runs on real time (the audio sync only bends
+   *  its rate +-12%), so stretched frames really do play slower. Not for GestureLSM: that
+   *  motion is generated against the sentence audio and must keep its timing. */
+  private _capHeadSpeed(c: Clip) {
+    const h = c.idx.Head; const J = c.joints; const n = J.length;
+    if (h === undefined || n < 3) return;
+    const step = 1 / c.fps;
+    // Per-interval stretch (>= 1), eased over +-3 frames so the slow-down ramps in and
+    // out instead of switching the speed on in one frame.
+    const raw = new Array(n - 1);
+    for (let i = 0; i < n - 1; i++) {
+      const a = J[i][h]; const b = J[i + 1][h];
+      const d = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+      raw[i] = Math.max(1, d / (this.headMaxSpeed * step));
+    }
+    if (raw.every((x) => x <= 1.0001)) return;
+    const k = new Array(n - 1);
+    for (let i = 0; i < n - 1; i++) {
+      let m = 1;
+      for (let o = -3; o <= 3; o++) {
+        const j = i + o;
+        if (j >= 0 && j < n - 1) m = Math.max(m, 1 + (raw[j] - 1) * (1 - Math.abs(o) / 4));
+      }
+      k[i] = m;
+    }
+    // Source time of each output frame, walking the stretched intervals.
+    const out: number[][][] = [J[0]];
+    let i = 0; let u = 0; // interval i, fraction u through it
+    for (;;) {
+      u += 1 / k[i];
+      while (i < n - 1 && u >= 1) { u = (u - 1) * k[i] / (k[i + 1] ?? 1); i++; }
+      if (i >= n - 1) break;
+      const a = J[i]; const b = J[i + 1];
+      out.push(a.map((p, jn) => p.map((x, ax) => x + (b[jn][ax] - x) * u)));
+    }
+    out.push(J[n - 1]);
+    console.info(`[vrm-motion] head speed cap: ${n} -> ${out.length} frames (${(out.length / n).toFixed(2)}x)`);
+    c.joints = out;
+  }
+
+  /** 0..1: how much of what is on the body right now comes from an IDLE clip. */
+  private _idleW(): number {
+    const cur = this.clip?.idle ? 1 : 0;
+    if (this._fadeT >= 1 || !this._prevClip) return cur;
+    const prev = this._prevClip.idleW ?? (this._prevClip.idle ? 1 : 0);
+    return prev + (cur - prev) * this._fadeW();
+  }
+
+  /** The posture correction in effect now: blended across a crossfade like the frame is. */
+  private _leanNow(b: string): [number, number] {
+    const cur = this.clip?.lean?.[b] ?? [0, 0];
+    if (this._fadeT >= 1 || !this._prevClip) return cur;
+    const prev = this._prevClip.lean?.[b] ?? [0, 0];
+    const w = this._fadeW();
+    return [prev[0] + (cur[0] - prev[0]) * w, prev[1] + (cur[1] - prev[1]) * w];
+  }
+
   /** Begin a crossfade from the current clip (if any) into `elapsed` of the new one. */
   private _beginFade() {
     if (!this.clip) return;
@@ -2216,14 +2424,25 @@ class VRMMotionPlayer {
         idx: this.clip.idx,
         joints: [this._frame.map((p) => p.slice())],
         fps: this.clip.fps,
+        lean: Object.fromEntries(Object.keys(POSTURE).map((k) => [k, this._leanNow(k)])),
+        idleW: this._idleW(), // a yes/no here snapped the share 0.65 -> 1 at a mid-fade seam
       };
       this._prevElapsed = 0;
       this._fadeStatic = true;
+      // The rotations on screen right now, for the FRAME bones (hips/head/hands). The
+      // landmarks above can't give them back: those were blended as POSITIONS while the
+      // bones were blended as ROTATIONS, and the outgoing rest also drops the idle's share
+      // at an idle->talk seam. Measured: hips flipped in one frame, feet 42-59mm and the
+      // head 17-23mm, whenever the next sentence's clip landed inside the 0.9s idle fade.
+      for (const [b, q] of Object.entries(this._qtPrev)) (this._snapQt[b] ??= new THREE.Quaternion()).copy(q);
     } else {
       this._prevClip = this.clip;
       this._prevElapsed = this.elapsed;
       this._fadeStatic = false;
     }
+    // Keep only the part of the hips carry that is applied RIGHT NOW: the new fade restarts
+    // the weight at 0, which would otherwise re-apply the whole carry in one frame.
+    this._hipsCarry.multiplyScalar(1 - this._fadeW());
     this._fadeT = 0;
   }
 
@@ -2251,7 +2470,10 @@ class VRMMotionPlayer {
       // the previous clip's tail (mid-gesture), not a neutral pose — capturing it as
       // "rest" would re-zero the FRAME bones onto a mid-gesture stance (posture snap).
       if (this.clip.chained && Object.keys(this.frameRestSmpl).length) this._restClip = this.clip;
-      else this.captureSmplRest(); // (re)capture the SMPL rest frame
+      else {
+        this.captureSmplRest(); // (re)capture the SMPL rest frame
+        this._hipsCarryArm = true; // the pelvis refs just changed: see _hipsCarry
+      }
     }
     const last = this.clip.joints.length - 1;
     const clipLen = last / this.clip.fps;
@@ -2645,6 +2867,49 @@ class VRMMotionPlayer {
       this._dir.copy(this._v1).sub(this._v0);
       if (this._dir.lengthSq() < 1e-8) continue;
       this._dir.normalize();
+      if (this.lsmPosture > 0 && b in POSTURE) {
+        // Undo the clip's posture bias about the body's own axes (levelled hip line), so a
+        // turned torso is corrected in its own planes rather than the world's.
+        const [rx, rz] = this._leanNow(b);
+        const li = idx.L_Hip; const ri = idx.R_Hip;
+        if ((rx || rz) && li !== undefined && ri !== undefined) {
+          this._v0.set(frame[li][0] - frame[ri][0], 0, frame[li][2] - frame[ri][2]);
+          if (this._v0.lengthSq() > 1e-8) {
+            this._v0.normalize();
+            this._v1.set(0, 1, 0).cross(this._v0).negate(); // forward = left x up
+            this._dir.applyAxisAngle(this._v0, rx * this.lsmPosture);
+            this._dir.applyAxisAngle(this._v1, rz * this.lsmPosture);
+          }
+        }
+      }
+      if ((b === "leftLowerLeg" || b === "rightLowerLeg") && this.idleKneeScale < 1) {
+        // Swing the shin toward the thigh's line: the KAWAII idles stand with the knees
+        // bent 16-20 deg, the talk clips at 8-9, so every turn visibly straightened and
+        // re-bent her legs. The floor clamp then sets her back down on the soles.
+        const w = this._idleW() * (1 - this.idleKneeScale);
+        const th = AIM[b === "leftLowerLeg" ? "leftUpperLeg" : "rightUpperLeg"];
+        const hi = idx[th[0]]; const ki = idx[th[1]];
+        if (w > 1e-3 && hi !== undefined && ki !== undefined) {
+          this._v0.fromArray(frame[ki]).sub(this._v1.fromArray(frame[hi])).normalize();
+          this._qA.setFromUnitVectors(this._dir, this._v0);
+          this._dir.applyQuaternion(this._krA.identity().slerp(this._qA, w));
+        }
+      }
+      if ((b === "leftFoot" || b === "rightFoot") && this.idleKneeScale < 1) {
+        // Flat feet in the idles too. They point the foot ~8 deg further down than this
+        // rig's rest (foot->toe -30 vs -22), so she stood on tiptoe with the heels ~2cm up
+        // — the toes were already on the floor, so the clamp never set her down. Keep the
+        // foot's heading, take the rest pitch; the talk clips are flat already (planted).
+        const w = this._idleW();
+        if (w > 1e-3) {
+          const hz = Math.hypot(this._dir.x, this._dir.z);
+          const rhz = Math.hypot(rd.x, rd.z);
+          if (hz > 1e-4 && rhz > 1e-4) {
+            this._v0.set((this._dir.x / hz) * rhz, rd.y, (this._dir.z / hz) * rhz);
+            this._dir.lerp(this._v0, w).normalize();
+          }
+        }
+      }
       if (this.parentAim && this.restPWInv[b]) {
         // parent world delta from rest -> where the rest direction went with the parent ->
         // swing the remainder. desired = swing * parentDelta * restWorld; the bone's world
@@ -2774,9 +3039,18 @@ class VRMMotionPlayer {
     // lift before posing), so `want` is the true penetration. Measuring the lifted pose
     // instead made this a feedback loop — lift, "no longer penetrating", drop, penetrate
     // again — i.e. the whole body vibrating ("ブルってなる").
-    const want = Math.max(0, this.groundY - low);
+    // Never push DOWN — except for the share of the pose an IDLE clip drives: those stand
+    // ~2cm above the floor on this rig (ankle 0.108-0.110 vs 0.089 at rest), which also
+    // made her rise at every turn start. Idles have no hops to protect.
+    let want = this.groundY - low;
+    if (want < 0) want *= this._idleW();
     this._lift += (want - this._lift) * 0.2;
-    if (this._lift > 1e-4) {
+    // A push-down is never deeper than the pose still needs: leaving an idle it eased out
+    // over ~10 frames while the talk clip planted the feet, and the soles sank 6-8mm at
+    // every turn start. (Releasing it is smooth anyway — `want` follows the idle fade.)
+    // NOT a faster rate overall: that fed foot-height noise into the body (feet +150%).
+    if (this._lift < 0) this._lift = Math.max(this._lift, want);
+    if (Math.abs(this._lift) > 1e-4) {
       hipsN.position.y += this._lift;
       hipsN.updateMatrixWorld(true);
     } else {

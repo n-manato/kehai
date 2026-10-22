@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { VRMHumanoid } from "@pixiv/three-vrm";
+import { VRMHumanoid, VRMLookAt, VRMLookAtBoneApplier, VRMLookAtRangeMap } from "@pixiv/three-vrm";
 import type { VRM } from "@pixiv/three-vrm";
 
 /**
@@ -39,8 +39,9 @@ const BONE_MAP: Record<string, string[]> = {
   upperChest: ["Spine2"],
   neck: ["Neck"],
   head: ["Head"],
-  leftEye: ["LeftEye"],
-  rightEye: ["RightEye"],
+  // c_eye.* is Auto-Rig Pro's eyeball deform bone (female_android).
+  leftEye: ["LeftEye", "c_eye.l"],
+  rightEye: ["RightEye", "c_eye.r"],
 
   leftShoulder: ["LeftShoulder"],
   leftUpperArm: ["LeftArm"],
@@ -164,16 +165,33 @@ export function buildVrmFromGltf(gltf: { scene: THREE.Object3D }): GlbHumanoidRe
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const humanoid = new VRMHumanoid(humanBones as any);
 
+  // Eyes, when the rig has them. The applier captures the eyes' rest pose here,
+  // while the file is still in its bind pose. Its ranges are placeholders: the
+  // viewer's setupGaze installs the tuned ones for every model it drives.
+  let lookAt: VRMLookAt | undefined;
+  if (humanBones.leftEye && humanBones.rightEye) {
+    gltf.scene.updateMatrixWorld(true);
+    const unit = () => new VRMLookAtRangeMap(90, 90);
+    lookAt = new VRMLookAt(humanoid, new VRMLookAtBoneApplier(humanoid, unit(), unit(), unit(), unit()));
+    // Aim from between the eyes, not from the head joint at the top of the neck:
+    // ~8cm lower, which tilts the gaze a few degrees off a viewer at 1.5m.
+    const head = humanBones.head.node;
+    const l = humanBones.leftEye.node.getWorldPosition(new THREE.Vector3());
+    const r = humanBones.rightEye.node.getWorldPosition(new THREE.Vector3());
+    lookAt.offsetFromHeadBone.copy(head.worldToLocal(l.add(r).multiplyScalar(0.5)));
+  }
+
   // Shaped like a VRM, carrying only what this app actually reads from one:
-  // scene, humanoid, meta. springBoneManager / expressionManager / lookAt stay
-  // undefined and every call site already guards them (`vrm.lookAt?.faceFront`).
+  // scene, humanoid, lookAt, meta. springBoneManager / expressionManager stay
+  // undefined and every call site already guards them.
   const vrm = {
     scene: gltf.scene,
     humanoid,
+    lookAt,
     meta: { name: "glb-humanoid", metaVersion: "1" },
     update(delta: number) {
       humanoid.update();
-      void delta;
+      lookAt?.update(delta);
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any as VRM;

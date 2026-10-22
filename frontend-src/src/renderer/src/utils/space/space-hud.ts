@@ -3,6 +3,7 @@ import { headTracker } from "./head-tracker";
 import { viewerTransform } from "./viewer-transform";
 import { impliedPanelHeightM } from "./off-axis";
 import { describePixelRatio } from "./pixel-ratio";
+import { autoHide } from "./auto-hide";
 
 /**
  * On-screen status for setting the spatial layer up on the real unit.
@@ -72,7 +73,7 @@ export function showSpaceHud(container: HTMLElement, canvas: HTMLCanvasElement |
     "color:#dff1ff",
     "white-space:pre",
   ].join(";");
-  container.appendChild(el);
+  container.appendChild(autoHide(el));
   hud = el;
 
   fpsWindow = performance.now();
