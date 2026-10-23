@@ -36,8 +36,10 @@ import { ModeProvider, useMode } from "./context/mode-context";
 import { installAutoHide } from "./utils/space/auto-hide";
 
 function AppContent(): JSX.Element {
-  const [showSidebar, setShowSidebar] = useState(true);
-  const [isFooterCollapsed, setIsFooterCollapsed] = useState(false);
+  // Both start closed: on the display the character is the point, and the panels
+  // are one click away on their edge arrows (2026-10-22).
+  const [showSidebar, setShowSidebar] = useState(false);
+  const [isFooterCollapsed, setIsFooterCollapsed] = useState(true);
   const { mode } = useMode();
   const { modelInfo } = useLive2DConfig();
   const isElectron = window.api !== undefined;

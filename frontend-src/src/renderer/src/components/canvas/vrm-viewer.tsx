@@ -2064,6 +2064,24 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     gtaoPass.updateGtaoMaterial({ radius: 0.25, distanceExponent: 1, thickness: 1, scale: 1, samples: 16 });
     gtaoPass.blendIntensity = LOOK.ssao;
     gtaoPass.enabled = LOOK.ssao > 0.001;
+    // Objects flagged userData.hideFromOverrides sit out GTAO's depth/normal render
+    // (an override material, so it draws everything): the floor mirror there was
+    // solid floor to the AO and darkened the air behind her shins — the "shadow
+    // behind her" (space/floor-reflection.ts).
+    {
+      const gtaoRender = gtaoPass.render.bind(gtaoPass);
+      gtaoPass.render = ((...args: Parameters<typeof gtaoPass.render>) => {
+        const hidden: THREE.Object3D[] = [];
+        scene.traverse((o: THREE.Object3D) => {
+          if (o.userData.hideFromOverrides && o.visible) { o.visible = false; hidden.push(o); }
+        });
+        try {
+          gtaoRender(...args);
+        } finally {
+          hidden.forEach((o) => { o.visible = true; });
+        }
+      }) as typeof gtaoPass.render;
+    }
     // Confine AO to the avatar's own volume — a cheap belt-and-braces limit now that the
     // backdrop lives outside the composer (see setBgGrad). It is NOT what fixed the backdrop
     // step: measured with the model posed and frozen, the straight step at y=397 survived
@@ -3307,7 +3325,10 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       fillFront.intensity = LOOK.fillFront;
       fillLeft.intensity = LOOK.fillSide;
       fillRight.intensity = LOOK.fillSide;
-      bloomPass.strength = LOOK.bloomStrength;
+      // Off for PBR models (plainStyle), like the diffusion below: on the android's
+      // white shell every edge sits over the threshold, and the bloom wrapped her
+      // in a white haze ("アバターの周りのもやはいらない").
+      bloomPass.strength = fx(LOOK.bloomStrength, 0);
       bloomPass.radius = LOOK.bloomRadius;
       bloomPass.threshold = LOOK.bloomThreshold;
       diffPass.strength = fx(LOOK.diffusion, 0);
@@ -4235,7 +4256,9 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
           }
         }
         // Before the look pass below, so the rim uniforms it injects are adopted.
-        aiFx.bind(gltf.scene);
+        // An asset that opts into the AI look is the android: it also gets the robot
+        // standby stance instead of Rem's/Miku's (vrm-motion-player robotIdle).
+        vrmMotionPlayer.robotIdle = aiFx.bind(gltf.scene);
         // plainStyle is read by applyLookState, which last ran before this model
         // was known — re-run it or the lights and grade stay on the toon values.
         if (plainStyle) applyLookState();

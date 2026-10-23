@@ -63,13 +63,16 @@ export const SPACE = {
   rainBand: 0,
   /** Cyan veil just behind her that separates her from the far field
    *  (backlight.ts): opacity at the centre (0 = off) and colour. */
-  backlight: 0.22,
+  backlight: 0, // off (2026-10-22, "もやはいらない"); 0.22 was the tuned look
   backlightColor: 0x4fc3ea,
   /** Her reflection in the floor, fading away from her feet (floor-reflection.ts).
    *  Opacity (0 = off). Costs one extra scene render at 1/3 resolution. */
+  // Her reflection stays; it is the DRAWN floor (rings, shadow patch) that flattened
+  // the scene — on PROTO the real box floor is right there, and a reflection alone
+  // reads as lying on it.
   reflection: 0.22,
   /** Projector base under her feet (0 = off) and its colour. */
-  pedestal: 1.0,
+  pedestal: 0, // off (2026-10-22): a drawn floor ring flattened the depth
   pedestalColor: 0x0796d0,
   /**
    * Field colour for the dataflow scene. On the PROTO panel white is see-through,
@@ -249,6 +252,11 @@ export const SPACE = {
    * LINE and that line is itself what leaves the frame. At 7.5 the swing is
    * 0.22 m and everything stays in shot.
    */
+  // Back to 7.5 (2026-10-22). It was cut to 2.5 against the 0/1 field's shimmer, but
+  // that shimmer was fixed at its source since (camera-facing quads, glyph choice in
+  // the vertex shader); measured at 7.5 the flicker stays proportional to the motion
+  // (flicker/motion 1.2-1.5, same as at 2.5) — and at 2.5 the sway was too small to see
+  // ("カメラが左右に揺れなくなった").
   cameraOrbitDeg: 7.5,
   /**
    * LATERAL drift amplitude, metres — the pre-orbit behaviour, used only when
@@ -517,7 +525,7 @@ export const SPACE = {
    * shadows from different directions read as two light sources and made the
    * grounding less believable, not more.
    */
-  contactShadow: 0.40,
+  contactShadow: 0, // off (2026-10-22, dataflow): the shadow patch read as a drawn floor; was 0.40
   /** Lateral half-width of the shadow, metres. */
   shadowRadius: 1.05,
   /** How far it stretches toward the viewer — long enough to leave the frame. */
@@ -547,7 +555,7 @@ export const SPACE = {
    * eye at 0.5 m and had the camera looking up at her. 1.25 m sits between her
    * chest and chin and reads as level.
    */
-  viewerEyeY: 1.25,
+  viewerEyeY: 1.45, // 1.25 -> 1.45 (2026-10-22): a touch higher, looking slightly down
   /**
    * Frame her by solving, not by eye. With this on, the camera distance and
    * pitch are derived so that fitBottomY..fitTopY is always inside the frame —
@@ -583,14 +591,18 @@ export const SPACE = {
    * it is a hard floor, not a hope: the camera pitch is solved from it, so the
    * feet stay exactly this far in whatever else changes.
    */
-  bottomMargin: 0.02,
+  // 0.035 (2026-10-22): a little room in front of her feet for her reflection
+  // (floor-reflection.ts); 0.12 left too much empty floor once the chat bar
+  // started collapsed.
+  bottomMargin: 0.035,
   /**
    * Fraction of the frame height that range fills. Measured: 0.965 puts her body
    * at ~92% of the frame, head ~4% down and toes ~96% down, which is the
    * reference crop. The earlier 0.86 left her filling only ~72% and reading as a
    * figure across the room rather than someone standing in front of you.
    */
-  fillFrac: 0.96,
+  // Must sum with bottomMargin to under 1, or her head leaves the top of the frame.
+  fillFrac: 0.935,
   /** Only used when fitBody is false. */
   horizonFrac: 0.52,
   /**

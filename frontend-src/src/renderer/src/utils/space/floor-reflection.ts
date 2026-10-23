@@ -44,7 +44,9 @@ varying vec3 vWorld;
 void main() {
   vec4 base = texture2DProj(tDiffuse, vUv);
   float r = length(vWorld.xz) / uRadius;
-  float fade = 1.0 - smoothstep(0.15, 1.0, r);
+  // In FRONT of her feet only. Behind her, the floor mirrors the backs of her legs,
+  // which read as a grey shadow standing behind her ("後ろの影いらない").
+  float fade = (1.0 - smoothstep(0.15, 1.0, r)) * smoothstep(-0.12, 0.08, vWorld.z);
   float a = base.a * fade * uOpacity;
   if (a < 0.004) discard;
   gl_FragColor = vec4(base.rgb * color, a);
@@ -77,6 +79,9 @@ export function createFloorReflection(renderer: THREE.WebGLRenderer): SpaceModul
   mirror.position.y = FLOOR_Y + 0.002;
   mirror.renderOrder = -7;
   mirror.name = "space-floor-reflection";
+  // Not a floor to anything else: kept out of GTAO's depth (vrm-viewer.tsx), which
+  // otherwise shaded her shins as if standing against a real surface.
+  mirror.userData.hideFromOverrides = true;
   const mat = mirror.material as THREE.ShaderMaterial;
   mat.transparent = true;
   mat.depthWrite = false;

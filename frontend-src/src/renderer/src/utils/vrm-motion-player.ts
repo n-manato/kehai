@@ -512,6 +512,64 @@ class VRMMotionPlayer {
    *  wrist clamp in torso-clamp.ts, which works on clip-driven poses too. */
   stand = { armZ: 0, elbowY: 0 };
 
+  /** ROBOT STANDBY for the no-clip state (the viewer sets it for the android). The
+   *  stand above is Rem's/Miku's: on this rig it left the forearms bent 36 deg with the
+   *  hands floating in front of the thighs, and the breath/sway is a person's. Here: arms
+   *  hanging almost straight a little off the body, a still torso, and a head that holds
+   *  then steps to a new small angle every few seconds, like a servo. Idle clips also
+   *  hand the body back to this stance when they end instead of holding their last
+   *  (human) pose. While an idle clip plays, the clip still drives the torso, head and
+   *  legs but the ARMS keep this stance (_robotArmW) — the KAWAII idles all stand with
+   *  the human forearm bend, which read as the old stance carried on. */
+  robotIdle = false;
+
+  private _robotArmW = 0;
+
+  private _robotArmU = 0; // linear phase behind _robotArmW (smoothstepped)
+
+  /** Seconds for the robot's arms to hand over between the stance and a speech gesture. */
+  robotArmFade = 1.0;
+
+  /** Robot: keep each wrist this far (m, horizontally) from either thigh's axis. The hand
+   *  clamp in torso-clamp.ts guards the torso plus Miku's SKIRT band, which ends ~8 cm below
+   *  the pelvis — on this rig's bare thighs a lowered gesture put the wrist 3.7 cm from the
+   *  hip joint, inside the leg. Standing with arms down the wrist is 11.4 cm out. 0 = off. */
+  thighGuard = 0.1;
+
+  private _thighPush: Record<string, THREE.Vector3> = { left: new THREE.Vector3(), right: new THREE.Vector3() };
+
+  private _tg = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+
+  /** Robot stance leg angle: the ankles stand this far AHEAD of the hip joints, for the
+   *  stance AND the planted (foot-IK) speech clips, so the feet never slide between them. */
+  private static readonly ROBOT_LEG_FWD = (5 * Math.PI) / 180;
+
+  private _legRootZ: Record<string, number> = {};
+
+  private _plant = new THREE.Vector3();
+
+  /** 0 -> 1 after an idle clip hands the body back to the stance (eases the ease in). */
+  private _robotRamp = 1;
+
+  /** Whole-pose crossfade for a clip that starts with NO clip to fade from (the stance or
+   *  the procedural idle): the bone low-pass alone moves fastest on its FIRST frame, so
+   *  every idle clip started with a jolt (head 5-7 deg, ankle 2 cm in one frame). */
+  poseBlendDur = 0.6;
+
+  private _poseSnap: Record<string, THREE.Quaternion> = {};
+
+  private _poseSnapHips = new THREE.Vector3();
+
+  private _poseBlendT = 1;
+
+  private _servo = { next: 0, tx: 0, ty: 0, cx: 0, cy: 0 };
+
+  private _robotQ = new THREE.Quaternion();
+
+  private _robotQ2 = new THREE.Quaternion();
+
+  private _robotV = new THREE.Vector3();
+
   /** Live handle for the skirt band of the hand clamp (see torso-clamp.ts SKIRT). */
   skirtClamp = SKIRT;
 
@@ -693,6 +751,11 @@ class VRMMotionPlayer {
 
   private _beatW = 0;
 
+  /** The robot plants its feet in EVERY clip: the KAWAII idles shift weight by stepping
+   *  (ankles 0.1-0.22 m forward), so each idle<->speech crossfade slid the feet 15-25 cm
+   *  across the floor. A robot does not shuffle — the legs IK under a fixed stance. */
+  private _plantFeet(g: { footIK: boolean }) { return g.footIK || this.robotIdle; }
+
   /** Retarget the gain set toward `src`, starting from whatever is live right now. */
   private _applyGains(src: "authored" | "lsm") {
     if (this._gainsFor === src) return;
@@ -706,7 +769,7 @@ class VRMMotionPlayer {
       this.pelvisRotGain = g.pelvisRot; this.pelvisTransGain = g.pelvisTrans;
       this.smooth = g.smooth; this.headSmoothMul = g.headMul; this.torsoRadius = g.torso;
       this._torsoSkirtOnly = g.skirtOnly;
-      this._ikW = g.footIK ? 1 : 0; this._beatW = g.beat ? 1 : 0;
+      this._ikW = this._plantFeet(g) ? 1 : 0; this._beatW = g.beat ? 1 : 0;
       this.footIK = g.footIK; this.beatSync = g.beat;
       this._gainMix = 1;
       return;
@@ -741,7 +804,7 @@ class VRMMotionPlayer {
     this.pelvisRotGain = L(f.pelvisRot, g.pelvisRot); this.pelvisTransGain = L(f.pelvisTrans, g.pelvisTrans);
     this.smooth = L(f.smooth, g.smooth); this.headSmoothMul = L(f.headMul, g.headMul);
     this.torsoRadius = L(f.torso, g.torso);
-    this._ikW = L(f.ik, g.footIK ? 1 : 0);
+    this._ikW = L(f.ik, this._plantFeet(g) ? 1 : 0);
     this._beatW = L(f.beat, g.beat ? 1 : 0);
     this.footIK = this._ikW > 0.5;   // for callers that still want a yes/no
     this.beatSync = this._beatW > 1e-3;
@@ -946,6 +1009,7 @@ class VRMMotionPlayer {
       this.legLen[`${side}Upper`] = pu.distanceTo(pk);
       this.legLen[`${side}Lower`] = pk.distanceTo(pf);
       this.footTarget[side] = pf.clone(); // planted ankle target (rest world pos)
+      this._legRootZ[side] = pu.z;
       const fq = new THREE.Quaternion(); ft.getWorldQuaternion(fq);
       this.restWQ[`${side}Foot`] = fq; // keep the foot flat regardless of missing toes
       // lowest contact point at rest = the floor for this rig (toe tip if it has toes)
@@ -1663,11 +1727,60 @@ class VRMMotionPlayer {
     nb.quaternion.copy(this._pq);
   }
 
+  /** Where foot IK plants an ankle: its rest spot, or — for the robot — the stance's spot
+   *  (the rest pose stands the ankles 4 cm BEHIND the hips; see _robotStand). */
+  private _plantTarget(side: string): THREE.Vector3 | undefined {
+    const t = this.footTarget[side];
+    if (!t || !this.robotIdle) return t;
+    const L = (this.legLen[`${side}Upper`] ?? 0) + (this.legLen[`${side}Lower`] ?? 0);
+    return this._plant.set(t.x, t.y, (this._legRootZ[side] ?? t.z) + L * Math.sin(VRMMotionPlayer.ROBOT_LEG_FWD));
+  }
+
+  /** Snapshot the pose on screen for the whole-pose crossfade (see poseBlendDur). */
+  private _snapPose() {
+    if (!this.vrm || this.poseBlendDur <= 0) return;
+    const names = Object.keys((this.vrm.humanoid as unknown as { humanBones: object }).humanBones ?? {});
+    for (const b of names) { const nb = this.node(b); if (nb) (this._poseSnap[b] ??= new THREE.Quaternion()).copy(nb.quaternion); }
+    const hipsN = this.node("hips"); if (hipsN) this._poseSnapHips.copy(hipsN.position);
+    this._poseBlendT = 0;
+  }
+
+  /** Robot, feet planted: set the pelvis HEIGHT so the legs stay nearly straight.
+   *  Clips move the pelvis on the assumption that the feet move with it: GestureLSM raised
+   *  it 6 mm past full reach (the feet hung ~1 cm off the floor, and the floor clamp never
+   *  pushes a speech clip down), and the KAWAII idles drop it up to 3 cm while stepping —
+   *  with the ankles pinned, 3 cm of drop is a 31 deg knee bend, a squat. The height goes
+   *  to the leg that needs it LOWER, so both feet always reach. Scaled by _ikW. */
+  private _robotLegHeight() {
+    const hipsN = this.node("hips");
+    if (!hipsN || !this.vrm) return;
+    this.vrm.scene.updateMatrixWorld(true);
+    let delta = Infinity;
+    for (const side of ["left", "right"]) {
+      const hipN = this.node(`${side}UpperLeg`); const t = this._plantTarget(side);
+      const L = (this.legLen[`${side}Upper`] ?? 0) + (this.legLen[`${side}Lower`] ?? 0);
+      if (!hipN || !t || !L) continue;
+      hipN.getWorldPosition(this._ik0);
+      const r = L * this.robotLegReach;
+      const hd2 = (this._ik0.x - t.x) ** 2 + (this._ik0.z - t.z) ** 2;
+      if (hd2 >= r * r) continue;
+      delta = Math.min(delta, t.y + Math.sqrt(r * r - hd2) - this._ik0.y);
+    }
+    if (!isFinite(delta)) return;
+    hipsN.parent?.getWorldScale(this._ik1);
+    hipsN.position.y += (delta * this._ikW) / (this._ik1?.y || 1);
+    hipsN.updateMatrixWorld(true);
+  }
+
+  /** Hip-to-ankle distance the robot's planted legs are held at, as a share of full leg
+   *  length: 0.997 ~ a 9 deg knee (a straight-but-not-locked stance). */
+  robotLegReach = 0.997;
+
   /** 2-bone leg IK: bend hip+knee so the ankle reaches its planted target, knee
    *  pointing forward. Foot kept flat. Call after the pelvis + body are posed. */
   private solveLegIK(side: "left" | "right") {
     const hipN = this.node(`${side}UpperLeg`); const kneeN = this.node(`${side}LowerLeg`);
-    const footN = this.node(`${side}Foot`); const target = this.footTarget[side];
+    const footN = this.node(`${side}Foot`); const target = this._plantTarget(side);
     const l1 = this.legLen[`${side}Upper`]; const l2 = this.legLen[`${side}Lower`];
     if (!hipN || !kneeN || !footN || !target || !l1 || !l2) return;
     const h = this._ik0; hipN.getWorldPosition(h);
@@ -1742,6 +1855,7 @@ class VRMMotionPlayer {
             data.joint_names.forEach((n: string, i: number) => { idx[n] = i; });
             const clipObj: Clip = { names: data.joint_names, idx, joints: data.joints, fps: data.fps || 30, loop: !!data.loop, lsm: !!data.gesturelsm };
             const fromIdle = !this.clip; // seed only when idle was driving the pose
+            if (fromIdle) this._snapPose();
             this._stats.applies += 1;
             this._prepareClip(clipObj, data);
             this._beginFade(); // crossfade from the outgoing clip (no seam stop)
@@ -1918,6 +2032,7 @@ class VRMMotionPlayer {
     data.joint_names.forEach((n: string, i: number) => { idx[n] = i; });
     const clipObj: Clip = { names: data.joint_names, idx, joints: data.joints, fps: data.fps || 30, loop: !!data.loop, idle: !!data.idle, lsm: !!data.gesturelsm };
     const fromIdle = !this.clip; // seed only when idle was driving the pose
+    if (fromIdle) this._snapPose();
     this._prepareClip(clipObj, data);
     this._beginFade(); // crossfade from the outgoing clip (no seam stop)
     this.clip = clipObj;
@@ -2581,6 +2696,27 @@ class VRMMotionPlayer {
     }
     this.applyFrame(this._frame, this.clip.idx);
     this.applyBeatSync(dt);
+    // Robot: idle clips keep the stance's arms; speech clips gesture freely. Smoothstepped
+    // (an exponential ease moved the arms 13% of the way in the FIRST frame, hand 540 deg/s)
+    // over robotArmFade: the first gesture of a reply can sit ~90 deg from the hanging arm,
+    // and 0.5 s swung the forearms there at 250-350 deg/s (530 when the next clip landed
+    // mid-swing) — the arms flew up as she started talking.
+    const armTgt = this.robotIdle && this.clip.idle ? 1 : 0;
+    this._robotArmU += Math.sign(armTgt - this._robotArmU) * Math.min(Math.abs(armTgt - this._robotArmU), dt / this.robotArmFade);
+    this._robotArmW = this._robotArmU * this._robotArmU * (3 - 2 * this._robotArmU);
+    if (this._robotArmW > 1e-3) this._robotArms(this._robotArmW);
+    if (this.robotIdle && this.thighGuard > 0) this._guardThighs(dt);
+    if (this._poseBlendT < 1) {
+      this._poseBlendT = Math.min(1, this._poseBlendT + dt / this.poseBlendDur);
+      const u = this._poseBlendT; const w = u * u * (3 - 2 * u); // zero speed at both ends
+      for (const [b, q] of Object.entries(this._poseSnap)) {
+        const nb = this.node(b); if (!nb) continue;
+        this._qA.copy(nb.quaternion); // read BEFORE overwriting (copy(q).slerp(copy(nb)) froze the pose)
+        nb.quaternion.copy(q).slerp(this._qA, w);
+      }
+      const hipsN = this.node("hips"); if (hipsN) hipsN.position.lerp(this._poseSnapHips, 1 - w);
+      this.vrm.scene.updateMatrixWorld(true);
+    }
     // HOLD BREATHING: while a finished clip HOLDS its end pose in an inter-clip gap,
     // add a gentle sway AROUND that pose (multiplied on top, so it never DRIFTS toward
     // idle — that drift was the "がくがく") so the ~0.2s gaps read as continued talking,
@@ -2626,6 +2762,14 @@ class VRMMotionPlayer {
       this._turnOver = true;
       this._idleNextAt = performance.now()
         + (this.idleGapMin + aiDebug.random() * (this.idleGapMax - this.idleGapMin)) * 1000;
+      if (this.robotIdle) {
+        // Back to the robot stance (updateIdle eases there) rather than holding the
+        // clip's last human pose; the next idle eases in from the stance (_seedSmooth).
+        this.clip = null; this._prevClip = null; this._fadeT = 1;
+        this._hipsTgtValid = false;
+        this._robotRamp = 0;
+        return;
+      }
     }
     // NEVER wrap an IDLE clip. The wrap exists so a SPEECH clip that ran out keeps gesturing
     // while it waits for the next sentence; an idle animation has nothing to wait for — the
@@ -2719,6 +2863,135 @@ class VRMMotionPlayer {
 
   /** Blend a bone TOWARD (idle-base * euler-offset) by alpha — never snaps, so idle,
    *  talking, and gesture->ambient transitions are all smooth. */
+  /** Robot standby pose + servo head (see robotIdle). Arms are aimed at WORLD directions
+   *  from their rest directions, so the stance does not depend on the rig's rest pose. */
+  private _robotStand(dt: number, t: number, e: number) {
+    // ~0.6 s to settle: steady, not a snap. Ramped in over 0.4 s after an idle clip
+    // hands over, so the return starts from rest instead of at its fastest.
+    this._robotRamp = Math.min(1, this._robotRamp + dt / 0.4);
+    const a = 0.06 * this._robotRamp * this._robotRamp;
+    // Torso: still. Only the talking layer (e > 0 when speaking without a clip) moves it.
+    this.ambient("spine", Math.sin(t * 2.1) * 0.015 * e, 0, 0, a);
+    this.ambient("chest", 0.02 * e, 0, 0, a);
+    this.ambient("neck", 0, 0, 0, a);
+    // Head: hold, then step to a new small angle every 2.5-6.5 s, quickly (~0.3 s).
+    const s = this._servo;
+    if (t >= s.next) {
+      s.next = t + 2.5 + aiDebug.random() * 4;
+      s.tx = (aiDebug.random() * 2 - 1) * 0.08; // yaw  +-4.6 deg
+      s.ty = (aiDebug.random() * 2 - 1) * 0.04; // pitch +-2.3 deg
+    }
+    const k = Math.min(1, dt * 9);
+    s.cx += (s.tx - s.cx) * k;
+    s.cy += (s.ty - s.cy) * k;
+    this.ambient("head", s.cy + Math.sin(t * 3.3) * 0.04 * e, s.cx, 0, 0.5 * this._robotRamp * this._robotRamp);
+    this._robotArms(a);
+    this._robotArmW = this._robotArmU = 1;
+    const hipsN = this.node("hips");
+    if (hipsN) { hipsN.quaternion.slerp(this._ambIdentity, a); hipsN.position.lerp(this.hipsRestPos, a); hipsN.updateMatrixWorld(true); }
+    // Legs: straight, the feet 5 deg AHEAD of the hips. The rest pose stands the ankles
+    // 4 cm behind the hips while every idle clip has them ~8 cm in front, so the feet slid
+    // 12 cm back at each idle->stance hand-over and, seen from the camera above, stood
+    // higher on screen ("他のモーションと比べると少し浮いてる"). Feet keep their rest
+    // (flat) world orientation; the hips then drop by however much the soles cleared.
+    // Speech clips plant the feet on the same spot (_plantTarget).
+    for (const side of ["left", "right"] as const) {
+      const ru = this.restDir[`${side}UpperLeg`];
+      if (!ru) continue;
+      const fwd = VRMMotionPlayer.ROBOT_LEG_FWD;
+      this._robotV.set(ru.x, -Math.cos(fwd), Math.sin(fwd)).normalize();
+      this._robotEase(`${side}UpperLeg`, this._robotV, a);
+      this._robotEase(`${side}LowerLeg`, this._robotV, a);
+      const rf = this.restDir[`${side}Foot`];
+      if (rf) this._robotEase(`${side}Foot`, rf, a);
+    }
+    if (hipsN && isFinite(this.groundY)) {
+      let low = Infinity;
+      for (const side of ["left", "right"]) {
+        const n = this.node(`${side}Toes`) ?? this.node(`${side}Foot`);
+        if (n) { n.getWorldPosition(this._ik2); low = Math.min(low, this._ik2.y); }
+      }
+      if (isFinite(low)) { hipsN.position.y += this.groundY - low; hipsN.updateMatrixWorld(true); }
+    }
+    if (this.pendingSpringInit > 0) { this.springReset(); this.pendingSpringInit -= 1; }
+  }
+
+  /** Push each wrist out of the thighs (see thighGuard) by swinging the upper arm about
+   *  the shoulder. The push is low-passed so a hand grazing the boundary cannot chatter. */
+  private _guardThighs(dt: number) {
+    if (!this.vrm) return;
+    const [w, a, b, c, sh] = this._tg;
+    const R = this.thighGuard;
+    this.vrm.scene.updateMatrixWorld(true);
+    for (const side of ["left", "right"] as const) {
+      const hand = this.node(`${side}Hand`); const upper = this.node(`${side}UpperArm`);
+      if (!hand || !upper) continue;
+      hand.getWorldPosition(w);
+      let px = 0; let pz = 0; let best = 0;
+      for (const leg of ["left", "right"]) {
+        const ul = this.node(`${leg}UpperLeg`); const ll = this.node(`${leg}LowerLeg`);
+        if (!ul || !ll) continue;
+        ul.getWorldPosition(a); ll.getWorldPosition(b);
+        b.sub(a);
+        const t = Math.max(0, Math.min(1, c.copy(w).sub(a).dot(b) / b.lengthSq()));
+        c.copy(a).addScaledVector(b, t);
+        if (Math.abs(w.y - c.y) > 0.08) continue; // above the hip joint: the torso clamp's job
+        let dx = w.x - c.x; let dz = w.z - c.z;
+        const d = Math.hypot(dx, dz);
+        if (d >= R) continue;
+        if (d < 1e-4) { dx = side === "left" ? 1 : -1; dz = 0; } else { dx /= d; dz /= d; }
+        const depth = R - d;
+        if (depth > best) { best = depth; px = dx * depth; pz = dz * depth; }
+      }
+      const p = this._thighPush[side];
+      const k = Math.min(1, dt * 10);
+      p.x += (px - p.x) * k; p.y = 0; p.z += (pz - p.z) * k;
+      if (p.lengthSq() < 1e-8) continue;
+      upper.getWorldPosition(sh);
+      a.copy(w).sub(sh); b.copy(a).add(p);
+      if (a.lengthSq() < 1e-8) continue;
+      this._dq.setFromUnitVectors(a.normalize(), b.normalize());
+      upper.getWorldQuaternion(this._robotQ);
+      this._robotQ.premultiply(this._dq);
+      upper.parent!.getWorldQuaternion(this._pq);
+      upper.quaternion.copy(this._pq.invert().multiply(this._robotQ));
+      upper.updateMatrixWorld(true);
+    }
+  }
+
+  /** Move the arms `alpha` of the way to the robot stance (shoulders, arms, hands). */
+  private _robotArms(a: number) {
+    // Shoulders back to rest FIRST: the arm aims below are taken from where the
+    // shoulders actually are, and a clip leaves its own shoulder pose.
+    for (const b of ["leftShoulder", "rightShoulder"]) { const nb = this.node(b); if (nb) { nb.quaternion.slerp(this._ambIdentity, a); nb.updateMatrixWorld(true); } }
+    // Arms: upper arm 7 deg off vertical, out to its own side; forearm nearly straight
+    // with a 10 deg forward bend so the hand hangs by the thigh. Aimed at WORLD
+    // directions through aimBoneTo (rest world quat + the parent's live pose), then
+    // eased toward — the rig's rest pose never enters into it.
+    const D = Math.PI / 180;
+    for (const side of ["left", "right"] as const) {
+      const ru = this.restDir[`${side}UpperArm`];
+      if (!ru) continue;
+      const out = Math.sign(ru.x) || (side === "left" ? 1 : -1);
+      this._robotV.set(out * Math.sin(7 * D), -Math.cos(7 * D), 0.03).normalize();
+      this._robotEase(`${side}UpperArm`, this._robotV, a);
+      this._robotV.set(out * Math.sin(4 * D), -Math.cos(10 * D), Math.sin(10 * D)).normalize();
+      this._robotEase(`${side}LowerArm`, this._robotV, a);
+    }
+    for (const b of ["leftHand", "rightHand"]) { const nb = this.node(b); if (nb) { nb.quaternion.slerp(this._ambIdentity, a); nb.updateMatrixWorld(true); } }
+  }
+
+  /** Ease a bone toward pointing its rest child direction along `worldDir`. */
+  private _robotEase(bone: string, worldDir: THREE.Vector3, alpha: number) {
+    const nb = this.node(bone);
+    if (!nb) return;
+    this._robotQ.copy(nb.quaternion);
+    this.aimBoneTo(bone, worldDir);
+    this._robotQ2.copy(nb.quaternion);
+    nb.quaternion.copy(this._robotQ).slerp(this._robotQ2, alpha);
+    nb.updateMatrixWorld(true);
+  }
+
   private ambient(bone: string, rx: number, ry: number, rz: number, alpha: number) {
     const nb = this.node(bone); const base = this.idleBase[bone];
     if (!nb || !base) return;
@@ -2776,6 +3049,7 @@ class VRMMotionPlayer {
     if (!this.clip) {
       if (this._talking) this._stats.proc += dt; else this._stats.idle += dt;
     }
+    if (this.robotIdle) { this._robotStand(dt, t, e); return; }
     // Always-on gentle idle (breath + slow sway), present even at e=0.
     const breath = Math.sin(t * 1.5) * 0.014;
     const sway = Math.sin(t * 0.6) * 0.012;
@@ -3009,6 +3283,7 @@ class VRMMotionPlayer {
           (this._aimLeg[bn] ??= new THREE.Quaternion()).copy(nb.quaternion);
         }
       }
+      if (this.robotIdle) this._robotLegHeight();
       this.vrm.scene.updateMatrixWorld(true);
       this.solveLegIK("left");
       this.solveLegIK("right");
