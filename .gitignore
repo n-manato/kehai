@@ -131,3 +131,8 @@ frontend-src/test-results/
 # 他エージェントのローカル設定
 .cursor/
 .gemini/
+certs/
+
+# exhibition mic calibration (render_view mic panel)
+mic_tuning.json
+mic_tuning.tmp

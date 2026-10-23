@@ -8,6 +8,7 @@ from loguru import logger
 from pydantic import BaseModel
 from silero_vad import load_silero_vad
 
+from . import mic_tuning
 from .vad_interface import VADInterface
 
 
@@ -94,6 +95,14 @@ class VADEngine(VADInterface):
                 f"sustain >= {db_threshold}dB, "
                 f"segment mean >= {self.config.segment_mean_db}dB"
             )
+        # conf.yaml is the fallback for anything the mic panel never touched.
+        mic_tuning.set_vad_defaults(
+            prob_threshold=self.config.prob_threshold,
+            onset_db=self.config.onset_db_threshold or self.config.db_threshold,
+            sustain_db=self.config.db_threshold,
+            segment_mean_db=self.config.segment_mean_db,
+            onset_ms=self.config.required_hits * 32,
+        )
         self.model = self.load_vad_model()
         self.state = StateMachine(self.config)
         self.window_size_samples = 512 if self.config.target_sr == 16000 else 256
@@ -160,6 +169,24 @@ class StateMachine:
         self.db_window = deque(maxlen=self.smoothing_window)
 
         self.pre_buffer = deque(maxlen=20)
+        self._tuning_version = -1
+
+    def _apply_tuning(self):
+        """Pick up the mic panel's thresholds (see mic_tuning) — checked every frame,
+        applied only when they changed. required_hits is the impulse filter: a dropped
+        object is loud and over in ~0.1 s, a word lasts longer. It only delays the
+        moment a turn is RECOGNISED as started (the pre-buffer keeps the audio), not
+        the end of the turn, so raising it costs no response time."""
+        if self._tuning_version == mic_tuning.VERSION:
+            return
+        self._tuning_version = mic_tuning.VERSION
+        v = mic_tuning.effective()
+        self.prob_threshold = v.get("prob_threshold", self.prob_threshold)
+        self.db_threshold = v.get("sustain_db", self.db_threshold)
+        self.onset_db = v.get("onset_db", self.onset_db)
+        self.segment_mean_db = v.get("segment_mean_db", self.segment_mean_db)
+        if "onset_ms" in v:
+            self.required_hits = max(1, round(v["onset_ms"] / 32))
 
     @classmethod
     def calculate_db(cls, audio_data: np.ndarray) -> float:
@@ -201,13 +228,16 @@ class StateMachine:
         """
         self._log_level(tag)
         if not self.segment_mean_db:
+            mic_tuning.MONITOR.event("pass", dur=round(len(self.dbs) * 0.032, 2))
             return True
         finite = [d for d in self.dbs if np.isfinite(d)]
         if not finite:
             return False
         mean_db = float(np.mean(finite))
         if mean_db >= self.segment_mean_db:
+            mic_tuning.MONITOR.event("pass", mean=round(mean_db, 1), dur=round(len(self.dbs) * 0.032, 2))
             return True
+        mic_tuning.MONITOR.event("drop", mean=round(mean_db, 1), dur=round(len(self.dbs) * 0.032, 2))
         logger.info(
             f"[vad-level] {tag} DROPPED: mean {mean_db:.1f}dB < {self.segment_mean_db}dB "
             f"(too quiet to be speech aimed at the mic)"
@@ -226,8 +256,10 @@ class StateMachine:
         chunk_bytes = int_chunk_np.astype(np.int16).tobytes()
         db = self.calculate_db(int_chunk_np)
 
+        self._apply_tuning()
         # Obtain the smoothed prob and db
         smoothed_prob, smoothed_db = self.get_smoothed_values(prob, db)
+        mic_tuning.MONITOR.frame(smoothed_prob, smoothed_db, self.state.name.lower())
 
         if self.state == State.IDLE:
             self.pre_buffer.append(chunk_bytes)
@@ -239,6 +271,7 @@ class StateMachine:
                     self.state = State.ACTIVE
                     self.update(chunk_bytes, smoothed_prob, smoothed_db)
                     self.hit_count = 0
+                    mic_tuning.MONITOR.event("start", db=round(float(smoothed_db), 1))
                     yield [], [], b"<|PAUSE|>"
             else:
                 self.hit_count = 0

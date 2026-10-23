@@ -40,7 +40,7 @@ def _local_ip_addresses() -> list[str]:
     return sorted(addresses)
 
 
-def _uncovered_addresses(cert_path: Path) -> list[str]:
+def _uncovered_addresses(cert_path: Path, extra: tuple[str, ...] = ()) -> list[str]:
     """Which of this machine's current IPs the existing certificate omits.
 
     An unreadable or malformed certificate counts as covering nothing, so it is
@@ -68,7 +68,7 @@ def _uncovered_addresses(cert_path: Path) -> list[str]:
     # Link-local and loopback are never how a LAN client reaches this machine,
     # so their absence is not a reason to churn the certificate.
     missing = []
-    for ip in _local_ip_addresses():
+    for ip in [*_local_ip_addresses(), *extra]:
         if ip.startswith(("127.", "169.254.")) or ip == "::1":
             continue
         if ip not in covered:
@@ -76,7 +76,9 @@ def _uncovered_addresses(cert_path: Path) -> list[str]:
     return missing
 
 
-def ensure_self_signed_cert(certfile: str, keyfile: str) -> tuple[str, str]:
+def ensure_self_signed_cert(
+    certfile: str, keyfile: str, extra_ips: tuple[str, ...] = ()
+) -> tuple[str, str]:
     """Ensure a self-signed cert/key pair exists, generating one if needed.
 
     Returns the (certfile, keyfile) paths. The certificate's Subject
@@ -98,7 +100,7 @@ def ensure_self_signed_cert(certfile: str, keyfile: str) -> tuple[str, str]:
         # certificate error, so the microphone silently produced nothing — no
         # audio reached the VAD, no turn was ever taken, and the symptom
         # presented as "she does not speak" with a completely healthy server.
-        missing = _uncovered_addresses(cert_path)
+        missing = _uncovered_addresses(cert_path, extra_ips)
         if not missing:
             logger.info(f"Using existing SSL certificate: {cert_path}")
             return str(cert_path), str(key_path)
@@ -117,7 +119,9 @@ def ensure_self_signed_cert(certfile: str, keyfile: str) -> tuple[str, str]:
     from cryptography.hazmat.primitives.asymmetric import rsa
 
     hostname = socket.gethostname()
-    ip_list = _local_ip_addresses()
+    # extra_ips: addresses the detection below cannot see — it finds the
+    # default-route interface, not e.g. an isolated cable to the PROTO.
+    ip_list = sorted({*_local_ip_addresses(), *extra_ips})
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 

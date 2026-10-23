@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KEHAI Remote View</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; object-fit: contain; cursor: default; touch-action: none; }
+  #start { position: fixed; inset: 0; display: grid; place-items: center; background: #000c;
+           color: #cfe; font: 600 20px system-ui, sans-serif; cursor: pointer; z-index: 2; }
+  #hud { position: fixed; left: 8px; bottom: 8px; font: 12px ui-monospace, monospace; color: #8fd;
+         background: #0008; padding: 4px 6px; border-radius: 4px; pointer-events: none; z-index: 1; }
+  /* The fps / Mbps / rtt line is a diagnostic: hidden unless ?hud=1. */
+  body:not(.hud) #hud { display: none; }
+  #ime { position: fixed; left: -1000px; top: 0; width: 10px; height: 10px; opacity: 0; }
+  /* Mic panel. The button only shows while the mouse moves, like the app's own UI. */
+  #micBtn { position: fixed; right: 2vmin; bottom: 2vmin; z-index: 3; padding: .5em .9em; cursor: pointer;
+            font: 600 clamp(14px, 2vmin, 32px) system-ui, sans-serif; color: #cfe; background: #000a;
+            border: 1px solid #4cc8; border-radius: .6em; transition: opacity .4s; }
+  body.idle #micBtn { opacity: 0; pointer-events: none; }
+  #mic { position: fixed; right: 2vmin; bottom: 2vmin; z-index: 4; box-sizing: border-box;
+         width: min(94vw, 34em); max-height: 92vh; overflow: auto; padding: 1em 1.2em;
+         font: clamp(14px, 1.9vmin, 30px)/1.45 system-ui, sans-serif; color: #dff;
+         background: #061016f0; border: 1px solid #3aa; border-radius: .8em; }
+  #mic[hidden] { display: none; }
+  #mic h2 { margin: 0 0 .5em; font-size: 1.2em; }
+  /* object-fit: the page-wide canvas rule letterboxes; the meter must fill its box. */
+  #mic #micMeter { width: 100%; height: 7em; background: #000; border-radius: .4em; cursor: default; object-fit: fill; }
+  #micStatus { margin: .4em 0 .2em; font-variant-numeric: tabular-nums; }
+  #micLog { margin: 0; padding-left: 1.2em; min-height: 1.4em; font-size: .85em; color: #9cc; }
+  #mic .row { display: grid; grid-template-columns: 1fr auto; gap: .1em .8em; margin: .8em 0; }
+  #mic .row label { font-weight: 600; }
+  #mic .row output { min-width: 4.5em; text-align: right; font-variant-numeric: tabular-nums; }
+  #mic .row input { grid-column: 1 / -1; width: 100%; }
+  #mic .row small, #mic .sw small { grid-column: 1 / -1; color: #9bb; }
+  #mic .sw { display: grid; grid-template-columns: auto 1fr; gap: .1em .6em; align-items: center; margin: .6em 0; }
+  #mic .sw input { width: 1.2em; height: 1.2em; }
+  #mic .btns { display: flex; flex-wrap: wrap; gap: .6em; margin-top: 1em; }
+  #mic .btns button { font: inherit; padding: .45em .9em; border-radius: .5em; border: 1px solid #4cc;
+                      background: #0b2a33; color: #dff; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<textarea id="ime" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+<div id="start">クリックして開始（マイクと音声を有効にします）</div>
+<div id="hud">connecting…</div>
+<button id="micBtn" type="button">マイク設定</button>
+<div id="mic" hidden>
+  <h2>マイク設定</h2>
+  <canvas id="micMeter" width="640" height="200"></canvas>
+  <div id="micStatus">—</div>
+  <ul id="micLog"></ul>
+  <div class="row" data-k="gain_db"><label>マイク感度</label><output></output>
+    <input type="range" min="-12" max="24" step="1">
+    <small>入力の音量そのものを上げ下げします。ふつうに話した声の山が、オレンジの線を少し越えるくらいが目安です。</small></div>
+  <div class="row" data-k="onset_db"><label>話し始めの音量</label><output></output>
+    <input type="range" min="30" max="95" step="1">
+    <small>オレンジの線。これを超える声で会話が始まります。周りがうるさいときは上げると、マイクの近くの声だけを拾います。</small></div>
+  <div class="row" data-k="sustain_db"><label>話し続けの音量</label><output></output>
+    <input type="range" min="20" max="90" step="1">
+    <small>水色の線。話している途中は、ここまで下がっても続いているとみなします。周りの騒音より上にしないと、話し終わりが判定されません。</small></div>
+  <div class="row" data-k="prob_threshold"><label>声らしさの判定</label><output></output>
+    <input type="range" min="0.1" max="0.95" step="0.05">
+    <small>上げると、声以外の音（物音・音楽）に反応しにくくなります。上げすぎると小さな声を逃します。</small></div>
+  <div class="row" data-k="onset_ms"><label>短い音を無視する時間</label><output></output>
+    <input type="range" min="64" max="640" step="32">
+    <small>これより短い音では会話を始めません（物を落とした音・咳・拍手など）。返答の速さには影響しません。</small></div>
+  <div class="row" data-k="segment_mean_db"><label>平均音量の下限</label><output></output>
+    <input type="range" min="0" max="85" step="1">
+    <small>灰色の点線。聞き取った区切りの平均音量がこれ未満なら、物音として捨てます。</small></div>
+  <label class="sw" data-k="noise_suppression"><input type="checkbox"><span>ノイズ抑制（ブラウザ標準）</span>
+    <small>空調やざわめきなど、続いている雑音を抑えます。遅延はほぼありません。</small></label>
+  <label class="sw" data-k="auto_gain"><input type="checkbox"><span>自動音量調整</span>
+    <small>騒がしい場所ではオフがおすすめです（静かな間に雑音まで持ち上げてしまうため）。</small></label>
+  <div class="btns">
+    <button type="button" id="micMeasure">周囲の音を測る（5秒）</button>
+    <button type="button" id="micReset">初期値に戻す</button>
+    <button type="button" id="micClose">閉じる</button>
+  </div>
+</div>
+<script>
+/*
+ * Viewer for server-side rendering (src/kehai/render_stream.py). No 3D here:
+ * it shows frames (H.264 via WebCodecs on the 4K path, JPEG on the fallback),
+ * plays the app's audio, and sends back pointer, keys and the microphone.
+ * ?hud=0 hides the stats line; ?mbps=20 sets the H.264 bitrate (default 30 on
+ * loopback/LAN/tailnet, 15 through the public hostname); ?q=50 lowers
+ * the fallback's JPEG quality.
+ */
+const KIND_AUDIO = 1, KIND_VIDEO = 2, KIND_MIC = 3, KIND_H264 = 4, KIND_CAM = 5, RATE = 48000;
+if (new URLSearchParams(location.search).get("hud") === "1") document.body.classList.add("hud");
+const params = new URLSearchParams(location.search);
+const canvas = document.getElementById("view");
+const g = canvas.getContext("2d");
+const hud = document.getElementById("hud");
+const ime = document.getElementById("ime");
+if (params.get("hud") === "0") hud.style.display = "none";
+
+let ws, audioNode, micNode, ctx, mode = "", streamSize = "2160x3840", rotate = 0;
+let frames = 0, bytes = 0, rtt = 0, decodeMs = 0, decoded = 0, lastErr = "", codecStr = "", playQ = -1;
+let pending = null, drawing = false, jbTarget = -1, starves = 0;
+// Same box / tailnet / LAN vs. the public Cloudflare hostname. Through Cloudflare
+// the PROTO's link could not hold 30 Mbps (RTT climbed 70 -> 340 ms, frames fell
+// to 47 fps, and the audio queued behind the video on the shared stream), so the
+// public route starts at 15 Mbps with a deeper audio buffer. ?mbps= overrides.
+const LOCAL = /^(127\.|localhost$|10\.|192\.168\.|100\.)/.test(location.hostname);
+const MBPS = +(params.get("mbps") || (LOCAL ? 30 : 15));
+
+const PLAY_WORKLET = `
+class Play extends AudioWorkletProcessor {
+  // Adaptive jitter buffer. On loopback or a LAN 40 ms is plenty, but through
+  // Cloudflare the audio shares one TCP stream with 4K video and arrives in
+  // bursts (RTT swung 70-340 ms on the PROTO): a fixed 40 ms starved and then
+  // threw the burst away — heard as crackling. Every starve grows the target
+  // by 40 ms (cap 400); 10 s without one shrinks it 10 ms back toward the floor.
+  constructor(opts) {
+    super(); this.q = []; this.cur = null; this.pos = 0; this.queued = 0; this.primed = false;
+    this.n = 0; this.starves = 0; this.calm = 0; this.prev = null; this.minQ = Infinity; this.win = 0;
+    this.floor = (opts.processorOptions && opts.processorOptions.floor) || 0.04;
+    this.target = this.floor;
+    this.port.onmessage = (e) => {
+      const f = new Float32Array(e.data.length);
+      for (let i = 0; i < f.length; i++) f[i] = e.data[i] / 0x7fff;
+      this.q.push(f); this.queued += f.length;
+      // Hard safety cap only. Lag is trimmed in process(), from the queue's
+      // LOW point over a second: a burst's peak is not lag, and cutting it is
+      // what turned bursty arrival into crackle.
+      if (this.queued > 48000 * 1.0) {
+        while (this.q.length > 1 && this.queued > 48000 * (this.target + 0.05)) this.queued -= this.q.shift().length;
+      }
+      if (++this.n % 50 === 0) this.port.postMessage([this.queued / 48, this.target * 1000, this.starves]);
+    };
+  }
+  loudTail(f) {
+    for (let i = Math.max(0, f.length - 240); i < f.length; i++) if (Math.abs(f[i]) > 0.01) return true;
+    return false;
+  }
+  process(_, outputs) {
+    const out = outputs[0][0];
+    this.calm += out.length;
+    if (this.calm > 48000 * 10) { this.calm = 0; this.target = Math.max(this.floor, this.target - 0.01); }
+    // Catch up rather than cap: if even the low point of the last second sat
+    // well above target, that excess is standing lag — drop it, once.
+    this.minQ = Math.min(this.minQ, this.queued); this.win += out.length;
+    if (this.win >= 48000) {
+      let excess = this.primed ? this.minQ - 48000 * (this.target + 0.04) : 0;
+      while (excess > 0 && this.q.length > 1 && this.q[0].length <= excess) {
+        const f = this.q.shift(); this.queued -= f.length; excess -= f.length;
+      }
+      this.win = 0; this.minQ = Infinity;
+    }
+    if (!this.primed && this.queued < 48000 * this.target) { out.fill(0); return true; }
+    this.primed = true;
+    for (let i = 0; i < out.length; i++) {
+      if (!this.cur || this.pos >= this.cur.length) {
+        this.cur = this.q.shift() || null; this.pos = 0;
+        if (this.cur) { this.queued -= this.cur.length; this.prev = this.cur; }
+        else {
+          // Ran dry. Mid-speech that is an audible gap; at the end of a reply
+          // the last chunk has already faded out. Only the first grows the buffer.
+          this.primed = false;
+          if (this.prev && this.loudTail(this.prev)) {
+            this.starves++; this.calm = 0;
+            this.target = Math.min(0.4, this.target + 0.04);
+          }
+          this.prev = null;
+        }
+      }
+      out[i] = this.cur ? this.cur[this.pos++] : 0;
+    }
+    return true;
+  }
+}
+registerProcessor("kehai-play", Play);
+class Cap extends AudioWorkletProcessor {
+  constructor() { super(); this.buf = new Int16Array(960); this.n = 0; }
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      this.buf[this.n++] = Math.max(-1, Math.min(1, ch[i])) * 0x7fff;
+      if (this.n === 960) { this.port.postMessage(this.buf.buffer, [this.buf.buffer]); this.buf = new Int16Array(960); this.n = 0; }
+    }
+    return true;
+  }
+}
+registerProcessor("kehai-cap", Cap);
+`;
+
+function size() {
+  const w = Math.round(innerWidth), h = Math.round(innerHeight);
+  if (ws?.readyState === 1) ws.send(JSON.stringify({ t: "size", w, h, q: +(params.get("q") || 70), mbps: MBPS }));
+}
+
+// ---- H.264 (4K path): hardware decode, newest frame drawn ----------------------
+let decoder = null, waitKey = true;
+function avcCodec(au) {
+  // codec string from the SPS (NAL type 7): profile_idc, constraints, level_idc
+  for (let i = 0; i + 7 < au.length; i++) {
+    if (au[i] === 0 && au[i + 1] === 0 && au[i + 2] === 1 && (au[i + 3] & 0x1f) === 7) {
+      const h = (n) => n.toString(16).padStart(2, "0");
+      return `avc1.${h(au[i + 4])}${h(au[i + 5])}${h(au[i + 6])}`;
+    }
+  }
+  return null;
+}
+// Hardware decoders commonly reject portrait 4K (height > 2304) as a config —
+// Chrome on Windows reports "Unsupported configuration" for 2160x3840 — so ask
+// first and fall back to software rather than showing nothing.
+let accel = "";
+async function pickAccel(codec, w, h) {
+  for (const hardwareAcceleration of ["prefer-hardware", "no-preference", "prefer-software"]) {
+    const cfg = { codec, codedWidth: w, codedHeight: h, optimizeForLatency: true, hardwareAcceleration };
+    try { if ((await VideoDecoder.isConfigSupported(cfg)).supported) return hardwareAcceleration; } catch { /* try next */ }
+  }
+  return null;
+}
+let configuring = false;
+async function makeDecoderFor(codec) {
+  configuring = true;
+  const [w, h] = streamSize.split("x").map(Number);
+  accel = await pickAccel(codec, w, h);
+  configuring = false;
+  if (!accel) { lastErr = `no decoder for ${codec} ${w}x${h}`; return false; }
+  makeDecoder(codec);
+  return true;
+}
+function makeDecoder(codec) {
+  decoder?.close();
+  decoder = new VideoDecoder({
+    output: (frame) => {
+      // A rotated stream is the portrait screen turned 90° clockwise; draw it
+      // turned back, so the canvas (and every click coordinate) is portrait.
+      const fw = rotate ? frame.displayHeight : frame.displayWidth;
+      const fh = rotate ? frame.displayWidth : frame.displayHeight;
+      if (canvas.width !== fw || canvas.height !== fh) { canvas.width = fw; canvas.height = fh; }
+      if (rotate) {
+        g.setTransform(0, -1, 1, 0, 0, fh);
+        g.drawImage(frame, 0, 0);
+        g.setTransform(1, 0, 0, 1, 0, 0);
+      } else {
+        g.drawImage(frame, 0, 0);
+      }
+      frame.close();
+      decoded++;
+    },
+    error: (e) => { lastErr = "decoder: " + e.message; waitKey = true; decoder = null; },
+  });
+  codecStr = `${codec} ${accel}`;
+  decoder.configure({ codec, optimizeForLatency: true, hardwareAcceleration: accel });
+}
+function onH264(b) {
+  const key = b[9] === 1, au = b.subarray(10);
+  if (configuring || (waitKey && !key)) return;
+  if (key && (!decoder || decoder.state === "closed")) {
+    const codec = avcCodec(au);
+    if (!codec) return;
+    void makeDecoderFor(codec);
+    return; // configured asynchronously; start decoding at the next keyframe
+  }
+  if (!decoder) return;
+  waitKey = false;
+  // Never queue behind the screen: if decode lags, skip to the next keyframe.
+  if (decoder.decodeQueueSize > 3 && !key) { waitKey = true; return; }
+  decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: performance.now() * 1000, data: au }));
+}
+
+async function draw() {
+  if (drawing || !pending) return;
+  drawing = true;
+  const blob = pending; pending = null;
+  const t0 = performance.now();
+  try {
+    const bmp = await createImageBitmap(blob);
+    if (canvas.width !== bmp.width || canvas.height !== bmp.height) { canvas.width = bmp.width; canvas.height = bmp.height; }
+    g.drawImage(bmp, 0, 0);
+    bmp.close();
+  } catch { /* corrupt frame: skip */ }
+  decodeMs = performance.now() - t0;
+  drawing = false;
+  if (pending) draw();
+}
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/render-stream/view`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { hud.textContent = "connected"; size(); if (!micEl.hidden) send({ t: "mic-monitor", on: true }); };
+  ws.onclose = (e) => {
+    // 4000 = another viewer took over. Reconnecting would evict it in turn and
+    // the two tabs would kick each other forever, neither ever showing a frame.
+    if (e.code === 4000) { hud.textContent = "another viewer took over — reload to take it back"; return; }
+    hud.textContent = `disconnected (${e.reason || e.code}) — retrying`; setTimeout(connect, 1500);
+  };
+  ws.onmessage = (e) => {
+    if (typeof e.data === "string") {
+      const m = JSON.parse(e.data);
+      if (m.t === "pong") rtt = performance.now() - m.c;
+      else if (m.t === "error") hud.textContent = "error: " + m.msg;
+      // The server can ask the page to load its latest copy — the PROTO has no
+      // keyboard to press F5 on (POST /render-stream/reload, loopback only).
+      else if (m.t === "reload") location.reload();
+      else if (m.t === "mic") micApply(m);
+      else if (m.t === "mic-level") micLevel(m);
+      else if (m.t === "mode") {
+        mode = `${m.mode}${m.mode === "x11" ? " " + m.size : ""}${m.rotate ? " (sent rotated)" : ""}`;
+        streamSize = m.stream || m.size || streamSize;
+        rotate = m.rotate || 0;
+      }
+      return;
+    }
+    const b = new Uint8Array(e.data);
+    bytes += b.length;
+    if (b[0] === KIND_H264) {
+      frames++;
+      onH264(b);
+    } else if (b[0] === KIND_VIDEO) {
+      frames++;
+      pending = new Blob([b.subarray(9)], { type: "image/jpeg" });  // newest wins
+      draw();
+    } else if (b[0] === KIND_AUDIO && audioNode) {
+      audioNode.port.postMessage(new Int16Array(e.data.slice(1)));
+    }
+  };
+}
+
+// ---- input ------------------------------------------------------------------
+const mods = (e) => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
+const BTN = ["left", "middle", "right"];
+function pos(e) {
+  // object-fit: contain letterboxes the frame; map through the drawn area only.
+  const r = canvas.getBoundingClientRect();
+  const s = Math.min(r.width / canvas.width, r.height / canvas.height);
+  const ox = (r.width - canvas.width * s) / 2, oy = (r.height - canvas.height * s) / 2;
+  return { x: (e.clientX - r.left - ox) / s, y: (e.clientY - r.top - oy) / s };
+}
+function send(m) { if (ws?.readyState === 1) ws.send(JSON.stringify(m)); }
+let clicks = 0, lastDown = 0;
+canvas.addEventListener("pointerdown", (e) => {
+  const now = performance.now(); clicks = now - lastDown < 400 ? clicks + 1 : 1; lastDown = now;
+  send({ t: "mouse", type: "mousePressed", ...pos(e), button: BTN[e.button] || "left", buttons: e.buttons, clickCount: clicks, modifiers: mods(e) });
+  ime.focus({ preventScroll: true });
+});
+canvas.addEventListener("pointerup", (e) => send({ t: "mouse", type: "mouseReleased", ...pos(e), button: BTN[e.button] || "left", buttons: e.buttons, clickCount: clicks, modifiers: mods(e) }));
+canvas.addEventListener("pointermove", (e) => send({ t: "mouse", type: "mouseMoved", ...pos(e), buttons: e.buttons, modifiers: mods(e) }));
+canvas.addEventListener("wheel", (e) => { e.preventDefault(); send({ t: "wheel", ...pos(e), dx: e.deltaX, dy: e.deltaY, modifiers: mods(e) }); }, { passive: false });
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+// The mousedown that follows pointerdown moves focus to <body> by default, which
+// undid the ime.focus() above — every keystroke then went nowhere.
+canvas.addEventListener("mousedown", (e) => { e.preventDefault(); ime.focus({ preventScroll: true }); });
+
+// Text goes through a hidden textarea so IME (日本語入力) composes locally and
+// only the committed string is sent; non-text keys are forwarded as key events.
+const TEXTLESS = new Set(["Enter", "Backspace", "Delete", "Tab", "Escape", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
+ime.addEventListener("keydown", (e) => {
+  if (e.isComposing) return;
+  if (TEXTLESS.has(e.key) || e.ctrlKey || e.metaKey) {
+    e.preventDefault();
+    send({ t: "key", type: "keyDown", key: e.key, code: e.code, keyCode: e.keyCode, modifiers: mods(e) });
+  }
+});
+ime.addEventListener("keyup", (e) => {
+  if (TEXTLESS.has(e.key) || e.ctrlKey || e.metaKey) send({ t: "key", type: "keyUp", key: e.key, code: e.code, keyCode: e.keyCode, modifiers: mods(e) });
+});
+ime.addEventListener("input", (e) => { if (!e.isComposing && ime.value) { send({ t: "text", text: ime.value }); ime.value = ""; } });
+// Safety net: if focus has wandered off the textarea anyway (alt-tab, devtools,
+// a click on the HUD), still deliver the key and pull focus back for the next one.
+document.addEventListener("keydown", (e) => {
+  if (e.target === ime || e.isComposing || micEl.contains(e.target)) return;
+  if (TEXTLESS.has(e.key) || e.ctrlKey || e.metaKey) {
+    e.preventDefault();
+    send({ t: "key", type: "keyDown", key: e.key, code: e.code, keyCode: e.keyCode, modifiers: mods(e) });
+    send({ t: "key", type: "keyUp", key: e.key, code: e.code, keyCode: e.keyCode, modifiers: mods(e) });
+  } else if (e.key.length === 1) {
+    e.preventDefault();
+    send({ t: "text", text: e.key });
+  }
+  ime.focus({ preventScroll: true });
+});
+ime.addEventListener("compositionend", () => { if (ime.value) { send({ t: "text", text: ime.value }); ime.value = ""; } });
+
+// ---- audio + mic (needs a gesture) ---------------------------------------------
+document.getElementById("start").addEventListener("click", async (e) => {
+  e.currentTarget.remove();
+  ime.focus();
+  ctx = new AudioContext({ sampleRate: RATE, latencyHint: "interactive" });
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([PLAY_WORKLET], { type: "application/javascript" })));
+  audioNode = new AudioWorkletNode(ctx, "kehai-play", { numberOfInputs: 0, outputChannelCount: [1], processorOptions: { floor: LOCAL ? 0.04 : 0.12 } });
+  audioNode.connect(ctx.destination);
+  audioNode.port.onmessage = (ev) => { [playQ, jbTarget, starves] = ev.data.map(Math.round); };
+  micNode = new AudioWorkletNode(ctx, "kehai-cap", { numberOfOutputs: 0 });
+  micNode.port.onmessage = (ev) => {
+    if (ws?.readyState !== 1) return;
+    const pcm = new Uint8Array(ev.data), msg = new Uint8Array(pcm.length + 1);
+    msg[0] = KIND_MIC; msg.set(pcm, 1); ws.send(msg);
+  };
+  micGain = ctx.createGain();
+  micGain.connect(micNode);
+  await openMic();
+  if (params.get("cam") !== "0") startCam();
+});
+
+// The capture as the mic panel set it (server-stored, see vad/mic_tuning.py):
+// browser noise suppression / auto gain are getUserMedia constraints, so changing
+// them re-opens the mic; the gain is a GainNode in front of the capture worklet.
+let micStream = null, micSrc = null, micGain = null, micCfg = {}, micOpenWith = "";
+async function openMic() {
+  if (!ctx || !micGain) return;
+  const ns = micCfg.noise_suppression !== false, agc = micCfg.auto_gain !== false;
+  micGain.gain.value = Math.pow(10, (micCfg.gain_db || 0) / 20);
+  const want = `${ns}/${agc}`;
+  if (micStream && micOpenWith === want) return;
+  micOpenWith = want;
+  try {
+    const mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: ns, autoGainControl: agc, channelCount: 1 } });
+    micSrc?.disconnect();
+    micStream?.getTracks().forEach((t) => t.stop());
+    micStream = mic;
+    micSrc = ctx.createMediaStreamSource(mic);
+    micSrc.connect(micGain);
+  } catch (err) { hud.textContent = "mic unavailable: " + err.name; micOpenWith = ""; }
+}
+
+// ---- camera -> head-coupled perspective ----------------------------------------
+// The scene is rendered on the server, but the viewer's head is HERE. Small JPEG
+// frames go up the same socket; the render tab feeds them to its own head tracker
+// as if they came from a local webcam, and the 3D view shifts with the viewer's
+// head (off-axis perspective). No camera, or no permission: the view simply stays
+// fixed. ?cam=0 turns it off.
+async function startCam() {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 360 }, facingMode: "user" } });
+  } catch (err) { console.info("camera unavailable:", err.name); return; }
+  const video = document.createElement("video");
+  video.muted = true; video.playsInline = true; video.srcObject = stream;
+  await video.play().catch(() => {});
+  const c = document.createElement("canvas"), g = c.getContext("2d");
+  let busy = false;
+  setInterval(() => {
+    // Never queue frames behind a slow link: a stale head pose is worse than none.
+    if (busy || ws?.readyState !== 1 || ws.bufferedAmount > 200000 || !video.videoWidth) return;
+    busy = true;
+    c.width = 640; c.height = Math.round(640 * video.videoHeight / video.videoWidth);
+    g.drawImage(video, 0, 0, c.width, c.height);
+    c.toBlob(async (blob) => {
+      try {
+        if (blob && ws?.readyState === 1) {
+          const jpg = new Uint8Array(await blob.arrayBuffer()), msg = new Uint8Array(jpg.length + 1);
+          msg[0] = KIND_CAM; msg.set(jpg, 1); ws.send(msg);
+        }
+      } finally { busy = false; }
+    }, "image/jpeg", 0.7);
+  }, 66);
+}
+
+// One-off capability report: which codec/orientation this machine can decode in
+// hardware decides how the server should encode for it.
+async function probeCaps() {
+  const out = {};
+  const tests = { "avc-high-5.2": "avc1.640034", "hevc-main-5.1": "hev1.1.6.L153.B0", "hevc-main-5.2": "hev1.1.6.L156.B0" };
+  for (const [name, codec] of Object.entries(tests)) {
+    for (const [o, w, h] of [["portrait", 2160, 3840], ["landscape", 3840, 2160]]) {
+      try {
+        const r = await VideoDecoder.isConfigSupported({ codec, codedWidth: w, codedHeight: h, hardwareAcceleration: "prefer-hardware" });
+        out[`${name}/${o}`] = r.supported;
+      } catch (e) { out[`${name}/${o}`] = "err"; }
+    }
+  }
+  try {
+    const gl = document.createElement("canvas").getContext("webgl2");
+    const ext = gl?.getExtension("WEBGL_debug_renderer_info");
+    out.gpu = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : "unknown";
+  } catch { out.gpu = "unknown"; }
+  out.cores = navigator.hardwareConcurrency;
+  out.screen = `${screen.width}x${screen.height}@${devicePixelRatio}`;
+  send({ t: "caps", caps: out });
+}
+setTimeout(probeCaps, 1500);
+
+addEventListener("resize", () => { clearTimeout(size.t); size.t = setTimeout(size, 200); });
+setInterval(() => send({ t: "ping", c: performance.now() }), 1000);
+setInterval(() => {
+  hud.textContent = `${mode} · ${frames} fps in / ${decoded} drawn · ${(bytes * 8 / 1e6).toFixed(1)} Mbps · rtt ${rtt.toFixed(0)} ms · ${canvas.width}x${canvas.height}${lastErr ? " · " + lastErr : ""}`;
+  // Report to the server log too: the person watching cannot always read this line out.
+  send({ t: "stat", inFps: frames, drawn: decoded, mbps: +(bytes * 8 / 1e6).toFixed(1), rtt: Math.round(rtt),
+         codec: codecStr, dec: decoder?.state || "none", q: decoder?.decodeQueueSize ?? -1, err: lastErr, playQ, jbTarget, starves, ctxRate: ctx ? ctx.sampleRate : -1,
+         baseLatency: ctx ? Math.round((ctx.baseLatency + (ctx.outputLatency || 0)) * 1000) : -1, ua: navigator.userAgent.slice(0, 120) });
+  frames = 0; bytes = 0; decoded = 0;
+}, 1000);
+
+// ---- mic panel ------------------------------------------------------------------
+// For a noisy hall: set the VAD's thresholds against what it actually hears. The
+// meter is the SERVER's VAD level (mic-level, 10 Hz while open), so a line drawn on
+// it is the real gate, not a browser-side estimate of it.
+const micEl = document.getElementById("mic"), micBtn = document.getElementById("micBtn");
+const meter = document.getElementById("micMeter"), mg = meter.getContext("2d");
+const micStatus = document.getElementById("micStatus"), micLog = document.getElementById("micLog");
+let micDefaults = {}, micHist = [], micPend = {}, micTimer = 0, measuring = null;
+const MIC_FMT = {
+  gain_db: (v) => `${v > 0 ? "+" : ""}${v} dB`,
+  prob_threshold: (v) => (+v).toFixed(2),
+  onset_ms: (v) => `${v} ms`,
+};
+const micFmt = (k, v) => (MIC_FMT[k] || ((x) => `${x} dB`))(v);
+
+function micApply(m) {
+  micCfg = { ...m.values };
+  micDefaults = m.defaults || {};
+  for (const row of micEl.querySelectorAll("[data-k]")) {
+    const k = row.dataset.k, inp = row.querySelector("input");
+    if (!(k in micCfg) || document.activeElement === inp) continue;
+    if (inp.type === "checkbox") inp.checked = !!micCfg[k];
+    else { inp.value = micCfg[k]; row.querySelector("output").textContent = micFmt(k, micCfg[k]); }
+  }
+  void openMic();
+  drawMeter();
+}
+
+function micSet(k, v) {
+  micCfg[k] = v;
+  micPend[k] = v;
+  clearTimeout(micTimer);
+  micTimer = setTimeout(() => { send({ t: "mic-set", values: micPend }); micPend = {}; }, 150);
+  if (k === "gain_db" || k === "noise_suppression" || k === "auto_gain") void openMic();
+  drawMeter();
+}
+
+for (const row of micEl.querySelectorAll("[data-k]")) {
+  const k = row.dataset.k, inp = row.querySelector("input");
+  inp.addEventListener("input", () => {
+    if (inp.type === "checkbox") return micSet(k, inp.checked);
+    row.querySelector("output").textContent = micFmt(k, +inp.value);
+    micSet(k, +inp.value);
+  });
+}
+
+const DB_LO = 20, DB_HI = 95;
+function drawMeter() {
+  const w = meter.width, h = meter.height, ph = 18, mh = h - ph;
+  const y = (db) => mh - ((Math.min(DB_HI, Math.max(DB_LO, db)) - DB_LO) / (DB_HI - DB_LO)) * mh;
+  mg.clearRect(0, 0, w, h);
+  const n = 80, bw = w / n;
+  // speech shading: green while a turn is open, darker during its pauses
+  micHist.forEach((f, i) => {
+    if (f.st === "idle") return;
+    mg.fillStyle = f.st === "active" ? "#1d5a3a" : "#16352a";
+    mg.fillRect(i * bw, 0, bw + 1, mh);
+  });
+  const line = (db, color, label, dash) => {
+    if (db == null) return;
+    mg.strokeStyle = color; mg.lineWidth = 3; mg.setLineDash(dash || []);
+    mg.beginPath(); mg.moveTo(0, y(db)); mg.lineTo(w, y(db)); mg.stroke();
+    mg.fillStyle = color; mg.font = "600 20px system-ui, sans-serif"; mg.textAlign = "right";
+    mg.fillText(label, w - 6, y(db) - 5);
+  };
+  line(micCfg.onset_db, "#ffa040", "話し始め");
+  line(micCfg.sustain_db, "#40d0ff", "話し続け");
+  if (micCfg.segment_mean_db) line(micCfg.segment_mean_db, "#aaa", "平均下限", [8, 8]);
+  mg.setLineDash([]);
+  mg.strokeStyle = "#fff"; mg.lineWidth = 2; mg.beginPath();
+  micHist.forEach((f, i) => { const px = i * bw + bw / 2; i ? mg.lineTo(px, y(f.db)) : mg.moveTo(px, y(f.db)); });
+  mg.stroke();
+  // voice-likeness strip along the bottom: lit where it passes the threshold
+  micHist.forEach((f, i) => {
+    mg.fillStyle = f.p >= (micCfg.prob_threshold ?? 0.4) ? "#6f6" : "#355";
+    mg.fillRect(i * bw, mh + 4 + (1 - f.p) * (ph - 6), bw, f.p * (ph - 6));
+  });
+}
+
+const MIC_ST = { idle: "待機中", active: "発話中", inactive: "区切り待ち" };
+function micLevel(m) {
+  micHist.push({ db: m.db, p: m.p, st: m.st });
+  if (micHist.length > 80) micHist.shift();
+  if (measuring) {
+    measuring.vals.push(m.db);
+    const left = Math.ceil((measuring.until - performance.now()) / 1000);
+    micStatus.textContent = `測定中…話さずにお待ちください（あと${Math.max(0, left)}秒）`;
+    if (left <= 0) finishMeasure();
+  } else {
+    micStatus.textContent = `${MIC_ST[m.st] || m.st}　いまの音量 ${m.db.toFixed(0)} dB　声らしさ ${m.p.toFixed(2)}`;
+  }
+  for (const e of m.ev || []) {
+    const t = new Date(e.t * 1000).toLocaleTimeString("ja-JP");
+    const txt = e.k === "start" ? `会話の始まりを検出（${e.db} dB）`
+      : e.k === "pass" ? `✓ 聞き取りへ（${e.mean != null ? "平均 " + e.mean + " dB・" : ""}${e.dur} 秒）`
+      : `✗ 物音として除外（平均 ${e.mean} dB・${e.dur} 秒）`;
+    const li = document.createElement("li");
+    li.textContent = `${t} ${txt}`;
+    micLog.prepend(li);
+    while (micLog.children.length > 4) micLog.lastChild.remove();
+  }
+  drawMeter();
+}
+
+// Room calibration: 5 s of nobody talking. Thresholds only ever go UP from the
+// conf.yaml values — a quiet room should not make her pick up people further back.
+function finishMeasure() {
+  const v = measuring.vals.filter((x) => x > 0).sort((a, b) => a - b);
+  measuring = null;
+  if (v.length < 10) { micStatus.textContent = "測定できませんでした（マイクの音が届いていません）"; return; }
+  const pct = (q) => v[Math.min(v.length - 1, Math.floor(q * v.length))];
+  const p50 = pct(0.5), p90 = pct(0.9);
+  const sustain = Math.round(Math.max(micDefaults.sustain_db ?? 0, p90 + 4));
+  const onset = Math.round(Math.max(micDefaults.onset_db ?? 0, sustain + 8, p90 + 12));
+  const mean = Math.round(Math.max(micDefaults.segment_mean_db ?? 0, p50 + 6));
+  const values = { sustain_db: Math.min(90, sustain), onset_db: Math.min(95, onset), segment_mean_db: Math.min(85, mean) };
+  send({ t: "mic-set", values });
+  micStatus.textContent = `周囲の音: ふだん ${p50.toFixed(0)} dB・大きいとき ${p90.toFixed(0)} dB → 話し始め ${values.onset_db} / 話し続け ${values.sustain_db} / 平均下限 ${values.segment_mean_db} dB に設定しました`;
+}
+
+document.getElementById("micMeasure").addEventListener("click", () => {
+  measuring = { until: performance.now() + 5000, vals: [] };
+});
+document.getElementById("micReset").addEventListener("click", () => send({ t: "mic-reset" }));
+const micShow = (on) => {
+  micEl.hidden = !on;
+  micBtn.hidden = on;
+  send({ t: "mic-monitor", on });
+  if (!on) { micHist = []; measuring = null; ime.focus({ preventScroll: true }); }
+};
+micBtn.addEventListener("click", () => micShow(true));
+document.getElementById("micClose").addEventListener("click", () => micShow(false));
+
+// The button shows only while someone is using the mouse/touch.
+let idleTimer = 0;
+const wakeUi = () => { document.body.classList.remove("idle"); clearTimeout(idleTimer); idleTimer = setTimeout(() => document.body.classList.add("idle"), 3000); };
+for (const ev of ["pointermove", "pointerdown", "touchstart"]) addEventListener(ev, wakeUi, { passive: true });
+wakeUi();
+
+connect();
+</script>
+</body>
+</html>

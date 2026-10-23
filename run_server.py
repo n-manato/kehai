@@ -384,7 +384,7 @@ def run(console_log_level: str, auto_sovits: bool = True):
     logger.info(
         f"Starting server on {scheme}://{server_config.host}:{server_config.port}"
     )
-    uvicorn.run(
+    main_config = uvicorn.Config(
         app=server.app,
         host=server_config.host,
         port=server_config.port,
@@ -396,6 +396,43 @@ def run(console_log_level: str, auto_sovits: bool = True):
         timeout_graceful_shutdown=5,
         **ssl_kwargs,
     )
+
+    # A second, HTTPS-only listener for LAN devices (the PROTO on its own cable).
+    # The main port stays plain http for the reasons in conf.yaml, but a device
+    # reaching it by LAN IP is not a secure context, so its browser hides the
+    # microphone. The cert lives OUTSIDE cache/ (clean_cache() deletes that on
+    # every exit), so the device accepts the warning once, not on every start.
+    extra_port = os.getenv("LAN_HTTPS_PORT", "")
+    if not extra_port or ssl_kwargs:
+        uvicorn.Server(main_config).run()
+        return
+    from src.kehai.ssl_utils import ensure_self_signed_cert
+
+    lan_ips = tuple(ip for ip in os.getenv("LAN_HTTPS_IPS", "").split(",") if ip)
+    certfile, keyfile = ensure_self_signed_cert("certs/lan/cert.pem", "certs/lan/key.pem", lan_ips)
+    lan_config = uvicorn.Config(
+        app=server.app,
+        host=server_config.host,
+        port=int(extra_port),
+        log_level=console_log_level.lower(),
+        timeout_graceful_shutdown=5,
+        lifespan="off",  # the main listener already ran the app's startup
+        ssl_certfile=certfile,
+        ssl_keyfile=keyfile,
+    )
+    logger.info(f"Also serving https://{server_config.host}:{extra_port} (LAN devices)")
+
+    async def serve_both():
+        servers = [uvicorn.Server(main_config), uvicorn.Server(lan_config)]
+        tasks = [asyncio.create_task(s.serve()) for s in servers]
+        # Each server installs its own signal handlers, so only one of them
+        # hears Ctrl+C / SIGTERM — when either stops, stop the other.
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for s in servers:
+            s.should_exit = True
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(serve_both())
 
 
 if __name__ == "__main__":

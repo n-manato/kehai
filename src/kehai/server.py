@@ -16,6 +16,7 @@ from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
 from .routes import init_client_ws_route, init_webtool_routes, init_proxy_route
 from .motion_routes import init_motion_routes
+from .render_stream import init_render_routes
 from .service_context import ServiceContext
 from .config_manager.utils import Config
 
@@ -139,6 +140,8 @@ class WebSocketServer:
         # Same-origin proxy to the remote HY-Motion gateway (PC-B). Registered
         # before the catch-all "/" frontend mount so /motion/* resolves here.
         self.app.include_router(init_motion_routes())
+        # Server-side rendering: /render-view + the two /render-stream sockets.
+        self.app.include_router(init_render_routes())
         # Continuously (re)generate a fresh per-emotion motion buffer on the live
         # event loop (no-op when no gateway key is configured).
         from . import motion_cache

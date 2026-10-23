@@ -1,3 +1,6 @@
+// First: in render-host mode it patches audio output and getUserMedia, which must
+// happen before anything else wires a node or opens a mic.
+import './utils/render-source';
 import { createRoot } from 'react-dom/client';
 import './index.css';
 import App from './App';
