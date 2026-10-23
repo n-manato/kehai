@@ -291,6 +291,11 @@ class _Hub:
             self.face_ms += (time.perf_counter() - t0) * 1000
             self.face_frames += 1
             self.face_count = len(result["faces"])
+            attn = face_detect.ATTENTION.record(result["faces"])
+            if face_detect.ADDRESSEE:
+                # Per-frame verdict for the render tab's barge-in check, so it
+                # judges on exactly the frames the turn will be judged on.
+                result["attn"] = attn
             await self.send_source(json.dumps({"t": "faces", **result}))
         except Exception as err:
             logger.debug(f"[faces] frame skipped: {err}")

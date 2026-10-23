@@ -43,6 +43,7 @@ export LLM_CTX_MAX=24576
 export MOTION_GATEWAY_KEY="$(cat .motion_gateway_key 2>/dev/null || echo)"  # gateway bearer key (also used by gsv_stream.py)
 export ELEVENLABS_API_KEY="$(cat .elevenlabs_key 2>/dev/null || echo)"      # asr/elevenlabs_asr.py (shadow challenger)
 export BACKCHANNEL="${BACKCHANNEL:-1}"   # 相槌 on turn end (utils/backchannel.py); 0 = off
+export ADDRESSEE="${ADDRESSEE:-1}"       # answer only speech said while someone faces the PROTO camera (face_detect.py); 0 = off
 export LAN_HTTPS_PORT="${LAN_HTTPS_PORT:-12443}"  # https for LAN devices (PROTO cable) so the mic works; "" = off
 export LAN_HTTPS_IPS="${LAN_HTTPS_IPS:-192.168.50.1}"  # PROTO-only LAN (enp179s0f1); goes into the cert
 

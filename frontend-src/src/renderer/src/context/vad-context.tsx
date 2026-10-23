@@ -14,6 +14,7 @@ import { SubtitleContext } from './subtitle-context';
 import { AiStateContext, AiState } from './ai-state-context';
 import { useLocalStorage } from '@/hooks/utils/use-local-storage';
 import { toaster } from '@/components/ui/toaster';
+import { headTracker } from '@/utils/space/head-tracker';
 
 /**
  * VAD settings configuration interface
@@ -181,6 +182,15 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
   const setAiStateRef = useRef(setAiState);
 
   const isProcessingRef = useRef(false);
+  /** performance.now() when the current utterance started, for the addressee check. */
+  const speechStartRef = useRef(0);
+  /**
+   * The current utterance is not to her: visitors talking among themselves
+   * near the PROTO (nobody facing it — headTracker.addressed). It must not
+   * interrupt her or move the conversation state; the server ignores the
+   * turn on the same evidence.
+   */
+  const asideRef = useRef(false);
 
   // Update refs when dependencies change
   useEffect(() => {
@@ -235,6 +245,8 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
     // Save current AI state but DON'T change to listening yet
     previousAiStateRef.current = aiStateRef.current;
     isProcessingRef.current = true;
+    speechStartRef.current = performance.now();
+    asideRef.current = false;
     // Duck the AI's streaming voice IMMEDIATELY (before speech is even
     // confirmed) so speaker echo doesn't feed back into the VAD during the
     // confirmation window; restored on misfire. A confirmed barge-in stops the
@@ -248,6 +260,15 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
    * Handle real speech start event (confirmed speech)
    */
   const handleSpeechRealStart = useCallback(() => {
+    if (headTracker.addressed(speechStartRef.current) === false) {
+      // Speech nearby, but nobody facing her: not a barge-in. Give her voice
+      // back its volume too — the duck was only for the confirmation window.
+      console.log('Real speech confirmed, but not to her (nobody facing) - not interrupting');
+      asideRef.current = true;
+      duckStreamingAudio(false);
+      webrtcAudio.duck(false);
+      return;
+    }
     console.log('Real speech confirmed - checking if need to interrupt');
     // Check if we need to interrupt based on the PREVIOUS state (before speech started)
     if (previousAiStateRef.current === 'thinking-speaking') {
@@ -288,7 +309,18 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
     console.log('Speech ended');
     duckStreamingAudio(false); // restore volume (no-op if the stream was interrupted)
     webrtcAudio.duck(false);
-    audioTaskQueue.clearQueue();
+    // Re-judged over the whole utterance: someone may have turned to her
+    // mid-sentence, and the server decides on the full span too.
+    const aside = asideRef.current && headTracker.addressed(speechStartRef.current) === false;
+    // Became addressed after all: the server is about to answer it, so this is
+    // the barge-in that was held back at the start.
+    if (asideRef.current && !aside && previousAiStateRef.current === 'thinking-speaking') {
+      interruptRef.current();
+    }
+    asideRef.current = false;
+    // An aside leaves her reply alone: clearing the queue here would drop the
+    // rest of what she is saying.
+    if (!aside) audioTaskQueue.clearQueue();
 
     // CONTINUOUS-mic modes (server-side VAD or the WebRTC track) must NEVER
     // stop the mic on speech end — the whole design is an always-open mic with
@@ -307,11 +339,12 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
     // Server-VAD mode: frames were already streamed; the backend's VAD decides
     // the turn end and triggers the conversation itself. Only the legacy batch
     // path sends the whole utterance here.
-    if (!serverVadRef.current) {
+    if (!serverVadRef.current && !aside) {
       sendAudioPartitionRef.current(audio);
     }
     isProcessingRef.current = false;
-    setAiStateRef.current("thinking-speaking");
+    // Not a turn: whatever state the conversation is in stays as it is.
+    if (!aside) setAiStateRef.current("thinking-speaking");
   }, []);
 
   /**

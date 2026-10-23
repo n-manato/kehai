@@ -28,6 +28,7 @@ from .config_manager.utils import scan_config_alts_directory, scan_bg_directory
 from .realtime import webrtc_manager, ws_opus
 from .utils.turn_timing import turn_timing
 from .conversations import speculative
+from . import face_detect
 from .conversations.conversation_handler import (
     handle_conversation_trigger,
     handle_group_interrupt,
@@ -58,6 +59,11 @@ _VAD_GRACE_S = 0.8
 # Speculative replies (conversations/speculative.py): start the reply on the
 # segment pause, publish it on the endpoint. SPECULATE=0 turns it off.
 _SPECULATE = os.getenv("SPECULATE", "1") == "1"
+# Addressee check (face_detect.ATTENTION): a turn is answered only if someone
+# near the PROTO was facing it while it was spoken. Judged from camera frames
+# already seen, so it adds nothing to the reply time; with no camera it never
+# drops a turn. ADDRESSEE=0 turns it off (read in face_detect, which also tells
+# the render tab, so barge-in follows the same switch).
 # ADAPTIVE ENDPOINT tiers (paired with the shortened hard endpoint, ~0.45s):
 # a transcript that clearly ENDS (。!? or a sentence-final form) fires right at
 # the short endpoint; an AMBIGUOUS one waits this much longer (≈ the old 0.77s
@@ -293,6 +299,9 @@ class WebSocketHandler:
         # remembers the value at its segment close; if it moved while the ASR
         # ran, the user is already talking again and the reply would be stale.
         self.speech_epoch: Dict[str, int] = {}
+        # Monotonic time the current utterance began (IDLE->ACTIVE), for the
+        # addressee check. A held mid-thought turn keeps its original start.
+        self.turn_started: Dict[str, float] = {}
         # MIC LIVENESS. The WebRTC mic track can stop delivering media while the peer
         # still reports connectionState 'connected' — every signal the BROWSER can see
         # still looks healthy, so its own disconnected/failed self-heal never fires and
@@ -956,6 +965,13 @@ class WebSocketHandler:
                 # can't leak into this turn's transcript. Barge-in interruption
                 # stays client-driven (its own VAD already interrupts).
                 self.segment_asr_tasks.pop(client_uid, None)
+                now = time.monotonic()
+                if client_uid not in self.pending_vad_transcript:
+                    self.turn_started[client_uid] = now
+                # Visitors talking among themselves while she speaks must not
+                # strip the gestures off the rest of her reply. (Unjudged —
+                # no camera — cancels as before.)
+                aside = face_detect.ADDRESSEE and face_detect.ATTENTION.judge(now, now)[0] is False
                 # Free PC-B GPU1 for THIS turn's ASR + TTS: the previous reply's
                 # in-flight motion generations are obsolete the moment the user
                 # starts talking, but were measured still draining (queued
@@ -965,7 +981,8 @@ class WebSocketHandler:
                 try:
                     from . import motion_cache  # lazy: optional subsystem
 
-                    motion_cache.cancel_all()
+                    if not aside:
+                        motion_cache.cancel_all()
                 except Exception:  # noqa: BLE001 — never break the VAD path
                     pass
                 # Semantic endpointing: the user resumed while an incomplete
@@ -1096,6 +1113,25 @@ class WebSocketHandler:
             return  # WebRTC audio goes out on the track, around the gate
         if self.speech_epoch.get(client_uid, 0) != epoch:
             logger.debug("[spec] skip: the user resumed speaking during the ASR")
+            return
+        # Starting a reply supersedes the running one (handle_conversation_trigger
+        # cancels it), so a speculation on visitors talking among themselves
+        # would cut her off mid-answer before the endpoint could ignore them.
+        # Only while she is answering: with nothing running, speculating costs
+        # nothing and keeps the reply fast if the turn turns out to be for her.
+        running = self.current_conversation_tasks.get(client_uid)
+        spec_now = self.speculations.get(client_uid)
+        if (
+            face_detect.ADDRESSEE
+            and running is not None
+            and not running.done()
+            and (spec_now is None or spec_now.task is not running)
+            and face_detect.ATTENTION.judge(
+                self.turn_started.get(client_uid, time.monotonic()), time.monotonic()
+            )[0]
+            is False
+        ):
+            logger.info(f"[spec] skip: not to her, and she is still answering ({text[:40]!r})")
             return
         async with self._spec_lock(client_uid):
             if self.speech_epoch.get(client_uid, 0) != epoch:
@@ -1245,6 +1281,18 @@ class WebSocketHandler:
             finally:
                 self.vad_grace_tasks.pop(client_uid, None)
             text = self.pending_vad_transcript.pop(client_uid, text)
+        # Speech among the visitors rather than to her: drop it like noise. The
+        # speculation already running for it is rolled back by
+        # _finalize_and_settle; one that IS addressed is untouched.
+        if face_detect.ADDRESSEE:
+            addressed, why = face_detect.ATTENTION.judge(
+                self.turn_started.get(client_uid, time.monotonic()), time.monotonic()
+            )
+            if addressed is False:
+                logger.info(f"[addressee] not to her ({why}) — ignored: {text!r}")
+                await self._release_dropped_turn(websocket)
+                return
+            logger.info(f"[addressee] {'to her' if addressed else 'unjudged'} ({why})")
         turn_timing.mark("asr_done")
         # (The 相槌 is sent just before the reply starts — _send_backchannel,
         # opt-in via BACKCHANNEL=1; it was removed once by request, then asked for again.)

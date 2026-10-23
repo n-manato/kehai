@@ -62,6 +62,8 @@ export interface ServerFaces {
   w: number;
   h: number;
   faces: { s: number; box: [number, number, number, number]; eyes: [[number, number], [number, number]] }[];
+  /** Someone near the PROTO was facing it in this frame. Absent = addressee check off. */
+  attn?: boolean;
 }
 
 type Pose = { x: number; y: number; z: number; yaw: number; pitch: number; roll: number };
@@ -76,6 +78,12 @@ const SAME_PERSON_M = 0.5;
 const FOCUS_MEMORY_S = 1.0;
 /** Seconds without a server result before the server source counts as gone. */
 const SERVER_STALE_S = 2.0;
+/**
+ * Barge-in addressee check — mirrors face_detect.Attention (LEAD_S, MIN_FRAC)
+ * so a speaker she lets interrupt her is one the server will then answer.
+ */
+const ADDRESS_LEAD_MS = 1000;
+const ADDRESS_MIN_FRAC = 0.3;
 
 class HeadTracker {
   private video: HTMLVideoElement | null = null;
@@ -123,6 +131,9 @@ class HeadTracker {
   private serverAt = 0;
 
   private serverFrame = "";
+
+  /** Per server frame: was someone near facing her (see ServerFaces.attn). */
+  private attn: { t: number; on: boolean }[] = [];
 
   /** The live camera element, for the debug preview. */
   getVideo(): HTMLVideoElement | null {
@@ -391,6 +402,10 @@ class HeadTracker {
     const nowMs = performance.now();
     this.serverAt = nowMs;
     this.serverFrame = `${msg.w}x${msg.h} (server)`;
+    if (typeof msg.attn === "boolean") {
+      this.attn.push({ t: nowMs, on: msg.attn });
+      while (this.attn.length && nowMs - this.attn[0].t > 10_000) this.attn.shift();
+    }
     const faces: TrackedFace[] = (msg.faces ?? []).map((f) => ({
       score: f.s,
       box: { x: f.box[0], y: f.box[1], w: f.box[2], h: f.box[3] },
@@ -399,6 +414,22 @@ class HeadTracker {
       eyeSpanM: SPACE.pupilSpanM,
     }));
     this.consume(faces, msg.w, msg.h, nowMs);
+  }
+
+  /**
+   * Was speech that began at `sinceMs` (performance.now()) said TO her — did
+   * someone near the PROTO face it for enough of [since - lead, now]?
+   *
+   * null = nothing to judge by (no server faces, check switched off, camera
+   * stale): the caller does what it always did. Same window and threshold the
+   * server applies to the finished turn, so the two agree.
+   */
+  addressed(sinceMs: number, nowMs = performance.now()): boolean | null {
+    const last = this.attn[this.attn.length - 1];
+    if (!last || nowMs - last.t > 1500) return null;
+    const win = this.attn.filter((a) => a.t >= sinceMs - ADDRESS_LEAD_MS && a.t <= nowMs);
+    if (win.length < 3) return null;
+    return win.filter((a) => a.on).length / win.length >= ADDRESS_MIN_FRAC;
   }
 
   private consume(faces: TrackedFace[], frameW: number, frameH: number, nowMs: number) {

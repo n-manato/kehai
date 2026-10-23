@@ -18,8 +18,18 @@ camera JPEGs already pass through this server (render_stream.py), so only the
 face list goes on to the render tab.
 
 Model: face_detection_yunet_2023mar.onnx, vendored beside this file (230 KB).
+
+It also keeps `ATTENTION`: frame by frame, whether someone near the PROTO is
+facing it. The voice turn reads that back for the span of the utterance to tell
+speech meant for her from people talking among themselves
+(websocket_handler._finalize_vad_turn) — a lookup into frames already seen, so it
+costs the reply nothing.
 """
 
+import math
+import os
+import time
+from collections import deque
 from pathlib import Path
 
 import av
@@ -29,6 +39,21 @@ from loguru import logger
 MODEL = Path(__file__).with_name("face_detection_yunet_2023mar.onnx")
 SIZE = 640  # the model's fixed input: 640x640
 STRIDES = (8, 16, 32)
+
+# Facing = the nose sits near the midline between the eyes. Measured as
+# (nose-to-left-eye - nose-to-right-eye) / their sum on photos of known pose:
+# frontal 0.03-0.17, ~25-32 degrees turned 0.36-0.47. 0.30 is ~20 degrees.
+# (The eyes themselves are a few pixels at this range; head pose is what a
+# 640x360 frame can actually see, and people turn their head to whoever they
+# are talking to.)
+FACING_ASYM = float(os.getenv("FACE_FACING_ASYM", "0.30"))
+# For the distance estimate: the camera's horizontal FOV (same assumption as the
+# frontend's headCamFovDeg) and the average adult pupil distance.
+HFOV_DEG = float(os.getenv("FACE_HFOV_DEG", "60"))
+IPD_M = 0.063
+# Addressee check on (websocket_handler gates turns, the render tab gates
+# barge-in on the per-frame `attn` it is sent). ADDRESSEE=0 turns both off.
+ADDRESSEE = os.getenv("ADDRESSEE", "1") == "1"
 
 
 class FaceDetector:
@@ -83,6 +108,7 @@ class FaceDetector:
                             [float((c + kp[0]) * s), float((r + kp[1]) * s)],
                             [float((c + kp[2]) * s), float((r + kp[3]) * s)],
                         ],
+                        float((c + kp[4]) * s),  # nose x
                     )
                 )
 
@@ -93,18 +119,24 @@ class FaceDetector:
             if all(_iou(f[1], g[1]) < 0.3 for g in kept):
                 kept.append(f)
 
-        return {
-            "w": w,
-            "h": h,
-            "faces": [
+        focal = sw / (2 * math.tan(math.radians(HFOV_DEG) / 2))
+        faces = []
+        for score, box, eyes, nose_x in kept:
+            (ax, ay), (bx, by) = sorted(eyes)  # left, right in the image
+            eye_px = max(math.hypot(bx - ax, by - ay), 1.0)
+            # Signed: past either eye (|yaw| > 1) is a profile.
+            yaw = ((nose_x - ax) - (bx - nose_x)) / max(bx - ax, 1.0)
+            faces.append(
                 {
                     "s": round(score, 3),
                     "box": [box[0] / sw, box[1] / sh, box[2] / sw, box[3] / sh],
                     "eyes": [[x / sw, y / sh] for x, y in eyes],
+                    "yaw": round(yaw, 2),
+                    "facing": abs(yaw) < FACING_ASYM,
+                    "d": round(IPD_M * focal / eye_px, 2),
                 }
-                for score, box, eyes in kept
-            ],
-        }
+            )
+        return {"w": w, "h": h, "faces": faces}
 
 
 def _iou(a: list[float], b: list[float]) -> float:
@@ -112,6 +144,61 @@ def _iou(a: list[float], b: list[float]) -> float:
     iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
     inter = ix * iy
     return inter / (a[2] * a[3] + b[2] * b[3] - inter + 1e-9)
+
+
+class Attention:
+    """Whether someone near the PROTO is facing it, per camera frame.
+
+    One camera, one log: the PROTO install has a single viewer camera, so this
+    is process-wide rather than per client.
+    """
+
+    # Only people this close count — further away they are passing, not talking.
+    MAX_M = float(os.getenv("ADDRESSEE_MAX_M", "3.0"))
+    # Fraction of the utterance's frames with someone facing her.
+    # (The render tab's barge-in check mirrors these two: head-tracker.ts.)
+    MIN_FRAC = float(os.getenv("ADDRESSEE_MIN_FRAC", "0.3"))
+    # People look, then speak: the window opens this long before the speech.
+    LEAD_S = 1.0
+
+    def __init__(self, keep_s: float = 60.0):
+        self.keep_s = keep_s
+        # (monotonic time, someone near is facing, nearest distance or None)
+        self.frames: deque[tuple[float, bool, float | None]] = deque()
+
+    def record(self, faces: list[dict]) -> bool:
+        """Log one frame; returns whether someone near was facing her in it."""
+        now = time.monotonic()
+        near = [f for f in faces if f["d"] <= self.MAX_M]
+        facing = any(f["facing"] for f in near)
+        self.frames.append((now, facing, min((f["d"] for f in near), default=None)))
+        while self.frames and now - self.frames[0][0] > self.keep_s:
+            self.frames.popleft()
+        return facing
+
+    def judge(self, t0: float, t1: float) -> tuple[bool | None, str]:
+        """Was the speech between t0 and t1 (monotonic) addressed to her?
+
+        None = no camera to judge by (not running, or stale): the caller
+        answers as it always did. Fails OPEN on purpose — a reply nobody asked
+        for is a small embarrassment, ignoring someone who did is not.
+        """
+        if not self.frames or t1 - self.frames[-1][0] > 1.5:
+            return None, "no camera"
+        win = [f for f in self.frames if t0 - self.LEAD_S <= f[0] <= t1]
+        if len(win) < 3:
+            return None, f"only {len(win)} camera frames"
+        facing = sum(1 for f in win if f[1])
+        near = [f[2] for f in win if f[2] is not None]
+        detail = f"facing {facing}/{len(win)} frames, " + (
+            f"nearest {min(near):.1f} m"
+            if near
+            else f"nobody within {self.MAX_M:.1f} m"
+        )
+        return facing / len(win) >= self.MIN_FRAC, detail
+
+
+ATTENTION = Attention()
 
 
 def load() -> FaceDetector | None:
