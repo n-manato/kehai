@@ -38,6 +38,7 @@ export const useInterrupt = () => {
     audioTaskQueue.clearQueue();
 
     setAiState('interrupted');
+    window.dispatchEvent(new CustomEvent('kehai-turn', { detail: 'end' }));
 
     if (sendSignal) {
       sendMessage({

@@ -127,6 +127,13 @@ class HeadTracker {
   /** When a clearly closer face first appeared; 0 = no challenger. */
   private challengerSince = 0;
 
+  /**
+   * Bumped each time she starts attending to someone else: "new" = nobody was
+   * attended a moment ago, "switch" = the closest person changed. The viewer turns
+   * it into a noticing reaction (eyes first, then the head, a nod).
+   */
+  private focusChange = { seq: 0, kind: "new" as "new" | "switch", z: 0 };
+
   /** performance.now() of the last server result; 0 = never. */
   private serverAt = 0;
 
@@ -150,6 +157,10 @@ class HeadTracker {
     return this.allFaces;
   }
 
+  /** The latest change of who she attends to (see focusChange). */
+  focusEvent(): Readonly<{ seq: number; kind: "new" | "switch"; z: number }> {
+    return this.focusChange;
+  }
 
   /** Faces are arriving from the server (the PROTO path) rather than this tracker. */
   private serverLive() {
@@ -503,6 +514,9 @@ class HeadTracker {
       else this.challengerSince = 0;
     }
 
+    // Nobody re-found = someone new (or someone back after FOCUS_MEMORY_S away).
+    const kind = !held ? "new" : chosen !== held ? "switch" : null;
+    if (kind) this.focusChange = { seq: this.focusChange.seq + 1, kind, z: chosen.pose.z };
     this.focus = { x: chosen.pose.x, z: chosen.pose.z, t };
     return chosen;
   }

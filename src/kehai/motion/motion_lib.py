@@ -352,6 +352,12 @@ _IDLE_WEIGHT = {  # unlisted -> 1
 # own gets (and what the pre-split active.json migrates into).
 _active_default: list[str] = []
 _active_by_conf: dict[str, list[str]] = {}
+# A second rotation per character for while someone is IN FRONT of her (the PROTO
+# camera is tracking a person; the frontend asks with ?engaged=1). Attention reads
+# as the body staying quiet with the face on that person, and most idle clips turn
+# the head or the hips away; this set holds the ones that do not. A character
+# without one plays its normal rotation either way.
+_engaged_by_conf: dict[str, list[str]] = {}
 # Never-twice-in-a-row is also per character, or switching models would suppress the
 # first clip of the new one for no reason.
 _idle_last: dict[str, str] = {}
@@ -375,7 +381,13 @@ def _save_active() -> None:
     try:
         with open(_ACTIVE_FILE, "w") as f:
             json.dump(
-                {"default": _active_default, "by_conf": _active_by_conf}, f, indent=1
+                {
+                    "default": _active_default,
+                    "by_conf": _active_by_conf,
+                    "engaged_by_conf": _engaged_by_conf,
+                },
+                f,
+                indent=1,
             )
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[motion_lib] could not save active idle set: {e}")
@@ -492,16 +504,25 @@ def get_idle(key: str) -> tuple[str, dict] | None:
     return (k, _idle_payload(k)) if k in _idle else None
 
 
-def random_idle(conf: str | None = None) -> tuple[str, dict] | None:
+def engaged_keys(conf: str | None = None) -> list[str]:
+    """The rotation for while someone is in front of her; empty = none of its own."""
+    return [k for k in _engaged_by_conf.get(_conf(conf), []) if k in _idle]
+
+
+def random_idle(conf: str | None = None, engaged: bool = False) -> tuple[str, dict] | None:
     """A weighted-random clip from this character's ACTIVE rotation, never twice in a
     row. An OWN set that is empty means "this character has no idle clips" and returns
     None — only the shared default falls back to the whole catalog, which is the
-    pre-split behaviour for characters that never had a set."""
+    pre-split behaviour for characters that never had a set. `engaged` picks from the
+    character's someone-is-here set when it has one (see _engaged_by_conf)."""
     import random
 
     c = _conf(conf)
     own = _active_by_conf.get(c)
-    if own is not None:
+    attending = engaged_keys(conf) if engaged else []
+    if attending:
+        pool = attending
+    elif own is not None:
         pool = [k for k in own if k in _idle]
     else:
         pool = [k for k in _active_default if k in _idle] or list(_idle)
@@ -528,9 +549,10 @@ def _load_idle() -> None:
                 _idle_stats[key] = _measure(d)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[motion_lib] failed to load idle {fn}: {e}")
-    global _active_default, _active_by_conf
+    global _active_default, _active_by_conf, _engaged_by_conf
     saved: list[str] = []
     by_conf: dict[str, list[str]] = {}
+    engaged: dict[str, list[str]] = {}
     if os.path.isfile(_ACTIVE_FILE):
         try:
             with open(_ACTIVE_FILE, "r") as f:
@@ -543,6 +565,10 @@ def _load_idle() -> None:
                 str(k): [str(x).lower() for x in (v or [])]
                 for k, v in (raw.get("by_conf") or {}).items()
             }
+            engaged = {
+                str(k): [str(x).lower() for x in (v or [])]
+                for k, v in (raw.get("engaged_by_conf") or {}).items()
+            }
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[motion_lib] could not read active idle set: {e}")
     _active_default = [k for k in (saved or _DEFAULT_ACTIVE) if k in _idle]
@@ -550,6 +576,7 @@ def _load_idle() -> None:
     # an empty list rather than deleted: "this character plays no idle clips" is a
     # real choice and must survive a restart.
     _active_by_conf = {c: [k for k in ks if k in _idle] for c, ks in by_conf.items()}
+    _engaged_by_conf = {c: [k for k in ks if k in _idle] for c, ks in engaged.items()}
     if _idle:
         logger.info(
             f"[motion_lib] idle catalog {len(_idle)} clips, default rotation "
@@ -558,6 +585,8 @@ def _load_idle() -> None:
         )
         for c, ks in _active_by_conf.items():
             logger.info(f"[motion_lib] idle rotation for {c}: {len(ks)} clips")
+        for c, ks in _engaged_by_conf.items():
+            logger.info(f"[motion_lib] engaged idle rotation for {c}: {', '.join(ks)}")
 
 
 def _load_bridge() -> None:

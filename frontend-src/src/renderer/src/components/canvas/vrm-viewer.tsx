@@ -48,7 +48,7 @@ import { diagnoseHeadTracking, headTracker, setupHeadTracking, type ServerFaces 
 import { calibrateHeadDistance, hidePanelCalibration, showPanelCalibration } from "@/utils/space/calibrate";
 import { hideSpaceHud, showSpaceHud } from "@/utils/space/space-hud";
 import { hideHeadPreview, showHeadPreview } from "@/utils/space/head-preview";
-import { applyViewerLookAt, resetViewerLookAt } from "@/utils/space/look-at-viewer";
+import { applyViewerLookAt, resetViewerLookAt, undoViewerLookAt } from "@/utils/space/look-at-viewer";
 import { useAiState } from "@/context/ai-state-context";
 
 /** Materials hidden on load, by material name. Empty by default.
@@ -3032,14 +3032,116 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     };
     const gazeTarget = new THREE.Object3D();
 
-    // What she attends to: the camera, or — while the PROTO's camera tracks
-    // someone — that person's head, blended by the same hand-over the camera
-    // follow uses. Updated per frame before the head turn and the gaze read it.
+    // --- Attention: noticing someone, and looking away to think ----------------
+    // What people do when they notice someone: the eyes get there first, the head
+    // follows, then a small nod (and, for someone who just walked up, a light
+    // smile). And while working out a reply they look away, up and to one side,
+    // and come back as they start to speak, rather than staring through the whole
+    // turn. Live: __attend({ ... }); __notice("new" | "switch") to see one.
+    const ATTEND = {
+      nodDeg: 8,         // for someone new; a switch between people gets 0.6x
+      nodDelay: 0.35,    // s after noticing — the head is mostly round by then
+      nodDur: 0.7,       // s, down and back up
+      smileS: 1.6,       // s of a light smile for someone new (never mid-turn)
+      cooldown: 5,       // s between reactions, so detection flicker cannot spam nods
+      maxDistM: 3.5,     // further away is passing by, not arriving
+      avertYawDeg: 25,   // where her eyes go while she thinks
+      avertPitchDeg: 8,
+      avertHead: 0.4,    // share of that the head joins in
+      avertBackMin: 0.5, // s into her speech before she looks back
+      avertBackMax: 1.1,
+      avertMax: 4,       // s: a long think still comes back
+    };
+    let focusSeen = headTracker.focusEvent().seq;
+    let noticeAt = -1e9;
+    let noticeNew = false;
+    let smiled = false;
+    let turnLive = false; // a reply is under way (kehai-turn events)
+    let speakSeen = false;
+    let avertUntil = 0;
+    let avertSide = 1;
+    const onTurn = (e: Event) => {
+      const kind = (e as CustomEvent).detail;
+      const t = aiDebug.now() / 1000;
+      if (kind === "think") {
+        turnLive = true;
+        speakSeen = false;
+        avertSide = aiDebug.random() < 0.5 ? -1 : 1;
+        avertUntil = t + ATTEND.avertMax;
+      } else if (kind === "speak") {
+        turnLive = true;
+        if (!speakSeen) { // her first sentence: look back shortly after it starts
+          speakSeen = true;
+          avertUntil = Math.min(
+            avertUntil,
+            t + ATTEND.avertBackMin + aiDebug.random() * (ATTEND.avertBackMax - ATTEND.avertBackMin),
+          );
+        }
+      } else if (kind === "end") {
+        turnLive = false;
+        avertUntil = 0;
+      }
+    };
+    window.addEventListener("kehai-turn", onTurn);
+    const notice = (isNew: boolean, t: number) => {
+      noticeAt = t;
+      noticeNew = isNew;
+      if (isNew && !turnLive) {
+        vrmExpression.playEmotion("joy_smile");
+        smiled = true;
+      }
+    };
+    (window as any).__attend = (patch?: Partial<typeof ATTEND>) => {
+      if (patch) Object.assign(ATTEND, patch);
+      return { ...ATTEND, turnLive, averting: aiDebug.now() / 1000 < avertUntil };
+    };
+    (window as any).__notice = (kind: "new" | "switch" = "new") => {
+      notice(kind === "new", aiDebug.now() / 1000);
+      return `noticed (${kind})`;
+    };
+
+    // Where the EYES aim (attendPoint) and where the HEAD turns (headPoint): the
+    // camera, or — while the PROTO's camera tracks someone — that person's head,
+    // blended by the camera follow's hand-over; plus the thinking look-away.
     const attendPoint = new THREE.Vector3();
+    const headPoint = new THREE.Vector3();
     const attendViewer = new THREE.Vector3();
-    const updateAttendPoint = () => {
+    const attendHead = new THREE.Vector3();
+    const avertOff = new THREE.Vector3();
+    /** Per frame, before the head turn and the gaze read the points. Returns the nod (rad). */
+    const updateAttend = (v: VRM): number => {
+      const t = aiDebug.now() / 1000;
+      const fe = headTracker.focusEvent();
+      if (fe.seq !== focusSeen) {
+        focusSeen = fe.seq;
+        if (t - noticeAt > ATTEND.cooldown && fe.z <= ATTEND.maxDistM) notice(fe.kind === "new", t);
+      }
+      if (smiled && (turnLive || t - noticeAt > ATTEND.smileS)) {
+        if (!turnLive) vrmExpression.relax(); // a reply's own emotion is left alone
+        smiled = false;
+      }
+      // Eyes jump to the person the moment she notices them; the head only
+      // comes round with the follow hand-over (~0.8 s) and the turn's easing.
+      const eyesW = t - noticeAt < 1 && viewerTransform.isTracking() ? 1 : headFollow.weight;
       attendPoint.copy(camera.position);
-      if (headFollow.weight > 0) attendPoint.lerp(viewerWorld(attendViewer), headFollow.weight);
+      if (eyesW > 0) attendPoint.lerp(viewerWorld(attendViewer), eyesW);
+      headPoint.copy(camera.position);
+      if (headFollow.weight > 0) headPoint.lerp(viewerWorld(attendViewer), headFollow.weight);
+      if (t < avertUntil) {
+        const head = v.humanoid?.getNormalizedBoneNode("head");
+        const d = head ? head.getWorldPosition(attendHead).distanceTo(attendPoint) : 2;
+        avertOff.set(
+          avertSide * Math.tan(THREE.MathUtils.degToRad(ATTEND.avertYawDeg)) * d,
+          Math.tan(THREE.MathUtils.degToRad(ATTEND.avertPitchDeg)) * d,
+          0,
+        );
+        attendPoint.add(avertOff);
+        headPoint.addScaledVector(avertOff, ATTEND.avertHead);
+      }
+      // The nod: one smooth dip over its window, and not while she is mid-reply.
+      const nt = (t - noticeAt - ATTEND.nodDelay) / ATTEND.nodDur;
+      if (turnLive || nt <= 0 || nt >= 1) return 0;
+      return THREE.MathUtils.degToRad(ATTEND.nodDeg * (noticeNew ? 1 : 0.6)) * Math.sin(Math.PI * nt);
     };
     const gazeWant = new THREE.Vector3();
     const gazeTmp = new THREE.Vector3();
@@ -5111,6 +5213,12 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         // together: they write the same bones, so whichever runs last wins and the
         // result is a fight, not a blend. The gesture player has priority; the
         // mixer fills the gaps.
+        // Last frame's turn toward the viewer comes off first, so every motion layer
+        // below starts from its own pose and the turn is re-applied once, at the
+        // same strength whatever is driving the body (look-at-viewer _undo).
+        undoViewerLookAt();
+        // Someone is being attended to: quieter idles, and less of their head motion.
+        vrmMotionPlayer.attention = headFollow.weight;
         vrmMotionPlayer.update(dt); // pose from the current gesture frame
         // The mixer runs AFTER the player when the player is not driving, so the
         // held pose it would otherwise keep writing does not overwrite the idle.
@@ -5134,8 +5242,8 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         // new orientation rather than a stale one. The target is the person the
         // PROTO's camera picked (the closest one); the turn is weighted by the
         // follow hand-over, so with nobody tracked she faces front as before.
-        updateAttendPoint();
-        applyViewerLookAt(vrm, attendPoint, dt, headFollow.weight);
+        const nod = updateAttend(vrm);
+        applyViewerLookAt(vrm, headPoint, dt, headFollow.weight, nod);
         updateGaze(dt, vrm); // move the gaze target; vrm.update() applies it to the eyes
         // Sub-step the spring/constraint update at a FIXED ~240Hz. With a variable/coarse
         // frame timestep (e.g. 60fps -> 16ms) the spring integration oscillates = the hair
@@ -5379,6 +5487,9 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       delete (window as any).__viewerPose;
       delete (window as any).__offAxis;
       delete (window as any).__follow;
+      window.removeEventListener("kehai-turn", onTurn);
+      delete (window as any).__attend;
+      delete (window as any).__notice;
       delete (window as any).__headIngest;
       delete (window as any).__headCalibrate;
       delete (window as any).__protoCalibrate;

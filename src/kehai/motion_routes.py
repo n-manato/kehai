@@ -191,20 +191,25 @@ def init_motion_routes() -> APIRouter:
         return Response(status_code=202)
 
     @router.get("/motion/idle")
-    async def motion_idle(key: str | None = None, conf: str | None = None):
+    async def motion_idle(
+        key: str | None = None, conf: str | None = None, engaged: bool = False
+    ):
         """A random IDLE clip for the frontend to play between turns (she should look
         like she's waiting, not standing frozen). The frontend asks again when the clip
         ends, so consecutive requests give different clips. 204 if none installed.
         `?key=` pins a specific clip (debugging / auditing one animation).
         `?conf=` is the character's conf_uid — the rotation is per character, because
-        one list cannot suit both an anime Miku and a photoreal chancellor."""
+        one list cannot suit both an anime Miku and a photoreal chancellor.
+        `?engaged=1`: someone is in front of her — pick from the character's quiet
+        set (motion_lib._engaged_by_conf); the reply says whether it did."""
         from .motion import motion_lib  # lazy
 
-        got = motion_lib.get_idle(key) if key else motion_lib.random_idle(conf)
+        got = motion_lib.get_idle(key) if key else motion_lib.random_idle(conf, engaged)
         if not got:
             return Response(status_code=204)
         key, clip = got
-        return JSONResponse(content={**clip, "key": key})
+        attending = engaged and key in motion_lib.engaged_keys(conf)
+        return JSONResponse(content={**clip, "key": key, "engaged": attending})
 
     @router.get("/motion/catalog")
     async def motion_catalog(conf: str | None = None):

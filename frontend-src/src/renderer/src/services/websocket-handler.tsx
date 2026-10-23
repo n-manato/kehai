@@ -340,12 +340,15 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
         webrtcAudio.forceReconnect();
         break;
       case 'conversation-chain-start':
+        // Turn events for her gaze (vrm-viewer ATTEND): she looks away to think.
+        window.dispatchEvent(new CustomEvent('kehai-turn', { detail: 'think' }));
         setAiState('thinking-speaking');
         talkingMotionController.onThinkingStart(); // "thinking" pose until audio starts
         audioTaskQueue.clearQueue();
         clearResponse();
         break;
       case 'conversation-chain-end':
+        window.dispatchEvent(new CustomEvent('kehai-turn', { detail: 'end' }));
         if (streamPlayerRef.current) {
           // Streaming path: the audioTaskQueue isn't used. Signal end-of-stream;
           // when the buffered audio drains the player's onEnded -> finishStreamingTurn
@@ -525,6 +528,8 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
         }
         break;
       case 'audio-stream-start': {
+        // Her voice is starting (every sentence; the gaze only uses the first).
+        window.dispatchEvent(new CustomEvent('kehai-turn', { detail: 'speak' }));
         // True-TTS-streaming: first sentence of the turn creates the gapless
         // player and wires the live-RMS mouth once; every sentence sets its own
         // subtitle + facial emotion. (Co-speech gesture in streaming mode is a

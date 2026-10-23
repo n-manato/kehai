@@ -44,12 +44,40 @@ const _tmpQ = new THREE.Quaternion();
 const _part = new THREE.Quaternion();
 const _delta = new THREE.Quaternion();
 const _apply = new THREE.Quaternion();
+const _up = new THREE.Vector3(0, 1, 0);
+const _axis = new THREE.Vector3();
 
 /** Smoothed rotation currently being applied, so a state change eases in. */
 const _current = new THREE.Quaternion();
 
+/**
+ * What each chain bone held before this layer rotated it, and what it was set to.
+ *
+ * Kept so the next frame can start from the motion's OWN pose (undoViewerLookAt).
+ * Without that the correction's strength depended on the motion source: a clip
+ * that writes every bone absolutely wipes last frame's turn, so `lookAt` 0.55
+ * left 45% of the angle — measured 10 deg off a person 22 deg to the side — while
+ * the robot stance and other layers that ease from the CURRENT bone pose kept the
+ * turn and added the next on top, reaching ~100% (1 deg). Same person, same
+ * setting, a face that did or did not quite look at them depending on the idle.
+ */
+const _undo = new Map<THREE.Object3D, { pre: THREE.Quaternion; set: THREE.Quaternion }>();
+
 export function resetViewerLookAt() {
   _current.identity();
+  _undo.clear();
+}
+
+/**
+ * Put the chain back to the motion's own pose. Call at the start of the frame,
+ * before the motion player and the idle layers run. A bone something else has
+ * written since is left alone.
+ */
+export function undoViewerLookAt() {
+  _undo.forEach(({ pre, set }, node) => {
+    if (node.quaternion.angleTo(set) < 1e-5) node.quaternion.copy(pre);
+  });
+  _undo.clear();
 }
 
 /**
@@ -59,8 +87,17 @@ export function resetViewerLookAt() {
  * `weight` (0..1) scales the turn on top of `SPACE.lookAt` — the camera-follow
  * hand-over, so she turns to a person only while one is tracked and eases back
  * to facing front when they leave, instead of snapping.
+ *
+ * `nodRad` tips the head forward on top of the turn (a nod of acknowledgement),
+ * and comes off with it at the next undoViewerLookAt().
  */
-export function applyViewerLookAt(vrm: VRM, targetWorld: THREE.Vector3, dt: number, weight = 1) {
+export function applyViewerLookAt(
+  vrm: VRM,
+  targetWorld: THREE.Vector3,
+  dt: number,
+  weight = 1,
+  nodRad = 0,
+) {
   if (SPACE.lookAt <= 0.001 || !vrm.humanoid) return;
 
   const head = vrm.humanoid.getNormalizedBoneNode("head" as never) as THREE.Object3D | null;
@@ -139,6 +176,25 @@ export function applyViewerLookAt(vrm: VRM, targetWorld: THREE.Vector3, dt: numb
     // Convert the world-space delta into this bone's parent space:
     //   newLocal = inv(parentWorld) * delta * parentWorld * local
     _tmpQ.copy(_parentQ).invert().multiply(_part).multiply(_parentQ);
+    const pre = node.quaternion.clone();
     node.quaternion.premultiply(_tmpQ);
+    _undo.set(node, { pre, set: node.quaternion.clone() });
+  }
+
+  if (Math.abs(nodRad) > 1e-4 && head.parent) {
+    // About the horizontal axis across her face, so it is a nod whichever way
+    // the turn above left her looking.
+    head.getWorldQuaternion(_headQ);
+    _fwd.copy(faceFront ?? new THREE.Vector3(0, 0, 1)).applyQuaternion(_headQ);
+    _axis.crossVectors(_up, _fwd);
+    if (_axis.lengthSq() > 1e-6) {
+      _part.setFromAxisAngle(_axis.normalize(), nodRad);
+      head.parent.getWorldQuaternion(_parentQ);
+      _tmpQ.copy(_parentQ).invert().multiply(_part).multiply(_parentQ);
+      const prev = _undo.get(head);
+      const pre = prev ? prev.pre : head.quaternion.clone();
+      head.quaternion.premultiply(_tmpQ);
+      _undo.set(head, { pre, set: head.quaternion.clone() });
+    }
   }
 }

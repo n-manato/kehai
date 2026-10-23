@@ -696,7 +696,10 @@ export const SPACE = {
    * while someone is tracked (scaled by the follow hand-over), so the untracked
    * view keeps her facing front exactly as before.
    */
-  lookAt: 0.55,
+  // 0.8 (was 0.55): the head carries most of the turn and the eyes the last few
+  // degrees, as people do when they attend to someone. 0.55 was tuned when the
+  // effective strength still depended on the motion (see look-at-viewer _undo).
+  lookAt: 0.8,
   lookAtMaxYaw: 40,
   lookAtMaxPitch: 22,
   lookAtSpeed: 4.0,
@@ -982,9 +985,12 @@ export function setQualityValue(q: Quality) {
  * rev 2: camera-driven attention. lookAt 0 -> 0.55 (now gated on tracking, so
  * it no longer turns her toward the drifting camera), offAxis -> false (the
  * follow orbit replaces it), headCamOffsetY 0 -> 0.95 (PROTO camera on top).
+ *
+ * rev 3: lookAt 0.55 -> 0.8, once the correction stopped compounding on some
+ * motions and not others (look-at-viewer undoViewerLookAt).
  */
-const SPACE_REV = 2;
-const SPACE_FIX: Partial<SpaceConfig> = { taa: 1, lookAt: 0.55, offAxis: false, headCamOffsetY: 0.95 };
+const SPACE_REV = 3;
+const SPACE_FIX: Partial<SpaceConfig> = { taa: 1, lookAt: 0.8, offAxis: false, headCamOffsetY: 0.95 };
 
 export function loadSpaceConfig() {
   // The device budget goes on FIRST, so a saved blob can still override it: the
