@@ -8,6 +8,7 @@
 #                      If they stay down, check ModelRuntimeConfig.enabled in its DB.
 #   ActionPlan       — GPU1. Left on GPU0 it takes the room GestureLSM (pinned to
 #                      GPU0) needs, and the gateway answers gesture with 507 gpu_full.
+#   STT (:8000)      — GPU0. Without it the gateway returns mock transcripts.
 #   vLLM (:8807)     — needs the venv's bin on PATH: flashinfer JIT-builds with ninja.
 #   KEHAI            — last, so its warmup probes see a complete stack.
 set -u
@@ -39,6 +40,16 @@ else
   (cd "$NEXUS/stack/ActionPlan-Code" && CUDA_VISIBLE_DEVICES=1 setsid --fork nohup ./venv/bin/python \
     actionplan_service.py --port 8893 </dev/null >/tmp/ap_service.log 2>&1)
   wait_for http://127.0.0.1:8893/health 120 ActionPlan
+fi
+
+# STT sidecar (faster-whisper behind the gateway). When it is down the gateway
+# does not fail — it answers every transcription with a canned "Mock
+# transcription..." sentence, so the mic looks alive and nothing is understood.
+# GPU0: GPU1 is ~95% full with GSV/gesture/ActionPlan and large-v3 needs ~3.4 GB.
+if ok http://127.0.0.1:8000/health; then log "STT sidecar already up"; else
+  log "starting STT sidecar on GPU0"
+  (cd "$NEXUS/model-service" && CUDA_VISIBLE_DEVICES=0 setsid --fork bash -c 'exec bash run.sh </dev/null >>/tmp/model-service.log 2>&1')
+  wait_for http://127.0.0.1:8000/health 60 "STT sidecar"
 fi
 
 if ok http://127.0.0.1:8807/v1/models; then log "vLLM already up"; else

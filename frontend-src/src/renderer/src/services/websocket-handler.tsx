@@ -29,6 +29,8 @@ import { vrmExpression } from '@/utils/vrm-expression';
 import { vrmLipSync } from '@/utils/vrm-lipsync';
 import { StreamingAudioPlayer, streamingPlaybackState } from '@/utils/streaming-audio-player';
 import { WsOpusDecoder } from '@/utils/ws-opus-decoder';
+import { playBackchannel } from '@/utils/backchannel-player';
+import { isRenderSource } from '@/utils/render-source';
 import { useBrowser } from '@/context/browser-context';
 
 // Watches the first seconds of a reply and, if no sound actually happens, moves
@@ -628,9 +630,18 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
             // this lead exists to absorb is correspondingly smaller. Straight
             // 250ms off the time to first word. Tune live WITHOUT a rebuild:
             // localStorage.streamPreroll = '0.5'; reload.
+            //
+            // Render-host mode (?render=1) runs on the server box itself, so the
+            // chunks arrive over loopback with next to no jitter: 0.05s there.
+            // Measured 2026-10-22 over ~35s replies: every turn shows exactly ONE
+            // gap at 0.05, 0.1 and 0.25 alike (48 / 32-136 / 160-208ms), so that
+            // gap is not jitter and a longer lead does not cover it.
+            // The viewer's own playback worklet still absorbs the network leg.
+            // health() reports `gaps` per turn if this ever proves too tight.
             prerollSec: (() => {
               const v = parseFloat(localStorage.getItem('streamPreroll') || '');
-              return Number.isFinite(v) && v >= 0 ? v : 0.25;
+              if (Number.isFinite(v) && v >= 0) return v;
+              return isRenderSource ? 0.05 : 0.25;
             })(),
             onEnded: () => finishStreamingTurn(),
             // Opus decoding is asynchronous, so "nothing left to play" and
@@ -862,6 +873,9 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
         if (message.text) {
           appendHumanMessage(message.text);
         }
+        break;
+      case 'backchannel':
+        if (message.audio) void playBackchannel(message.audio);
         break;
       case 'error':
         toaster.create({

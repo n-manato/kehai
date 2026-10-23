@@ -27,6 +27,7 @@ from .chat_history_manager import (
 from .config_manager.utils import scan_config_alts_directory, scan_bg_directory
 from .realtime import webrtc_manager, ws_opus
 from .utils.turn_timing import turn_timing
+from .conversations import speculative
 from .conversations.conversation_handler import (
     handle_conversation_trigger,
     handle_group_interrupt,
@@ -54,6 +55,9 @@ class MessageType(Enum):
 # Grace period a mid-thought turn stays open for; resuming speech within it
 # folds the held transcript into the next turn instead of firing early.
 _VAD_GRACE_S = 0.8
+# Speculative replies (conversations/speculative.py): start the reply on the
+# segment pause, publish it on the endpoint. SPECULATE=0 turns it off.
+_SPECULATE = os.getenv("SPECULATE", "1") == "1"
 # ADAPTIVE ENDPOINT tiers (paired with the shortened hard endpoint, ~0.45s):
 # a transcript that clearly ENDS (。!? or a sentence-final form) fires right at
 # the short endpoint; an AMBIGUOUS one waits this much longer (≈ the old 0.77s
@@ -280,6 +284,15 @@ class WebSocketHandler:
         # (完結に見える途中文で VAD が切った) — the texts merge and one combined
         # reply supersedes the stale one.
         self.last_vad_turn: Dict[str, tuple] = {}
+        # Speculative reply per client, and the lock that serialises starting,
+        # confirming and discarding one: a discard rolls the history back to its
+        # checkpoint, so it must never interleave with a real turn's first writes.
+        self.speculations: Dict[str, speculative.Speculation] = {}
+        self.spec_locks: Dict[str, asyncio.Lock] = {}
+        # Bumped whenever the user starts or resumes speaking. A speculation
+        # remembers the value at its segment close; if it moved while the ASR
+        # ran, the user is already talking again and the reply would be stale.
+        self.speech_epoch: Dict[str, int] = {}
         # MIC LIVENESS. The WebRTC mic track can stop delivering media while the peer
         # still reports connectionState 'connected' — every signal the BROWSER can see
         # still looks healthy, so its own disconnected/failed self-heal never fires and
@@ -780,7 +793,8 @@ class WebSocketHandler:
             f"[audio-health] {client_uid[:8]} ctx={ctx} "
             f"buffers={data.get('buffers', '?')} secs={data.get('seconds', '?')} "
             f"rate={data.get('rate', '?')} gain={data.get('gain', '?')} "
-            f"origin={data.get('origin', '?')}{note}"
+            f"preroll={data.get('preroll', '?')} gaps={data.get('gaps', '?')}"
+            f"/{data.get('gapMs', '?')}ms@{data.get('gapAt', '?')}s origin={data.get('origin', '?')}{note}"
         )
 
     async def _handle_motion_usage(
@@ -960,6 +974,11 @@ class WebSocketHandler:
                 grace = self.vad_grace_tasks.pop(client_uid, None)
                 if grace is not None and not grace.done():
                     grace.cancel()
+                self.speech_epoch[client_uid] = self.speech_epoch.get(client_uid, 0) + 1
+                asyncio.create_task(self._drop_speculation(client_uid, "new turn"))
+            elif audio_bytes == b"<|SPEECH|>":
+                self.speech_epoch[client_uid] = self.speech_epoch.get(client_uid, 0) + 1
+                asyncio.create_task(self._drop_speculation(client_uid, "user resumed"))
             elif audio_bytes == b"<|RESUME|>":
                 pass
             elif audio_bytes.startswith(b"<|SEG|>"):
@@ -974,11 +993,18 @@ class WebSocketHandler:
                 self.segment_asr_tasks.setdefault(client_uid, []).append(
                     asyncio.create_task(context.asr_engine.async_transcribe_np(segment))
                 )
+                if _SPECULATE:
+                    asyncio.create_task(
+                        self._speculate(
+                            websocket, client_uid, list(self.segment_asr_tasks[client_uid]),
+                            self.speech_epoch.get(client_uid, 0),
+                        )
+                    )
             elif audio_bytes == b"<|TURN_END|>":
                 tasks = self.segment_asr_tasks.pop(client_uid, [])
                 if tasks:
                     asyncio.create_task(
-                        self._finalize_vad_turn(websocket, client_uid, tasks)
+                        self._finalize_and_settle(websocket, client_uid, tasks)
                     )
 
     def _resume_latest_history(self, context: ServiceContext) -> None:
@@ -1021,6 +1047,126 @@ class WebSocketHandler:
             )
         except Exception as e:  # noqa: BLE001 — client may already be gone
             logger.debug(f"[server-vad] could not release dropped turn: {e!r}")
+
+    # --- speculative replies (see conversations/speculative.py) -------------
+
+    def _spec_lock(self, client_uid: str) -> asyncio.Lock:
+        return self.spec_locks.setdefault(client_uid, asyncio.Lock())
+
+    async def _drop_speculation(self, client_uid: str, reason: str) -> None:
+        async with self._spec_lock(client_uid):
+            spec = self.speculations.pop(client_uid, None)
+            if spec is not None:
+                await speculative.discard(spec, reason)
+
+    def _worth_speculating(self, client_uid: str, text: str) -> bool:
+        """The cheap half of _finalize_vad_turn's screening. Anything that turn
+        would hold or drop is not worth a speculative LLM+TTS run; the endpoint
+        stays authoritative either way (a miss is rolled back)."""
+        t = text.strip()
+        if not t or _is_junk_transcript(t) or _transcript_looks_incomplete(t):
+            return False
+        if len(t) <= 40 and any(h in t.lower() for h in _ASR_HALLUCINATIONS):
+            return False
+        context = self.client_contexts.get(client_uid)
+        lang = getattr(context.character_config, "language", "ja") if context else "ja"
+        return not (lang != "ja" and _CJK_CHARS_RE.search(t))
+
+    async def _speculate(self, websocket: WebSocket, client_uid: str, tasks: list, epoch: int) -> None:
+        """On a segment pause, start the reply to the transcript so far."""
+        try:
+            await self._speculate_inner(websocket, client_uid, tasks, epoch)
+        except Exception as e:  # noqa: BLE001 — a failed speculation is just a miss
+            logger.exception(f"[spec] speculation failed: {e!r}")
+
+    async def _speculate_inner(self, websocket: WebSocket, client_uid: str, tasks: list, epoch: int) -> None:
+        t0 = time.monotonic()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        asr_ms = (time.monotonic() - t0) * 1000
+        parts = [r.strip() for r in results if isinstance(r, str) and r.strip()]
+        parts = [p for p in parts if not _segment_is_hallucination(p)]
+        text = self.pending_vad_transcript.get(client_uid, "") + "".join(parts)
+        if not self._worth_speculating(client_uid, text):
+            logger.debug(f"[spec] skip: not worth it ({text[-30:]!r})")
+            return
+        group = self.chat_group_manager.get_client_group(client_uid)
+        if group and len(group.members) > 1:
+            return  # group replies broadcast; not gated
+        if webrtc_manager.track_for_send(websocket.send_text) is not None:
+            return  # WebRTC audio goes out on the track, around the gate
+        if self.speech_epoch.get(client_uid, 0) != epoch:
+            logger.debug("[spec] skip: the user resumed speaking during the ASR")
+            return
+        async with self._spec_lock(client_uid):
+            if self.speech_epoch.get(client_uid, 0) != epoch:
+                return
+            # Stale if the turn already ended (finalize owns it now) or another
+            # segment closed while this ASR ran (a newer _speculate will run).
+            if self.segment_asr_tasks.get(client_uid) is None or len(
+                self.segment_asr_tasks[client_uid]
+            ) != len(tasks):
+                logger.info(
+                    f"[spec] too late: ASR took {asr_ms:.0f} ms and the endpoint "
+                    "(or another segment) came first"
+                )
+                return
+            current = self.speculations.get(client_uid)
+            if current is not None and current.text == text:
+                return
+            if current is not None:
+                self.speculations.pop(client_uid)
+                await speculative.discard(current, "transcript grew")
+            context = self.client_contexts.get(client_uid)
+            if context is None:
+                return
+            mem_len, hist_len = speculative.checkpoint(context)
+            gate = speculative.GatedSocket(websocket)
+            await handle_conversation_trigger(
+                msg_type="text-input",
+                data={"text": text},
+                client_uid=client_uid,
+                context=context,
+                websocket=gate,
+                client_contexts=self.client_contexts,
+                client_connections=self.client_connections,
+                chat_group_manager=self.chat_group_manager,
+                received_data_buffers=self.received_data_buffers,
+                current_conversation_tasks=self.current_conversation_tasks,
+                broadcast_to_group=self.broadcast_to_group,
+            )
+            task = self.current_conversation_tasks.get(client_uid)
+            if task is None:
+                return
+            self.speculations[client_uid] = speculative.Speculation(
+                text=text, task=task, gate=gate, context=context,
+                mem_len=mem_len, hist_len=hist_len,
+            )
+            logger.info(f"[spec] started on the pause ({asr_ms:.0f} ms of ASR): {text[:60]!r}")
+
+    async def _finalize_and_settle(self, websocket: WebSocket, client_uid: str, tasks: list) -> None:
+        """_finalize_vad_turn, plus: a speculation it neither confirmed nor
+        replaced (the turn was dropped, held and abandoned, ...) is rolled back."""
+        try:
+            await self._finalize_vad_turn(websocket, client_uid, tasks)
+        finally:
+            await self._drop_speculation(client_uid, "turn ended without it")
+
+    async def _send_backchannel(self, websocket: WebSocket, client_uid: str) -> None:
+        """A short acknowledgment the moment a turn ends, to cover the gap until
+        the reply's first audio. Only on the slow path: a speculative HIT
+        already has audio ready. BACKCHANNEL=1 to enable (utils/backchannel.py)."""
+        context = self.client_contexts.get(client_uid)
+        if context is None:
+            return
+        try:
+            from .utils import backchannel  # lazy: optional
+
+            clip = await backchannel.get_clip(context)
+            if clip:
+                await websocket.send_text(json.dumps({"type": "backchannel", "audio": clip}))
+                logger.info("[backchannel] sent")
+        except Exception as e:  # noqa: BLE001 — never break a turn over this
+            logger.debug(f"[backchannel] skipped: {e!r}")
 
     async def _finalize_vad_turn(
         self, websocket: WebSocket, client_uid: str, tasks: list
@@ -1100,9 +1246,8 @@ class WebSocketHandler:
                 self.vad_grace_tasks.pop(client_uid, None)
             text = self.pending_vad_transcript.pop(client_uid, text)
         turn_timing.mark("asr_done")
-        # (An instant pre-synthesized 相槌 was tried here and REMOVED by user
-        # request — the extra utterances weren't wanted. utils/backchannel.py
-        # remains available behind BACKCHANNEL=1 wiring if ever revisited.)
+        # (The 相槌 is sent just before the reply starts — _send_backchannel,
+        # opt-in via BACKCHANNEL=1; it was removed once by request, then asked for again.)
         # Rapid follow-up: the user kept talking after a pause long enough for
         # the VAD to close the turn, so a SECOND (third...) turn fired while the
         # reply to the first was still running. Merge the texts and answer ONCE
@@ -1133,19 +1278,39 @@ class WebSocketHandler:
             )
         except Exception as e:  # noqa: BLE001 — never let the panel break the turn
             logger.warning(f"[server-vad] could not send transcription: {e}")
-        await handle_conversation_trigger(
-            msg_type="text-input",
-            data={"text": text},
-            client_uid=client_uid,
-            context=self.client_contexts[client_uid],
-            websocket=websocket,
-            client_contexts=self.client_contexts,
-            client_connections=self.client_connections,
-            chat_group_manager=self.chat_group_manager,
-            received_data_buffers=self.received_data_buffers,
-            current_conversation_tasks=self.current_conversation_tasks,
-            broadcast_to_group=self.broadcast_to_group,
-        )
+        async with self._spec_lock(client_uid):
+            spec = self.speculations.pop(client_uid, None)
+            if (
+                spec is not None
+                and spec.text.strip() == text.strip()
+                and not spec.task.cancelled()
+            ):
+                # The reply has been running since the pause; publish it.
+                head_ms = (time.monotonic() - spec.started) * 1000
+                held = spec.gate.held
+                await spec.gate.release()
+                logger.info(
+                    f"[spec] HIT: reply started {head_ms:.0f} ms before the endpoint, "
+                    f"{held} msgs released at once"
+                )
+                return
+            if spec is not None:
+                # Roll it back BEFORE the real turn starts writing history.
+                await speculative.discard(spec, "endpoint on a different transcript")
+            await self._send_backchannel(websocket, client_uid)
+            await handle_conversation_trigger(
+                msg_type="text-input",
+                data={"text": text},
+                client_uid=client_uid,
+                context=self.client_contexts[client_uid],
+                websocket=websocket,
+                client_contexts=self.client_contexts,
+                client_connections=self.client_connections,
+                chat_group_manager=self.chat_group_manager,
+                received_data_buffers=self.received_data_buffers,
+                current_conversation_tasks=self.current_conversation_tasks,
+                broadcast_to_group=self.broadcast_to_group,
+            )
 
     async def _handle_conversation_trigger(
         self, websocket: WebSocket, client_uid: str, data: WSMessage

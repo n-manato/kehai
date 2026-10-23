@@ -42,6 +42,7 @@ export LLM_CTX_BUDGET=21000
 export LLM_CTX_MAX=24576
 export MOTION_GATEWAY_KEY="$(cat .motion_gateway_key 2>/dev/null || echo)"  # gateway bearer key (also used by gsv_stream.py)
 export ELEVENLABS_API_KEY="$(cat .elevenlabs_key 2>/dev/null || echo)"      # asr/elevenlabs_asr.py (shadow challenger)
+export BACKCHANNEL="${BACKCHANNEL:-1}"   # 相槌 on turn end (utils/backchannel.py); 0 = off
 export LAN_HTTPS_PORT="${LAN_HTTPS_PORT:-12443}"  # https for LAN devices (PROTO cable) so the mic works; "" = off
 export LAN_HTTPS_IPS="${LAN_HTTPS_IPS:-192.168.50.1}"  # PROTO-only LAN (enp179s0f1); goes into the cert
 
@@ -99,8 +100,10 @@ PY
     # running on this same box.
     curl -sf -m 120 -X POST "$GW/audio/transcriptions" \
       -H "Authorization: Bearer $MOTION_GATEWAY_KEY" \
-      -F "file=@cache/warm_silent6s.wav;type=audio/wav" -F "model=faster-whisper-large-v3-full" -o /dev/null \
-      && echo "[warmup] STT model is warm" || echo "[warmup] STT warmup failed (will cold-start on first use)"
+      -F "file=@cache/warm_silent6s.wav;type=audio/wav" -F "model=faster-whisper-large-v3-full" -o cache/warm_stt.json \
+      && ! grep -q "Mock transcription" cache/warm_stt.json \
+      && echo "[warmup] STT model is warm" \
+      || echo "[warmup] STT DOWN (gateway answers with a mock transcript when its sidecar is down) — run ./kehai.sh up"
   ) &
 fi
 

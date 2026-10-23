@@ -2,7 +2,7 @@
 time between "user stopped speaking" and "first TTS audio" actually went.
 
     [TTFA] asr=xxxms llm_first_sentence=xxxms tts_first_chunk=xxxms
-           TOTAL(endpoint->first_pcm)=xxxms (+~0.25-0.35s priming/jitter to ear)
+           TOTAL(endpoint->first_pcm)=xxxms (+ client preroll: 0.05s render tab / 0.25s browser)
 
 Marks are idempotent (first write wins) so only the FIRST sentence of a turn is
 measured. Singleton — the VAD handler and tts_manager share it without wiring.
@@ -41,7 +41,7 @@ class TurnTiming:
 
         logger.info(
             "[TTFA] asr={} | llm_first_sentence={} | tts_first_chunk={} | "
-            "TOTAL endpoint->first_pcm={} (+~0.25-0.35s priming/jitter to ear)".format(
+            "TOTAL endpoint->first_pcm={} (+ client preroll: 0.05s render tab / 0.25s browser)".format(
                 d("turn_end", "asr_done"),
                 d("asr_done", "first_sentence"),
                 d("first_sentence", "first_pcm"),

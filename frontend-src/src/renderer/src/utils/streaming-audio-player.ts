@@ -215,6 +215,15 @@ export class StreamingAudioPlayer {
 
   private scheduledSeconds = 0;
 
+  /** Underruns: a buffer that arrived after the previous one finished playing,
+   *  i.e. an audible gap. The preroll exists to keep this at zero. */
+  private gaps = 0;
+
+  private gapSeconds = 0;
+
+  /** Seconds of audio already scheduled when the first gap hit — says WHERE. */
+  private firstGapAt = -1;
+
   /**
    * What this player actually DID with the turn, for the server log.
    *
@@ -231,6 +240,10 @@ export class StreamingAudioPlayer {
       ctx: this.ctx.state,
       buffers: this.scheduledBuffers,
       seconds: +this.scheduledSeconds.toFixed(2),
+      gaps: this.gaps,
+      gapMs: Math.round(this.gapSeconds * 1000),
+      gapAt: +this.firstGapAt.toFixed(2),
+      preroll: this.preroll,
       rate: this.ctx.sampleRate,
       gain: this.gain.gain.value,
       origin: location.origin,
@@ -247,6 +260,11 @@ export class StreamingAudioPlayer {
     // Never schedule in the past — if playback fell behind (underrun), restart
     // the clock from now so we don't drop audio into an already-elapsed slot.
     const startAt = Math.max(this.ctx.currentTime, this.nextStartTime);
+    if (this.scheduledBuffers > 0 && startAt - this.nextStartTime > 0.005) {
+      this.gaps += 1;
+      this.gapSeconds += startAt - this.nextStartTime;
+      if (this.firstGapAt < 0) this.firstGapAt = this.scheduledSeconds;
+    }
     src.start(startAt);
     this.scheduledBuffers += 1;
     this.scheduledSeconds += buffer.duration;

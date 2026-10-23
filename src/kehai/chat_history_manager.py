@@ -230,6 +230,39 @@ def get_history(conf_uid: str, history_uid: str) -> List[HistoryMessage]:
         return []
 
 
+def history_length(conf_uid: str, history_uid: str) -> int:
+    """Number of raw entries in the history file (metadata included) — a
+    checkpoint that truncate_history() can return to."""
+    if not conf_uid or not history_uid:
+        return 0
+    filepath = _get_safe_history_path(conf_uid, history_uid)
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return len(json.load(f))
+    except Exception:
+        return 0
+
+
+def truncate_history(conf_uid: str, history_uid: str, length: int) -> int:
+    """Drop every entry after the first `length` raw entries; returns how many
+    were removed. Used to undo a speculative reply that was never confirmed."""
+    if not conf_uid or not history_uid:
+        return 0
+    filepath = _get_safe_history_path(conf_uid, history_uid)
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            history_data = json.load(f)
+        removed = len(history_data) - length
+        if removed <= 0:
+            return 0
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(history_data[:length], f, ensure_ascii=False, indent=2)
+        return removed
+    except Exception as e:
+        logger.error(f"Failed to truncate history {filepath}: {e}")
+        return 0
+
+
 def delete_history(conf_uid: str, history_uid: str) -> bool:
     """Delete a specific history file"""
     if not conf_uid or not history_uid:

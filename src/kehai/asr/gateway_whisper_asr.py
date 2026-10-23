@@ -107,12 +107,28 @@ class VoiceRecognition(ASRInterface):
     _PUBLIC_URL = "https://gpu.aiccore-uno.ai/v1/audio/transcriptions"
 
     def transcribe_np(self, audio: np.ndarray) -> str:
-        ogg = self._ogg_opus_bytes(audio)
-        files = (
-            {"file": ("utterance.ogg", ogg, "audio/ogg")}
-            if ogg is not None
-            else {"file": ("utterance.wav", self._wav_bytes(audio), "audio/wav")}
-        )
+        # Opus only pays off on a real network leg. On loopback (PC-B: the
+        # gateway is on this box) it is pure cost: ~25ms to encode here, ~8ms
+        # to decode in the sidecar, and a lossy copy of the speech whisper
+        # then has to recognize. Loopback gets the raw WAV — except PC-A's
+        # :13000, which is an SSH tunnel and so a network leg after all.
+        wav_files = {"file": ("utterance.wav", self._wav_bytes(audio), "audio/wav")}
+        ogg_files = None
+
+        def files_for(url: str) -> dict:
+            nonlocal ogg_files
+            local = "127.0.0.1" in url or "localhost" in url
+            if local and ":13000" not in url:
+                return wav_files
+            if ogg_files is None:
+                ogg = self._ogg_opus_bytes(audio)
+                ogg_files = (
+                    {"file": ("utterance.ogg", ogg, "audio/ogg")}
+                    if ogg is not None
+                    else wav_files
+                )
+            return ogg_files
+
         data = {"model": self.model}
         if self.language:
             data["language"] = self.language
@@ -139,7 +155,7 @@ class VoiceRecognition(ASRInterface):
             try:
                 t0 = time.monotonic()
                 r = self._client.post(
-                    url, headers=headers, files=files, data=data, timeout=per_to
+                    url, headers=headers, files=files_for(url), data=data, timeout=per_to
                 )
                 if r.status_code != 200:
                     logger.warning(

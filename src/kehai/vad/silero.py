@@ -322,6 +322,10 @@ class StateMachine:
                     self.state = State.ACTIVE
                     self.hit_count = 0
                     self.miss_count = 0
+                    # The user picked the turn back up after a segment closed.
+                    # Nothing else marks this (<|RESUME|> is the turn END), and a
+                    # reply started speculatively on the pause must be dropped.
+                    yield [], [], b"<|SPEECH|>"
             else:
                 self.hit_count = 0
                 self.miss_count += 1
