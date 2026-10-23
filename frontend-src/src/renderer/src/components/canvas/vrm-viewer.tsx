@@ -36,15 +36,15 @@ import { aiDebug, debugParams, flashRecorder } from "@/utils/debug/ai-debug";
 import { SPACE_LAYER } from "@/utils/space/layers";
 import { isProtoMode, setProtoMode } from "@/utils/space/proto-mode";
 import { deviceProfile } from "@/utils/space/device-profile";
-import { createFraming } from "@/utils/space/framing";
+import { createFraming, headFollow } from "@/utils/space/framing";
 import { createBodyDepth } from "@/utils/space/body-depth";
 import { autoHide, refreshAutoHide } from "@/utils/space/auto-hide";
 import { SPACE } from "@/utils/space/space-config";
 import { taa, TaaResolve, TaaVelocity } from "@/utils/space/taa";
 import { describePixelRatio, resolvePixelRatio, watchDevicePixelRatio } from "@/utils/space/pixel-ratio";
 import { applyOffAxis, currentPanel, impliedPanelHeightM } from "@/utils/space/off-axis";
-import { viewerTransform } from "@/utils/space/viewer-transform";
-import { diagnoseHeadTracking, headTracker, setupHeadTracking } from "@/utils/space/head-tracker";
+import { viewerTransform, viewerWorld } from "@/utils/space/viewer-transform";
+import { diagnoseHeadTracking, headTracker, setupHeadTracking, type ServerFaces } from "@/utils/space/head-tracker";
 import { calibrateHeadDistance, hidePanelCalibration, showPanelCalibration } from "@/utils/space/calibrate";
 import { hideSpaceHud, showSpaceHud } from "@/utils/space/space-hud";
 import { hideHeadPreview, showHeadPreview } from "@/utils/space/head-preview";
@@ -1729,6 +1729,8 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       }
       return headTracker.status();
     };
+    // Faces the server found in the PROTO's camera (render-source.ts calls this).
+    (window as any).__headIngest = (m: ServerFaces) => headTracker.ingest(m);
     (window as any).__headCameras = () => {
       headTracker.listCameras().then((cams) => {
         if (!cams.length) console.warn("[space] no video inputs visible to this browser");
@@ -1778,6 +1780,21 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         maxYaw: SPACE.lookAtMaxYaw,
         maxPitch: SPACE.lookAtMaxPitch,
         speed: SPACE.lookAtSpeed,
+      };
+    };
+    // The camera following the attended person, and who that is. Patch keys to
+    // tune live, e.g. __follow({ headOrbitMaxDeg: 15, headOrbitGain: -1 }).
+    (window as any).__follow = (patch?: Record<string, number>) => {
+      if (patch) Object.assign(SPACE, patch);
+      const st = headTracker.status();
+      return {
+        faces: st.faces,
+        tracking: st.tracking,
+        pose: st.pose,
+        follow: { ...headFollow },
+        gain: SPACE.headOrbitGain,
+        maxDeg: SPACE.headOrbitMaxDeg,
+        lookAt: SPACE.lookAt,
       };
     };
     (window as any).__headPreview = (show = true) =>
@@ -3014,6 +3031,16 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       stabilise: 0.9,
     };
     const gazeTarget = new THREE.Object3D();
+
+    // What she attends to: the camera, or — while the PROTO's camera tracks
+    // someone — that person's head, blended by the same hand-over the camera
+    // follow uses. Updated per frame before the head turn and the gaze read it.
+    const attendPoint = new THREE.Vector3();
+    const attendViewer = new THREE.Vector3();
+    const updateAttendPoint = () => {
+      attendPoint.copy(camera.position);
+      if (headFollow.weight > 0) attendPoint.lerp(viewerWorld(attendViewer), headFollow.weight);
+    };
     const gazeWant = new THREE.Vector3();
     const gazeTmp = new THREE.Vector3();
     const gazeHead = new THREE.Vector3();
@@ -3066,13 +3093,13 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         // vertical range is narrower: people scan sideways far more than up/down
         gazeWant.set((aiDebug.random() * 2 - 1) * r, (aiDebug.random() * 2 - 1) * r * 0.55, 0);
       }
-      gazeTmp.copy(camera.position).add(gazeWant);
+      gazeTmp.copy(attendPoint).add(gazeWant);
       if (GAZE.stabilise < 0.999) {
         const head = v.humanoid?.getNormalizedBoneNode("head");
         if (head) {
           head.getWorldPosition(gazeHead);
           gazeFwd.set(0, 0, 1).applyQuaternion(head.getWorldQuaternion(gazeQ))
-            .multiplyScalar(gazeHead.distanceTo(camera.position))
+            .multiplyScalar(gazeHead.distanceTo(attendPoint))
             .add(gazeHead);
           gazeTmp.lerp(gazeFwd, 1 - GAZE.stabilise); // pull the target toward the head's own aim
         }
@@ -5104,10 +5131,11 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         // Head/upper-body turn toward whoever is watching. Additive on top of
         // the gesture pose, and BEFORE vrm.update() so humanoid.update() pushes
         // it to the raw bones and the eye look-at is computed against the head's
-        // new orientation rather than a stale one. camera.position is the right
-        // target in both modes: with head-coupled perspective active it IS the
-        // viewer's eye, and without it it is wherever the view is from.
-        applyViewerLookAt(vrm, camera.position, dt);
+        // new orientation rather than a stale one. The target is the person the
+        // PROTO's camera picked (the closest one); the turn is weighted by the
+        // follow hand-over, so with nobody tracked she faces front as before.
+        updateAttendPoint();
+        applyViewerLookAt(vrm, attendPoint, dt, headFollow.weight);
         updateGaze(dt, vrm); // move the gaze target; vrm.update() applies it to the eyes
         // Sub-step the spring/constraint update at a FIXED ~240Hz. With a variable/coarse
         // frame timestep (e.g. 60fps -> 16ms) the spring integration oscillates = the hair
@@ -5350,6 +5378,8 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       delete (window as any).__spacePixels;
       delete (window as any).__viewerPose;
       delete (window as any).__offAxis;
+      delete (window as any).__follow;
+      delete (window as any).__headIngest;
       delete (window as any).__headCalibrate;
       delete (window as any).__protoCalibrate;
       sceneComposer.dispose();

@@ -638,21 +638,76 @@ export const SPACE = {
   headCamDeviceId: "",
   headCamWidth: 1280,
   headCamFovDeg: 60,
+  /** Outer eye corners, metres — the depth ruler for this page's own tracker. */
   eyeSpanM: 0.098,
+  /**
+   * Eye CENTRES, metres (average adult pupil distance) — the depth ruler for
+   * faces from the server, whose detector marks the middle of each eye.
+   */
+  pupilSpanM: 0.063,
   headCamMirror: true,
   headCamOffsetX: 0,
-  headCamOffsetY: 0,
+  /**
+   * Camera height above the panel centre, metres. The PROTO's camera sits on top
+   * of the cabinet, i.e. about half a panel (panelHeightM / 2) above centre.
+   * Left at 0 every face read ~1 m too low and her gaze dropped to the viewer's
+   * knees — the eyes are the one place where a height error is obvious.
+   */
+  headCamOffsetY: 0.95,
   headCamOffsetZ: 0,
+  /** Faces this page's own tracker detects per frame; the CLOSEST is attended. */
+  headCamMaxFaces: 6,
+  /**
+   * Hysteresis for changing who she attends to. Another face has to be this much
+   * closer (fraction of the current one's distance) for `focusSwitchS` without
+   * a break before she turns to them. Without it two people at nearly the same
+   * distance swap places with every frame of depth noise, and her head ping-pongs.
+   */
+  focusSwitchMargin: 0.15,
+  focusSwitchS: 0.6,
 
-  // --- Phase 4: looking at the viewer (parked with the camera) --------------
-  /** 0 while head tracking is off; 0.55 is the tuned value to restore with it. */
-  lookAt: 0,
+  // --- Following the attended person with the world camera -----------------
+  /**
+   * While someone is tracked, the drift's ORBIT is driven by where they stand
+   * instead of by the sine: stand to the right of the PROTO and the camera swings
+   * round to her right-hand side of the screen, so you see her from your side.
+   * Degrees of orbit per degree of the viewer's bearing from her — 1 means the
+   * camera sits on the line from her to you, which is also what makes her look
+   * into the lens when she looks at you. Negative mirrors the direction.
+   */
+  headOrbitGain: 1.0,
+  /**
+   * Limit of the follow orbit to each side. Bounded by the frame, like
+   * cameraOrbitDeg: past ~12 the HUD ring behind her starts leaving the frame.
+   * Raised a little above the idle sway's 7.5 so a viewer off to the side
+   * visibly sees round her.
+   */
+  headOrbitMaxDeg: 12,
+  /** Camera metres up/down per metre the viewer's head is above/below the virtual eye (viewerEyeY). */
+  headOrbitY: 0,
+  /** 1/s. How fast the camera settles on a new bearing (a focus change is a jump). */
+  headOrbitSpeed: 2.0,
+  /** Seconds to hand the camera over between the idle sway and following. */
+  headOrbitBlendS: 0.8,
+
+  // --- Phase 4: looking at the viewer ---------------------------------------
+  /**
+   * Strength of the head/upper-body turn toward the attended person. Only acts
+   * while someone is tracked (scaled by the follow hand-over), so the untracked
+   * view keeps her facing front exactly as before.
+   */
+  lookAt: 0.55,
   lookAtMaxYaw: 40,
   lookAtMaxPitch: 22,
   lookAtSpeed: 4.0,
 
   // --- Phase 3: off-axis projection (inert without a tracked head) ----------
-  offAxis: true,
+  /**
+   * Off by default: it takes the whole camera over the moment a face is tracked,
+   * and the follow orbit above is what the PROTO installation uses instead. It
+   * also needs the panel measured (__protoCalibrate) before it is right at all.
+   */
+  offAxis: false,
   offAxisStrength: 1.0,
   parallaxBoost: 0.0,
   /** PHYSICAL PANEL GEOMETRY — measure with __protoCalibrate(). */
@@ -923,9 +978,13 @@ export function setQualityValue(q: Quality) {
  * rev 1: taa 0 -> 1. A stored taa:0 (from the TAA experiments) pins the
  * temporal pass off and brings back exactly the crawling edges it was built to
  * fix; shipped default is 1 and nothing in the sweeps depends on 0 anymore.
+ *
+ * rev 2: camera-driven attention. lookAt 0 -> 0.55 (now gated on tracking, so
+ * it no longer turns her toward the drifting camera), offAxis -> false (the
+ * follow orbit replaces it), headCamOffsetY 0 -> 0.95 (PROTO camera on top).
  */
-const SPACE_REV = 1;
-const SPACE_FIX: Partial<SpaceConfig> = { taa: 1 };
+const SPACE_REV = 2;
+const SPACE_FIX: Partial<SpaceConfig> = { taa: 1, lookAt: 0.55, offAxis: false, headCamOffsetY: 0.95 };
 
 export function loadSpaceConfig() {
   // The device budget goes on FIRST, so a saved blob can still override it: the

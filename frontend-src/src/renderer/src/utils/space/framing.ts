@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { SPACE } from "./space-config";
 import { isProtoMode } from "./proto-mode";
+import { viewerTransform, viewerWorld } from "./viewer-transform";
 
 /**
  * Camera placement for the PROTO unit: life-size framing, plus a slow drift.
@@ -67,6 +68,17 @@ export function orbitPose(out: THREE.Vector3, yawDeg: number): THREE.Vector3 {
 }
 
 const _orbit = new THREE.Vector3();
+const _viewer = new THREE.Vector3();
+
+/**
+ * The camera following the attended person (see `headOrbitGain`).
+ *
+ * `weight` is the hand-over between the idle sway (0) and following (1), eased
+ * over `headOrbitBlendS` so a face appearing or leaving never cuts the shot.
+ * Published because her head turn uses the same hand-over: the turn toward a
+ * person and the camera swinging to them have to arrive together.
+ */
+export const headFollow = { weight: 0, yawDeg: 0, targetDeg: 0 };
 
 export interface Framing {
   /** Re-apply the base framing (after a settings change). */
@@ -188,7 +200,30 @@ export function createFraming(
     },
     update(dt: number) {
       if (interacting || !ownsCamera) return;
-      if (!SPACE.cameraDriftEnabled || SPACE.cameraDrift <= 0.0001) {
+
+      // Follow hand-over and the bearing to follow. Updated even when the drift
+      // is switched off: following a person is not the ambient sway.
+      const tracking = viewerTransform.isTracking();
+      const blend = Math.max(SPACE.headOrbitBlendS, 0.05);
+      headFollow.weight = THREE.MathUtils.clamp(headFollow.weight + (tracking ? dt : -dt) / blend, 0, 1);
+      if (tracking) {
+        viewerWorld(_viewer);
+        // Bearing of the viewer from the point the camera orbits, in the same
+        // sense as the orbit's yaw: positive = to the right of the screen.
+        const bearing = THREE.MathUtils.radToDeg(
+          Math.atan2(_viewer.x - controls.target.x, _viewer.z - controls.target.z),
+        );
+        const max = Math.max(SPACE.headOrbitMaxDeg, 0);
+        headFollow.targetDeg = THREE.MathUtils.clamp(bearing * SPACE.headOrbitGain, -max, max);
+      }
+      // Eased rather than set: changing who she attends to is a jump of the
+      // bearing, and the shot should swing to the new person, not cut.
+      headFollow.yawDeg += (headFollow.targetDeg - headFollow.yawDeg)
+        * (1 - Math.exp(-Math.max(SPACE.headOrbitSpeed, 0.01) * dt));
+      const fw = headFollow.weight;
+
+      const driftOn = SPACE.cameraDriftEnabled && SPACE.cameraDrift > 0.0001;
+      if (!driftOn && fw <= 0) {
         // Snap back rather than freezing wherever the drift happened to be, or
         // turning it off leaves the camera at a random offset for the session.
         if (driftOffset.lengthSq() > 0) {
@@ -200,6 +235,9 @@ export function createFraming(
       }
       t += dt;
       const w = (Math.PI * 2) / Math.max(SPACE.cameraDriftPeriod, 1);
+      // The sway yields to following: a camera that keeps wandering while it
+      // is meant to be looking from your side reads as not looking at all.
+      const dw = driftOn ? 1 - fw : 0;
 
       /**
        * TWO low frequencies per axis, not one.
@@ -223,40 +261,43 @@ export function createFraming(
       driftBase.copy(base);
       driftTarget.copy(controls.target);
 
-      const yBob = mix(0.63, 0.271, 0.4) * SPACE.cameraDriftY;
+      const yBob = mix(0.63, 0.271, 0.4) * SPACE.cameraDriftY * dw;
+      // Height relative to the virtual eye, so a viewer at that height moves nothing.
+      const yFollow = THREE.MathUtils.clamp((_viewer.y - SPACE.viewerEyeY) * SPACE.headOrbitY, -0.3, 0.3) * fw;
 
+      /**
+       * ORBIT around her, not a translation past her.
+       *
+       * A lateral slide and a swing around the subject look similar over a few
+       * centimetres, but they are different motions and only one of them scales:
+       * at fifteen degrees a translation would carry the camera nearly a metre
+       * sideways and out of the framing entirely, while an orbit keeps the
+       * distance — and therefore her size and her position in frame — fixed by
+       * construction, and spends the whole movement on showing her from a
+       * different angle. That is also what makes the background sweep, which is
+       * where the depth reads from. Following a person is the same orbit with
+       * its angle taken from where they stand.
+       */
+      let yaw = THREE.MathUtils.degToRad(headFollow.yawDeg) * fw;
+      // Legacy pure-translation drift, kept for cameraOrbitDeg = 0.
+      let slideX = 0;
+      let slideZ = 0;
       if (SPACE.cameraOrbitDeg > 0.001) {
-        /**
-         * ORBIT around her, not a translation past her.
-         *
-         * A lateral slide and a swing around the subject look similar over a few
-         * centimetres, but they are different motions and only one of them scales:
-         * at fifteen degrees a translation would carry the camera nearly a metre
-         * sideways and out of the framing entirely, while an orbit keeps the
-         * distance — and therefore her size and her position in frame — fixed by
-         * construction, and spends the whole movement on showing her from a
-         * different angle. That is also what makes the background sweep, which is
-         * where the depth reads from.
-         */
-        const yaw = mix(1.00, 0.412, 1.7) * THREE.MathUtils.degToRad(SPACE.cameraOrbitDeg);
-        const dx = base.x - controls.target.x;
-        const dz = base.z - controls.target.z;
-        const c = Math.cos(yaw);
-        const s = Math.sin(yaw);
-        _orbit.set(
-          controls.target.x + dx * c + dz * s,
-          base.y + yBob,
-          controls.target.z - dx * s + dz * c,
-        );
-        camera.position.copy(_orbit);
+        yaw += mix(1.00, 0.412, 1.7) * THREE.MathUtils.degToRad(SPACE.cameraOrbitDeg) * dw;
       } else {
-        // Legacy pure-translation drift, kept for cameraOrbitDeg = 0.
-        camera.position.set(
-          base.x + mix(1.00, 0.412, 1.7) * SPACE.cameraDrift,
-          base.y + yBob,
-          base.z + mix(0.37, 0.183, 2.9) * SPACE.cameraDriftZ,
-        );
+        slideX = mix(1.00, 0.412, 1.7) * SPACE.cameraDrift * dw;
+        slideZ = mix(0.37, 0.183, 2.9) * SPACE.cameraDriftZ * dw;
       }
+      const dx = base.x - controls.target.x;
+      const dz = base.z - controls.target.z;
+      const c = Math.cos(yaw);
+      const s = Math.sin(yaw);
+      _orbit.set(
+        controls.target.x + dx * c + dz * s + slideX,
+        base.y + yBob + yFollow,
+        controls.target.z - dx * s + dz * c + slideZ,
+      );
+      camera.position.copy(_orbit);
 
       driftOffset.subVectors(camera.position, base);
       // Re-aim at the solved framing target every frame. This is what makes the

@@ -8,10 +8,10 @@ import { autoHide } from "./auto-hide";
  * "TRACK: searching" tells you detection is failing but not why, and the
  * candidates — camera aimed at the wrong side of the cabinet, face backlit by a
  * 4K panel, standing too far for a 640x480 frame, wrong device picked — all look
- * identical from the console. Showing the actual frame with the actual landmarks
+ * identical from the console. Showing the actual frame with the actual detections
  * collapses all of that into one glance.
  *
- * It draws the landmarks the TRACKER produced, not a second inference of its
+ * It draws the faces the TRACKER produced, not a second inference of its
  * own: a separate detection pass could disagree with the one driving the scene,
  * which would make the preview actively misleading.
  */
@@ -105,18 +105,24 @@ export function showHeadPreview(container: HTMLElement): string {
     ctx.drawImage(v, 0, 0, c.width, c.height);
 
     const face = headTracker.getLastFace();
-    if (face && face.length) {
+    // Every face found, the one she attends to (the closest) in cyan and the
+    // rest dimmed, so the choice can be checked by eye against the room.
+    headTracker.getFaces().forEach((f) => {
+      const b = f.box;
+      ctx.strokeStyle = f === face ? "rgba(53,215,255,0.95)" : "rgba(200,200,200,0.5)";
+      ctx.lineWidth = f === face ? 2 : 1;
+      ctx.strokeRect(b.x * c.width, b.y * c.height, b.w * c.width, b.h * c.height);
+    });
+    if (face) {
       ctx.fillStyle = "rgba(53,215,255,0.75)";
-      for (let i = 0; i < face.length; i += 4) {
-        ctx.fillRect(face[i].x * c.width - 1, face[i].y * c.height - 1, 2, 2);
+      const lm = face.landmarks ?? [];
+      for (let i = 0; i < lm.length; i += 4) {
+        ctx.fillRect(lm[i].x * c.width - 1, lm[i].y * c.height - 1, 2, 2);
       }
-      // The three landmarks the distance/position maths actually uses, so a bad
-      // estimate can be traced to a bad landmark rather than guessed at.
-      const marks: [number, string][] = [[33, "#ffe066"], [263, "#ffe066"], [168, "#ff4fd8"]];
-      marks.forEach(([idx, colour]) => {
-        const p = face[idx];
-        if (!p) return;
-        ctx.strokeStyle = colour;
+      // The two points the distance/position maths actually uses, so a bad
+      // estimate can be traced to a bad point rather than guessed at.
+      face.eyes.forEach((p) => {
+        ctx.strokeStyle = "#ffe066";
         ctx.lineWidth = 1.5;
         ctx.beginPath();
         ctx.arc(p.x * c.width, p.y * c.height, 4, 0, Math.PI * 2);
@@ -131,7 +137,7 @@ export function showHeadPreview(container: HTMLElement): string {
     const p = viewerTransform.get();
     const s = headTracker.status();
     label.textContent = [
-      `${face ? "FACE OK" : "no face"}   ${vw}x${vh}  ${s.fps}fps`,
+      `${face ? "FACE OK" : "no face"} (${s.faces} seen)   ${vw}x${vh}  ${s.fps}fps`,
       `x ${(p.x * 100).toFixed(0)}cm  y ${(p.y * 100).toFixed(0)}cm  z ${(p.z * 100).toFixed(0)}cm`,
     ].join("\n");
   };

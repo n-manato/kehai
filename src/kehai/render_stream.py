@@ -28,7 +28,11 @@ Binary frames, first byte is the kind:
     2 video  hub    -> viewer   float64 LE server timestamp + JPEG
     3 mic    viewer -> source   Int16 LE mono 48 kHz PCM
     4 h264   hub    -> viewer   float64 LE server timestamp + u8 keyframe + Annex B AU
-    5 cam    viewer -> source   JPEG frame of the viewer's camera (head tracking)
+    5 cam    viewer -> server   JPEG frame of the viewer's camera (head tracking).
+                                The server finds the faces in it (face_detect.py)
+                                and sends the render tab only {"t": "faces", ...};
+                                without a detector the frame goes on to the
+                                render tab, which then detects for itself.
 Text frames are JSON control messages (mode, size, input, ping, and the mic panel:
 mic / mic-set / mic-reset / mic-monitor / mic-level, see vad/mic_tuning.py).
 """
@@ -48,6 +52,7 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from loguru import logger
 
+from . import face_detect
 from .vad import mic_tuning
 
 CDP_HTTP = os.environ.get("RENDER_CDP", "http://127.0.0.1:9222")
@@ -216,6 +221,9 @@ class _Hub:
         # view_ws and dropped the viewer — 60 times in one server log. Serialize them.
         self.viewer_lock = asyncio.Lock()
         self.source: WebSocket | None = None
+        # The mic relay, the test hook and the face results all write to the
+        # source from different tasks — the same hazard as viewer_lock.
+        self.source_lock = asyncio.Lock()
         self.cdp: _Cdp | None = None
         self.latest: bytes | None = None
         self.fresh = asyncio.Event()
@@ -232,6 +240,62 @@ class _Hub:
         self.mic_q_ms = None
         self.injecting = False
         self.audio_samples = 0  # PCM samples forwarded to the viewer (should be 48k/s)
+        # Face detection on the viewer's camera: None = not loaded yet, False =
+        # unavailable (frames are forwarded instead). One frame in flight.
+        self.faces: face_detect.FaceDetector | None | bool = None
+        self.face_busy = False
+        self.face_task: asyncio.Task | None = None
+        self.face_frames = 0
+        self.face_ms = 0.0
+        self.face_count = 0
+
+    async def send_source(self, data: bytes | str) -> None:
+        """Every write to the render tab goes through here (see source_lock)."""
+        ws = self.source
+        if not ws:
+            return
+        async with self.source_lock:
+            try:
+                if isinstance(data, str):
+                    await ws.send_text(data)
+                else:
+                    await ws.send_bytes(data)
+            except Exception:
+                pass
+
+    async def on_cam(self, data: bytes) -> None:
+        """A camera frame (kind 5) from the viewer or the test hook.
+
+        Never queued: while one frame is being detected the next ones are
+        dropped, because a stale head position is worse than a skipped one.
+        """
+        if not self.source:
+            return
+        if self.faces is False:
+            await self.send_source(data)
+            return
+        if self.face_busy:
+            return
+        self.face_busy = True
+        # Held so the task is not garbage-collected mid-detection.
+        self.face_task = asyncio.create_task(self._detect(data[1:]))
+
+    async def _detect(self, jpeg: bytes) -> None:
+        try:
+            if self.faces is None:
+                self.faces = await asyncio.to_thread(face_detect.load) or False
+                if not self.faces:
+                    return
+            t0 = time.perf_counter()
+            result = await asyncio.to_thread(self.faces.detect, jpeg)
+            self.face_ms += (time.perf_counter() - t0) * 1000
+            self.face_frames += 1
+            self.face_count = len(result["faces"])
+            await self.send_source(json.dumps({"t": "faces", **result}))
+        except Exception as err:
+            logger.debug(f"[faces] frame skipped: {err}")
+        finally:
+            self.face_busy = False
 
     async def send_viewer(self, ws: WebSocket, data: bytes | str) -> None:
         """Every write to the viewer goes through here (see viewer_lock)."""
@@ -414,8 +478,10 @@ def init_render_routes() -> APIRouter:
                 data = await ws.receive_bytes()
                 # Camera frames too, so head tracking can be exercised on a box
                 # with no camera (render_view.html sends kind 5 the same way).
-                if data[:1] in (bytes([KIND_MIC]), bytes([KIND_CAM])) and hub.source:
-                    await hub.source.send_bytes(data)
+                if data[:1] == bytes([KIND_MIC]):
+                    await hub.send_source(data)
+                elif data[:1] == bytes([KIND_CAM]):
+                    await hub.on_cam(data)
         except WebSocketDisconnect:
             pass
         finally:
@@ -447,7 +513,13 @@ def init_render_routes() -> APIRouter:
         async def stats():
             while True:
                 n0, s0, d0, a0 = hub.frames, hub.sent, hub.dropped, hub.audio_samples
+                f0, fm0 = hub.face_frames, hub.face_ms
                 await asyncio.sleep(10)
+                nf = hub.face_frames - f0
+                faces = (
+                    f"faces {nf / 10:.1f} fps {(hub.face_ms - fm0) / nf:.0f} ms, {hub.face_count} in view"
+                    if nf else "faces off"
+                )
                 size = X_SIZE if hub.mode == "x11" else hub.size
                 v = hub.viewer_stat
                 logger.info(
@@ -457,7 +529,7 @@ def init_render_routes() -> APIRouter:
                     f"| audio {(hub.audio_samples - a0) / 10000:.1f} kS/s in, viewer ctx {v.get('ctxRate')} Hz "
                     f"| audio queues: mic {hub.mic_q_ms} ms (render side), play {v.get('playQ')}"
                     f"/{v.get('jbTarget')} ms target, {v.get('starves')} starves "
-                    f"+ device {v.get('baseLatency')} ms (viewer) "
+                    f"+ device {v.get('baseLatency')} ms (viewer) | {faces} "
                     f"{v.get('err') or ''} | {v.get('ua', '')[:70]}"
                 )
 
@@ -492,17 +564,11 @@ def init_render_routes() -> APIRouter:
                     break
                 if msg.get("bytes"):
                     data = msg["bytes"]
-                    if data[:1] == bytes([KIND_MIC]) and hub.source and not hub.injecting:
-                        try:
-                            await hub.source.send_bytes(data)
-                        except Exception:
-                            pass
-                    elif data[:1] == bytes([KIND_CAM]) and hub.source:
+                    if data[:1] == bytes([KIND_MIC]) and not hub.injecting:
+                        await hub.send_source(data)
+                    elif data[:1] == bytes([KIND_CAM]):
                         # The viewer's camera, for the render tab's head tracker.
-                        try:
-                            await hub.source.send_bytes(data)
-                        except Exception:
-                            pass
+                        await hub.on_cam(data)
                     continue
                 m = json.loads(msg.get("text") or "{}")
                 if m.get("t") == "size":

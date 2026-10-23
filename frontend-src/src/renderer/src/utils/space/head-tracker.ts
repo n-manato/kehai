@@ -16,6 +16,14 @@ import { viewerTransform } from "./viewer-transform";
  * Everything is self-hosted (wasm under /libs/mediapipe/, model vendored beside
  * it) because the app is meant to run offline and the illusion must not depend
  * on a CDN being reachable at startup.
+ *
+ * Two sources of faces feed the same selection:
+ *   - this tracker's own FaceLandmarker, on a local camera. Its detector sees
+ *     the frame at 128x128, so on a wide camera it only finds faces within
+ *     ~1.3 m — fine for a desktop webcam, not for a room.
+ *   - `ingest()`, faces found by the SERVER in the PROTO's camera frames
+ *     (src/kehai/face_detect.py, delivered by render-source.ts). That is the
+ *     PROTO path: it reaches 4 m and costs the render tab nothing.
  */
 
 const WASM_PATH = "libs/mediapipe";
@@ -29,13 +37,45 @@ const MODEL_PATH = "libs/mediapipe/face_landmarker.task";
  */
 const LEFT_EYE_OUTER = 33;
 const RIGHT_EYE_OUTER = 263;
-/** Between-the-eyes landmark — a stable proxy for "where the head is". */
-const NOSE_BRIDGE = 168;
 
 export interface CameraOption {
   deviceId: string;
   label: string;
 }
+
+type Point = { x: number; y: number };
+
+/** A face from either source, normalised to its frame (0..1). */
+export interface TrackedFace {
+  score: number;
+  box: { x: number; y: number; w: number; h: number };
+  /** The two points whose separation gives the distance... */
+  eyes: [Point, Point];
+  /** ...and their real separation, metres. */
+  eyeSpanM: number;
+  /** Full landmark set, own tracker only — for the debug preview. */
+  landmarks?: Point[];
+}
+
+/** What the server sends for one camera frame (see src/kehai/face_detect.py). */
+export interface ServerFaces {
+  w: number;
+  h: number;
+  faces: { s: number; box: [number, number, number, number]; eyes: [[number, number], [number, number]] }[];
+}
+
+type Pose = { x: number; y: number; z: number; yaw: number; pitch: number; roll: number };
+interface Candidate {
+  face: TrackedFace;
+  pose: Pose;
+}
+
+/** How far (m) a face may move between detections and still be the same person. */
+const SAME_PERSON_M = 0.5;
+/** Seconds the attended person may vanish (a turn, a blink) and still be re-found. */
+const FOCUS_MEMORY_S = 1.0;
+/** Seconds without a server result before the server source counts as gone. */
+const SERVER_STALE_S = 2.0;
 
 class HeadTracker {
   private video: HTMLVideoElement | null = null;
@@ -68,16 +108,41 @@ class HeadTracker {
   /** performance.now() when start() finished, to notice a stream that never produces frames. */
   private startedAt = 0;
 
-  private lastFace: { x: number; y: number }[] | null = null;
+  private lastFace: TrackedFace | null = null;
+
+  /** Every face in the latest detection, attended one included. */
+  private allFaces: TrackedFace[] = [];
+
+  /** Where the attended person was last seen (raw pose metres), to re-find them. */
+  private focus: { x: number; z: number; t: number } | null = null;
+
+  /** When a clearly closer face first appeared; 0 = no challenger. */
+  private challengerSince = 0;
+
+  /** performance.now() of the last server result; 0 = never. */
+  private serverAt = 0;
+
+  private serverFrame = "";
 
   /** The live camera element, for the debug preview. */
   getVideo(): HTMLVideoElement | null {
     return this.video;
   }
 
-  /** Landmarks from the most recent detection (normalised 0..1), or null. */
+  /** The ATTENDED face in the most recent detection (normalised 0..1), or null. */
   getLastFace() {
     return this.lastFace;
+  }
+
+  /** Every face in the most recent detection. */
+  getFaces() {
+    return this.allFaces;
+  }
+
+
+  /** Faces are arriving from the server (the PROTO path) rather than this tracker. */
+  private serverLive() {
+    return this.serverAt > 0 && performance.now() - this.serverAt < SERVER_STALE_S * 1000;
   }
 
   /** Cameras the browser can see. Labels need permission to be non-empty. */
@@ -93,7 +158,7 @@ class HeadTracker {
   }
 
   isRunning() {
-    return this.running;
+    return this.running || this.serverLive();
   }
 
   /**
@@ -120,14 +185,19 @@ class HeadTracker {
   }
 
   status() {
+    const server = this.serverLive();
     return {
-      running: this.running,
+      running: this.running || server,
+      source: server ? "server" : this.running ? "browser" : null,
       tracking: viewerTransform.isTracking(),
+      faces: this.allFaces.length,
       fps: Math.round(this.fps),
       error: this.lastError ?? this.stallReason(),
       delegate: this.delegate,
       activeCamera: this.activeCamera,
-      videoSize: this.video ? `${this.video.videoWidth}x${this.video.videoHeight}` : null,
+      videoSize: server
+        ? this.serverFrame
+        : this.video ? `${this.video.videoWidth}x${this.video.videoHeight}` : null,
       pose: { ...viewerTransform.get() },
       deviceId: SPACE.headCamDeviceId || "(default)",
     };
@@ -201,7 +271,10 @@ class HeadTracker {
         FaceLandmarker.createFromOptions(fileset, {
           baseOptions: { modelAssetPath: MODEL_PATH, delegate },
           runningMode: "VIDEO",
-          numFaces: 1, // single primary viewer by design — see the plan
+          // Several, because a venue has several people in front of the
+          // PROTO; one would be whichever face MediaPipe listed first, not the
+          // closest. pickFocus() chooses.
+          numFaces: Math.max(1, Math.round(SPACE.headCamMaxFaces)),
           outputFaceBlendshapes: false,
           outputFacialTransformationMatrixes: false,
         });
@@ -253,6 +326,9 @@ class HeadTracker {
     this.lastVideoTime = -1;
     this.delegate = null;
     this.lastFace = null;
+    this.allFaces = [];
+    this.focus = null;
+    this.challengerSince = 0;
     this.activeCamera = null;
     this.startedAt = 0;
     this.fps = 0;
@@ -266,6 +342,9 @@ class HeadTracker {
     const video = this.video;
     const landmarker = this.landmarker;
     if (!video || !landmarker || video.readyState < 2) return;
+    // The server is the better source when it is live; don't spend a frame on
+    // a second opinion that would fight it.
+    if (this.serverLive()) return;
     // MediaPipe VIDEO mode requires strictly increasing timestamps, and the
     // display refresh usually outruns the camera — feeding the same frame twice
     // throws rather than returning a cached result.
@@ -281,6 +360,48 @@ class HeadTracker {
       return;
     }
 
+    const faces: TrackedFace[] = (result.faceLandmarks ?? []).map((lm) => {
+      let x0 = 1;
+      let y0 = 1;
+      let x1 = 0;
+      let y1 = 0;
+      lm.forEach((p) => {
+        x0 = Math.min(x0, p.x);
+        y0 = Math.min(y0, p.y);
+        x1 = Math.max(x1, p.x);
+        y1 = Math.max(y1, p.y);
+      });
+      return {
+        score: 1,
+        box: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
+        eyes: [lm[LEFT_EYE_OUTER], lm[RIGHT_EYE_OUTER]] as [Point, Point],
+        eyeSpanM: SPACE.eyeSpanM,
+        landmarks: lm,
+      };
+    });
+    this.consume(faces, video.videoWidth || 640, video.videoHeight || 480, nowMs);
+  };
+
+  /**
+   * Faces the SERVER found in the PROTO's camera frame (render-source.ts hands
+   * them over). Same selection and smoothing as the tracker's own detections;
+   * the camera frames themselves never reach this page.
+   */
+  ingest(msg: ServerFaces) {
+    const nowMs = performance.now();
+    this.serverAt = nowMs;
+    this.serverFrame = `${msg.w}x${msg.h} (server)`;
+    const faces: TrackedFace[] = (msg.faces ?? []).map((f) => ({
+      score: f.s,
+      box: { x: f.box[0], y: f.box[1], w: f.box[2], h: f.box[3] },
+      eyes: [{ x: f.eyes[0][0], y: f.eyes[0][1] }, { x: f.eyes[1][0], y: f.eyes[1][1] }],
+      // Eye CENTRES (YuNet keypoints), so the pupil distance, not the corners.
+      eyeSpanM: SPACE.pupilSpanM,
+    }));
+    this.consume(faces, msg.w, msg.h, nowMs);
+  }
+
+  private consume(faces: TrackedFace[], frameW: number, frameH: number, nowMs: number) {
     this.frameCount += 1;
     if (nowMs - this.fpsWindowStart > 1000) {
       this.fps = (this.frameCount * 1000) / (nowMs - this.fpsWindowStart);
@@ -288,40 +409,85 @@ class HeadTracker {
       this.fpsWindowStart = nowMs;
     }
 
-    const face = result.faceLandmarks?.[0];
     const tSec = nowMs / 1000;
-    this.lastFace = face ?? null;
-    if (!face) {
+    this.allFaces = faces;
+    const cands: Candidate[] = [];
+    faces.forEach((face) => {
+      const pose = this.faceToPose(face, frameW, frameH);
+      if (pose) cands.push({ face, pose });
+    });
+    if (!cands.length) {
+      this.lastFace = null;
       viewerTransform.markLost(tSec);
       return;
     }
 
-    const pose = this.landmarksToPose(face, video.videoWidth || 640, video.videoHeight || 480);
-    if (!pose) {
-      viewerTransform.markLost(tSec);
-      return;
-    }
+    const { face, pose } = this.pickFocus(cands, tSec);
+    this.lastFace = face;
     viewerTransform.setMeasurement(pose.x, pose.y, pose.z, pose.yaw, pose.pitch, pose.roll, tSec);
-  };
+  }
 
   /**
-   * Normalised landmarks -> metres in panel-centre coordinates.
+   * Who she attends to: the person CLOSEST to the PROTO — the one most likely to
+   * be talking to her, in a room where others are only passing behind.
    *
-   * Z comes from apparent eye separation: the outer eye corners are a known
-   * real-world width, so their width in pixels pins the distance. That needs the
+   * Closest is decided on the eye-span distance, which jitters by several
+   * centimetres per frame. Taken raw, two people side by side trade places with
+   * the noise and her head swings between them. So the current person is kept
+   * (re-found by position, since detection order is not stable) until someone
+   * else is clearly closer — `focusSwitchMargin` — and has stayed so for
+   * `focusSwitchS`. If the current person walks off, the closest one left takes
+   * over at once.
+   */
+  private pickFocus(cands: Candidate[], t: number): Candidate {
+    let closest = cands[0];
+    cands.forEach((c) => {
+      if (c.pose.z < closest.pose.z) closest = c;
+    });
+
+    let incumbent: Candidate | null = null;
+    const last = this.focus;
+    if (last && t - last.t < FOCUS_MEMORY_S) {
+      let best = Infinity;
+      cands.forEach((c) => {
+        const d = Math.hypot(c.pose.x - last.x, c.pose.z - last.z);
+        if (d < best) {
+          best = d;
+          incumbent = c;
+        }
+      });
+      if (best > SAME_PERSON_M) incumbent = null;
+    }
+
+    let chosen: Candidate = closest;
+    const held = incumbent as Candidate | null;
+    if (!held || held === closest) {
+      this.challengerSince = 0;
+    } else if (closest.pose.z >= held.pose.z * (1 - SPACE.focusSwitchMargin)) {
+      this.challengerSince = 0;
+      chosen = held;
+    } else {
+      if (!this.challengerSince) this.challengerSince = t;
+      if (t - this.challengerSince < SPACE.focusSwitchS) chosen = held;
+      else this.challengerSince = 0;
+    }
+
+    this.focus = { x: chosen.pose.x, z: chosen.pose.z, t };
+    return chosen;
+  }
+
+  /**
+   * A face -> metres in panel-centre coordinates.
+   *
+   * Z comes from apparent eye separation: the eye points are a known
+   * real-world width (`face.eyeSpanM`), so their width in pixels pins the distance. That needs the
    * camera's horizontal FOV, which we can't read from the browser — hence
    * `SPACE.headCamFovDeg`, calibrated once against the real camera by standing a
    * measured distance away and comparing `__headTracker().pose.z`.
    */
-  private landmarksToPose(
-    face: { x: number; y: number; z: number }[],
-    videoW: number,
-    videoH: number,
-  ) {
-    const le = face[LEFT_EYE_OUTER];
-    const re = face[RIGHT_EYE_OUTER];
-    const nb = face[NOSE_BRIDGE];
-    if (!le || !re || !nb) return null;
+  private faceToPose(face: TrackedFace, videoW: number, videoH: number): Pose | null {
+    const [le, re] = face.eyes;
+    if (!le || !re) return null;
 
     // Landmark x/y are normalised to the frame, so convert to pixels before
     // measuring a width — otherwise a non-square frame skews the distance.
@@ -334,12 +500,12 @@ class HeadTracker {
     const focalPx = videoW / (2 * Math.tan(hFov / 2));
 
     // Pinhole: apparent size = real size * focal / distance.
-    let z = (SPACE.eyeSpanM * focalPx) / eyePx;
+    let z = (face.eyeSpanM * focalPx) / eyePx;
     z = Math.min(Math.max(z, 0.25), 6);
 
-    // Head centre in pixels, then back-projected at that distance.
-    const cxPx = nb.x * videoW;
-    const cyPx = nb.y * videoH;
+    // Head centre (between the eyes) in pixels, then back-projected at that distance.
+    const cxPx = ((le.x + re.x) / 2) * videoW;
+    const cyPx = ((le.y + re.y) / 2) * videoH;
     let x = ((cxPx - videoW / 2) / focalPx) * z;
     const y = -((cyPx - videoH / 2) / focalPx) * z;
 
@@ -429,6 +595,18 @@ export async function diagnoseHeadTracking(): Promise<Record<string, unknown>> {
   const cams = devices.filter((d) => d.kind === "videoinput");
   add("video inputs found", cams.length > 0, cams.map((d, i) => `[${i}] ${d.label || "(unnamed)"}`).join(" | "));
 
+  // Faces from the server (the PROTO path): there is no camera on this page to check.
+  const live = headTracker.status();
+  if (live.source === "server") {
+    add("faces from the server", true, `${live.videoSize}, ${live.fps} fps, ${live.faces} in view`);
+    return {
+      steps,
+      verdict: live.faces
+        ? "working (server-side detection)"
+        : "server detection is running but no face is in the PROTO camera's view",
+    };
+  }
+
   // If it is already running, judge the live stream instead of grabbing another.
   if (headTracker.isRunning()) {
     const st = headTracker.status();
@@ -438,7 +616,7 @@ export async function diagnoseHeadTracking(): Promise<Record<string, unknown>> {
     add("video has frames", !!v && v.readyState >= 2, v ? `readyState ${v.readyState}, ${v.videoWidth}x${v.videoHeight}` : "no element");
     add("detector producing results", st.fps > 0, `${st.fps} fps`);
     const face = headTracker.getLastFace();
-    add("face detected", !!face, face ? `${face.length} landmarks` : "no face in the current frame");
+    add("face detected", !!face, face ? `${st.faces} face(s) in view` : "no face in the current frame");
     return {
       steps,
       verdict: face

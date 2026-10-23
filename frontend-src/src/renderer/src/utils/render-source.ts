@@ -153,11 +153,15 @@ function start() {
     return play.call(this);
   };
 
-  // ---- in: the viewer's camera is this page's camera ------------------------
-  // JPEG frames from the viewer (render_view.html) are painted onto a canvas whose
-  // captureStream() is handed out as the webcam. The head tracker then runs here
-  // unchanged — same calibration, smoothing and off-axis projection as on a unit
-  // with its own camera — and is started by the first frame that arrives.
+  // ---- in: the viewer's camera ---------------------------------------------
+  // Normally the SERVER finds the faces in the viewer's camera frames and only
+  // the result arrives here ({"t": "faces"}, see src/kehai/face_detect.py),
+  // handed to the head tracker through __headIngest.
+  //
+  // Fallback, when the server cannot run its detector: the JPEG frames come
+  // through instead and are painted onto a canvas whose captureStream() is
+  // handed out as the webcam. The head tracker then runs here unchanged and is
+  // started by the first frame that arrives.
   const camCanvas = document.createElement("canvas");
   camCanvas.width = 640;
   camCanvas.height = 360;
@@ -218,6 +222,15 @@ function start() {
     };
     ws.binaryType = "arraybuffer";
     ws.onmessage = (e) => {
+      if (typeof e.data === "string") {
+        try {
+          const m = JSON.parse(e.data);
+          // Dropped until the viewer mounts and registers the hook; the next
+          // camera frame is a fraction of a second behind.
+          if (m.t === "faces") (window as unknown as { __headIngest?: (m: unknown) => void }).__headIngest?.(m);
+        } catch { /* not ours */ }
+        return;
+      }
       if (!(e.data instanceof ArrayBuffer)) return;
       const b = new Uint8Array(e.data);
       if (b[0] === KIND_MIC && micNode) {

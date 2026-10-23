@@ -1,3 +1,7 @@
+import type * as THREE from "three";
+import { GLASS_Z } from "./layers";
+import { SPACE } from "./space-config";
+
 /**
  * Where the viewer's head is, in the SAME world coordinates as the scene
  * (metres, panel-centre-ish origin, +Z toward the viewer — see layers.ts).
@@ -187,3 +191,14 @@ class ViewerTransform {
 }
 
 export const viewerTransform = new ViewerTransform();
+
+/**
+ * The tracked viewer's head as a point in the scene: panel-centre metres moved
+ * onto the glass (GLASS_Z) at the panel's height. The same placement off-axis
+ * uses for its eye, without the strength dial — this is where the person IS, for
+ * her gaze and for the follow orbit's bearing.
+ */
+export function viewerWorld(out: THREE.Vector3): THREE.Vector3 {
+  const p = viewerTransform.get();
+  return out.set(p.x, SPACE.panelCenterY + p.y, GLASS_Z + Math.max(p.z, 0.15));
+}

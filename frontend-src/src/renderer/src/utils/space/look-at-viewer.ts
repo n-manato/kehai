@@ -55,8 +55,12 @@ export function resetViewerLookAt() {
 /**
  * Rotate the spine chain so she looks toward `targetWorld`.
  * Call once per frame, after the motion player and before `vrm.update()`.
+ *
+ * `weight` (0..1) scales the turn on top of `SPACE.lookAt` — the camera-follow
+ * hand-over, so she turns to a person only while one is tracked and eases back
+ * to facing front when they leave, instead of snapping.
  */
-export function applyViewerLookAt(vrm: VRM, targetWorld: THREE.Vector3, dt: number) {
+export function applyViewerLookAt(vrm: VRM, targetWorld: THREE.Vector3, dt: number, weight = 1) {
   if (SPACE.lookAt <= 0.001 || !vrm.humanoid) return;
 
   const head = vrm.humanoid.getNormalizedBoneNode("head" as never) as THREE.Object3D | null;
@@ -116,7 +120,7 @@ export function applyViewerLookAt(vrm: VRM, targetWorld: THREE.Vector3, dt: numb
   // master strength: the eyes are meant to carry most of the tracking, the head
   // only to agree with them.
   _delta.setFromUnitVectors(_fwd, _local);
-  _apply.identity().slerp(_delta, THREE.MathUtils.clamp(SPACE.lookAt, 0, 1));
+  _apply.identity().slerp(_delta, THREE.MathUtils.clamp(SPACE.lookAt * weight, 0, 1));
 
   // Ease so a jump in the tracked position (a re-lock after losing the face)
   // doesn't snap her neck.
