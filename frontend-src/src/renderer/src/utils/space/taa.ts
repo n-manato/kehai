@@ -371,11 +371,17 @@ void main() {
   // the single-sample raster misses entirely.
   vec2 bestUv = vUv;
   float bestD = texture2D(tVelDepth, vUv).x;
+  float noHist = 0.0;
   for (int y = -1; y <= 1; y++) {
     for (int x = -1; x <= 1; x++) {
       vec2 o = vUv + vec2(float(x), float(y)) * uTexelIn;
       float d = texture2D(tVelDepth, o).x;
       if (d < bestD) { bestD = d; bestUv = o; }
+      // B > 1.5 = "never accumulate here" (the 0/1 rain, binary-rain.ts): small
+      // thin glyphs sliding under a drifting camera are what this resolve's
+      // thin-feature lock holds hardest, and they shimmered — measured 5x the
+      // flicker with TAA on vs off in the rain. Dilated 3x3 to cover glyph edges.
+      noHist = max(noHist, step(1.5, texture2D(tVelocity, o).z));
     }
   }
   vec2 vel = texture2D(tVelocity, bestUv).xy;
@@ -387,7 +393,7 @@ void main() {
   // wrapped traffic mover): there is nothing true to fetch. Ghost-averse
   // brief: drop it and pay one aliased frame.
   if (any(lessThan(histUv, vec2(0.0))) || any(greaterThan(histUv, vec2(1.0)))
-      || speedPx > uMaxVel) valid = 0.0;
+      || speedPx > uMaxVel || noHist > 0.5) valid = 0.0;
 
   // DEPTH DISOCCLUSION (what FSR2 calls its depth-based rejection). The clamp
   // rejects by COLOUR, so a newly-uncovered surface that happens to resemble
@@ -1128,7 +1134,18 @@ export class TaaVelocity {
     // debug figures' joint labels) and fat lines use their own vertex layouts
     // and would rasterise garbage velocity over the frame.
     const hidden: THREE.Object3D[] = [];
+    // Objects that move in their own vertex shader (binary-rain.ts) are invisible
+    // to the override material — it would draw them where their buffers say, i.e.
+    // standing still. They bring a velocity material of their own and are drawn
+    // with it after the shared pass, depth-tested against it.
+    const custom: THREE.Object3D[] = [];
     scene.traverse((o) => {
+      if (o.userData.taaVelocityMaterial && o.visible) {
+        // eslint-disable-next-line no-param-reassign
+        o.visible = false;
+        custom.push(o);
+        return;
+      }
       const m = o as THREE.SkinnedMesh;
       if ((m.isSkinnedMesh || (m.isMesh && m.morphTargetInfluences?.length))
         && !m.userData.__taaVel) this.register(m);
@@ -1156,6 +1173,22 @@ export class TaaVelocity {
     renderer.autoClear = true;
     renderer.setRenderTarget(this.rt);
     renderer.render(scene, camera);
+    if (custom.length) {
+      scene.overrideMaterial = null;
+      renderer.autoClear = false;
+      custom.forEach((o) => {
+        const m = o as THREE.Mesh;
+        const own = m.material;
+        const vel = o.userData.taaVelocityMaterial as THREE.ShaderMaterial;
+        vel.uniforms.uCurrVP.value.copy(taa.viewProj);
+        vel.uniforms.uPrevVP.value.copy(taa.prevViewProj);
+        m.material = vel;
+        // eslint-disable-next-line no-param-reassign
+        o.visible = true;
+        renderer.render(o, camera);
+        m.material = own;
+      });
+    }
     renderer.setRenderTarget(rt);
     renderer.setClearColor(this.clearColor, clearAlpha);
     renderer.autoClear = autoClear;

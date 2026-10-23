@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import datetime
 from typing import (
     AsyncIterator,
     List,
@@ -22,6 +23,9 @@ from ..transformers import (
     actions_extractor,
     tts_filter,
     display_processor,
+    normalize_labelled_tags,
+    strip_labelled_tags,
+    _GESTURE_TAG,
 )
 from ...config_manager import TTSPreprocessorConfig
 from ..input_types import BatchInput, TextSource
@@ -310,6 +314,17 @@ class BasicMemoryAgent(AgentInterface):
             # Drop contentless assistant turns (bare "..." left by interrupts).
             # Replayed as context they teach the model that an empty reply is a
             # valid answer, and it starts producing them on its own.
+            # Clean the tags older replies leaked into storage. Replayed, they are
+            # few-shot examples: the model copied "[expression: joy]", which the
+            # live path could not parse — the loop that made every sentence
+            # neutral. Labelled emotions become the prompt's own [joy] form (the
+            # example it SHOULD copy); [g:...] and [emoji: ...] go. The files are
+            # left as they are; only what the model sees is cleaned.
+            if role == "assistant":
+                content = strip_labelled_tags(
+                    _GESTURE_TAG.sub("", normalize_labelled_tags(content))
+                )
+                content = re.sub(r"[ \t]{2,}", " ", content).strip()
             if role == "assistant" and not re.sub(r"[.…\s]", "", content):
                 continue
             # Drop REPEATED identical assistant replies. Once the model has said
@@ -422,6 +437,17 @@ class BasicMemoryAgent(AgentInterface):
                 )
 
         if user_content:
+            # The clock, every turn. Asked the time, the model answered from nothing
+            # ("It's 3:17 PM." at 17:31) — the persona does not tell it to use the
+            # time tool and it did not. Sent just before the user turn, not in the
+            # system prompt: a prompt that changes every minute would void vLLM's
+            # prefix cache for the whole history behind it. Not stored in memory.
+            now = datetime.now().astimezone()
+            messages.append({
+                "role": "system",
+                "content": f"Current local time: {now.strftime('%A, %d %B %Y, %H:%M')} "
+                f"(UTC{now.strftime('%z')[:3]}:{now.strftime('%z')[3:]}).",
+            })
             user_message = {"role": "user", "content": user_content}
             messages.append(user_message)
 

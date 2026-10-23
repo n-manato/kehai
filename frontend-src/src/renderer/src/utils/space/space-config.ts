@@ -16,6 +16,67 @@ export const SPACE = {
   /** Master switch. */
   enabled: true,
 
+  // --- Scene ------------------------------------------------------------------
+  /**
+   * Which environment to build. "dataflow" (2026-10-22): no text and no drawn
+   * structure — a projector base at her feet and a cloud of data bits that turns
+   * around her, streams into her while she thinks and out of her while she
+   * talks (data-flow.ts / pedestal.ts). "console": the earlier holographic
+   * console (HUD rings, text panels, towers, traffic). Rebuilt on change.
+   */
+  scene: "dataflow" as "dataflow" | "console",
+  /** Data bits: opacity scale (0 = off), count (rebuild), size, colours.
+   *  Off by default (2026-10-22, "チリいらない"): beside the 0/1 rain the square
+   *  bits read as dust. The 0/1 flips and the base carry the state instead. */
+  flow: 0,
+  flowCount: 1600,
+  flowSize: 22,
+  flowColor: 0x0577b8,
+  /** What a bit fades toward behind her. Near the field = see-through on PROTO. */
+  flowFarColor: 0x7cc4e8,
+  /** The point the bits stream into / out of: the emblem on her chest, just in
+   *  FRONT of it — a core inside the body hid every stream behind her torso. */
+  flowCoreY: 1.36,
+  flowCoreZ: 0.2,
+  /** 0/1 columns falling behind her (binary-rain.ts): opacity (0 = off), layout
+   *  (columns x rows: rebuild), fall speed m/s, glyph height m, colour. */
+  rain: 0.85,
+  rainColumns: 20, // 60 -> 30 -> 20 (2026-10-22, "数字の数が多すぎる" / "まだ少しおおい")
+  // 18 rows over 3.2 m (0.18 m apart) at 0.07 m/s: a given spot on screen sees a
+  // new digit arrive every 2-5 s. At 26 rows / 0.18 m/s it was 1-2 a second, which
+  // read as the digits "switching 0/1 too fast" even with no switching at all.
+  rainRows: 9,
+  rainSpeed: 0.07,
+  rainGlyphM: 0.09,
+  /** Depth band of the columns behind her (m, rebuild) and how much the far ones
+   *  blur (mip bias at the far end). */
+  rainNear: 2,
+  rainFar: 14,
+  rainBlur: 2.5,
+  /** Foreground 0/1 (binary-rain.ts `fore`): columns at the frame edges in front
+   *  of her, defocused. Count (rebuild), opacity share (0 = off), blur (mip bias). */
+  rainFgColumns: 2,
+  rainFgOpacity: 0.35,
+  rainFgBlur: 3.5,
+  rainColor: 0x0568a8,
+  /** Bright band travelling down each column (0 = off: one steady level). */
+  rainBand: 0,
+  /** Cyan veil just behind her that separates her from the far field
+   *  (backlight.ts): opacity at the centre (0 = off) and colour. */
+  backlight: 0.22,
+  backlightColor: 0x4fc3ea,
+  /** Her reflection in the floor, fading away from her feet (floor-reflection.ts).
+   *  Opacity (0 = off). Costs one extra scene render at 1/3 resolution. */
+  reflection: 0.22,
+  /** Projector base under her feet (0 = off) and its colour. */
+  pedestal: 1.0,
+  pedestalColor: 0x0796d0,
+  /**
+   * Field colour for the dataflow scene. On the PROTO panel white is see-through,
+   * so this is as close to white as the grade allows without tinting the box.
+   */
+  flowBackdrop: 0xf1f2f6,
+
   /**
    * ONE knob over how much light the environment puts on the panel.
    *
@@ -194,7 +255,7 @@ export const SPACE = {
    * cameraOrbitDeg is 0. Sideways movement is what slides the background against
    * her and separates the depth layers.
    */
-  cameraDrift: 0.03,
+  cameraDrift: 0.01, // 1/3 of the original 0.03 (2026-10-22): parallax for depth behind her, without the shimmer the full drift put on the 0/1 field
   /**
    * Vertical and depth amplitudes, metres — deliberately much smaller, and now
    * independent knobs rather than fixed fractions of the lateral one.
@@ -207,12 +268,16 @@ export const SPACE = {
    * return, because motion along the view axis barely shifts anything laterally.
    * So Z is cut to 0.004 and Y to 0.010, and the budget goes to X.
    */
-  cameraDriftY: 0.010,
-  cameraDriftZ: 0.004,
+  cameraDriftY: 0.0035,
+  cameraDriftZ: 0.0015,
   /** Seconds for one full drift cycle. Each axis also mixes a second, slower
    *  incommensurate component, so nothing in the path repeats on this period. */
   cameraDriftPeriod: 16,
   /** Master switch for the drift — `__AI_DEBUG__.setCameraDriftEnabled()`. */
+  // On, at a third of the original amplitude (see cameraDrift). At full strength it
+  // was the largest measured source of flicker on the 0/1 field — every column
+  // shifts by its own parallax — and was switched off; the glyphs have since moved
+  // from point sprites to quads, which take sub-pixel motion without stepping.
   cameraDriftEnabled: true,
 
   /**

@@ -110,7 +110,7 @@ async def handle_sentence_output(
         else:
             logger.debug("🚫 No translation engine available. Skipping translation.")
 
-        full_response += display_text.text
+        full_response = join_spoken_pieces(full_response, display_text.text)
         await tts_manager.speak(
             tts_text=tts_text,
             display_text=display_text,
@@ -120,6 +120,22 @@ async def handle_sentence_output(
             websocket_send=websocket_send,
         )
     return full_response
+
+
+def join_spoken_pieces(acc: str, piece: str) -> str:
+    """Append one spoken piece to the reply text. The divider cuts at commas too and
+    each piece arrives left-stripped, so a bare += stored "Thursday,22 October" /
+    "Oh,you're glowing" — in the chat history, which is replayed to the model. Put
+    the space back between Latin text; CJK runs on without one."""
+    if (
+        acc
+        and piece
+        and acc[-1] in ",.!?;:)\u2019\"'"
+        and piece[0].isascii()
+        and piece[0].isalnum()
+    ):
+        return f"{acc} {piece}"
+    return acc + piece
 
 
 async def handle_audio_output(

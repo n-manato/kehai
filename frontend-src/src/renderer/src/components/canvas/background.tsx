@@ -39,13 +39,13 @@ const Background = memo(({ children }: { children?: React.ReactNode }) => {
             transform: 'scaleX(-1)',
           }}
         />
-      ) : (
+      ) : backgroundUrl ? (
         <Image
           {...canvasStyles.background.image}
           src={backgroundUrl}
           alt="background"
         />
-      )}
+      ) : null}
       {children}
     </Box>
   );

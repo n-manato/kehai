@@ -93,10 +93,12 @@ export class LAppView {
     // this._gear.release();
     // this._gear = null;
 
-    this._back.release();
+    // Both are created by initializeSprite(), which never runs when the view is torn
+    // down before a Live2D model was ever shown (a VRM session) — it threw here.
+    this._back?.release();
     this._back = null;
 
-    gl.deleteProgram(this._programId);
+    if (this._programId) gl.deleteProgram(this._programId);
     this._programId = null;
   }
 

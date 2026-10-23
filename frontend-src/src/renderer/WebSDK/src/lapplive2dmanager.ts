@@ -191,6 +191,9 @@ export class LAppLive2DManager {
 
     // Use the directory name and file name from our configuration
     const model: string = LAppDefine.ModelDir[index];
+    // No Live2D model configured (a VRM/glb session): loading would request
+    // "undefined/undefined.model3.json" and 404.
+    if (!model) return;
     const modelPath: string = LAppDefine.ResourcesPath + model + '/';
     
     // Use ModelFileNames if available, otherwise fall back to ModelDir

@@ -48,6 +48,10 @@ export interface VisemeCue {
  * exports only have a jaw. Resolved once at bind time so the per-frame path
  * stays a lookup.
  */
+/** ARKit `jawOpen` drive (see update): speech level minus this floor, times this gain. */
+const JAW_FLOOR = 0.06;
+const JAW_OPEN_GAIN = 3.6;
+
 const VISEME_ALIASES: Record<string, string[]> = {
   aa: ["aa", "viseme_aa", "AA", "jawOpen"],
   E: ["E", "viseme_E", "EE", "jawOpen"],
@@ -73,6 +77,12 @@ class VRMLipSync {
   private visemeIdx: Record<string, number[]> = {};
 
   private cues: VisemeCue[] = [];
+
+  /** Has the TTS ever delivered viseme cues? Only then is the volume-driven jaw a
+   *  stopgap awaiting them (see update). GPT-SoVITS never sends any, and the android's
+   *  mouth sat at HALF travel for every sentence waiting for cues that never came
+   *  (measured: jawOpen max 0.265 against the 0.275 stopgap cap). */
+  private cuesSeen = false;
 
   /** Current blend per viseme, so shapes cross-fade instead of snapping. */
   private vLevel: Record<string, number> = {};
@@ -105,6 +115,13 @@ class VRMLipSync {
   private liveSource: (() => number) | null = null;
 
   private smoothed = 0;
+
+  /**
+   * Speech loudness (0..1), smoothed, independent of how the mouth is driven.
+   * The viseme path returns before the volume is ever read, so anything else
+   * that wants to follow the voice (ai-fx's glow) reads this instead.
+   */
+  voice = 0;
 
   // How wide the mouth opens. `gain` scales the raw volume; `cap` is the max
   // opening (1 = fully open). Tunable live via window.__vrmMouth.
@@ -186,6 +203,7 @@ class VRMLipSync {
    */
   setVisemes(cues: VisemeCue[], startAt: number) {
     if (!cues || !cues.length) return;
+    this.cuesSeen = true;
     const now = performance.now() / 1000;
     const base = startAt > 0 ? startAt : now;
     const mapped = cues.map((c) => ({ v: c.v, t: base + c.t, d: c.d }));
@@ -292,9 +310,22 @@ class VRMLipSync {
     this.smoothed = 0;
   }
 
+  /** Current speech level (0..1): the live PCM RMS when streaming, else the
+   *  clip's volume array at the playback position. */
+  private rawLevel(): number {
+    if (this.liveSource) return this.liveSource();
+    const a = this.audio;
+    if (a && !a.paused && !a.ended && this.volumes.length) {
+      const idx = Math.floor((a.currentTime * 1000) / this.sliceMs);
+      return this.volumes[Math.min(idx, this.volumes.length - 1)] || 0;
+    }
+    return 0;
+  }
+
   /** Set the mouth-open morph from the current playback position. Call per frame,
    *  AFTER vrm.update() so it overrides the expressionManager. */
   update() {
+    this.voice += (this.rawLevel() - this.voice) * 0.4;
     // Real mouth shapes win whenever a sentence has supplied them. They are not
     // BLENDED with the volume-driven jaw: the jaw morph is one of the shapes the
     // viseme set already drives, so running both would fight over the same
@@ -311,20 +342,18 @@ class VRMLipSync {
     // hanging open with no lip shaping is what "the mouth opens too wide at the
     // start, then it's fine" is describing. Half the travel while it is a
     // stopgap; the cues take over with the full range the moment they land.
-    const stopgap = this.hasVisemes() ? 0.5 : 1;
+    const stopgap = this.hasVisemes() && this.cuesSeen ? 0.5 : 1;
     const cap = this.cap * stopgap;
-    let target = 0;
-    if (this.liveSource) {
-      // Streaming: mouth openness straight from the live PCM RMS (already 0..1).
-      target = Math.min(cap, this.liveSource() * this.gain);
-    } else {
-      const a = this.audio;
-      if (a && !a.paused && !a.ended && this.volumes.length) {
-        const idx = Math.floor((a.currentTime * 1000) / this.sliceMs);
-        const v = this.volumes[Math.min(idx, this.volumes.length - 1)] || 0;
-        target = Math.min(this.cap, v * this.gain);
-      }
-    }
+    // Streaming takes the stopgap cap; the clip path keeps the full one.
+    // ARKit's jawOpen is a much smaller shape than the PMX あ the gain was tuned on: at
+    // the same 0.1-0.2 speech level the android's mouth barely parted (median 0.12).
+    // A plain larger gain kept it hanging open between syllables (troughs sit at ~0.08,
+    // peaks ~0.16), so take the floor off first: it shuts in the dips, opens on the peaks.
+    const raw = this.rawLevel();
+    const level = this.mouthName === "jawOpen"
+      ? Math.max(0, raw - JAW_FLOOR) * JAW_OPEN_GAIN
+      : raw;
+    const target = Math.min(this.liveSource ? cap : this.cap, level * this.gain);
     // Smooth so the mouth doesn't chatter between 20ms samples.
     this.smoothed += (target - this.smoothed) * 0.4;
     // The author's 「あ２:-0.02」 mouth-centre sink used to be approximated here as a

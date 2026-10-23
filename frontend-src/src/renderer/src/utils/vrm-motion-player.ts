@@ -202,6 +202,9 @@ const POSTURE: Record<string, { kind: "vert" | "down" | "L" | "R"; ref: [number,
 
 /** GestureLSM joints that get the temporal smoothing (see _smoothLsm). The arms and
  *  hands are left alone: their sharpness IS the gesture (beats, emphasis). */
+/** Finger bones that take `fingerGain` (Distal follows the gesture gain). */
+const FINGER_GAIN_BONE = /(Proximal|Intermediate|Metacarpal)$/;
+
 const LSM_SMOOTH = /^(Pelvis|Spine\d|Neck|Head|Jaw|[LR]_(Hip|Knee|Ankle|Foot|Collar|Eye))$/;
 
 /**
@@ -489,6 +492,9 @@ class VRMMotionPlayer {
   private chestFrame = false; // drive the chest by full frame (set in adaptChains)
 
   private restLocal: Record<string, THREE.Quaternion> = {};
+
+  /** Relaxed finger pose, averaged from the idle clips (see the gain step in applyFrame). */
+  private _relaxQ: Record<string, THREE.Quaternion> = {};
 
   private gestureSeq = 0;
 
@@ -833,6 +839,7 @@ class VRMMotionPlayer {
     // Capture every retargeted bone's idle local quat — the pose the gesture is
     // damped back toward (shoulders/torso) so it doesn't look contorted upright.
     this.restLocal = {};
+    this._relaxQ = {}; // per model
     for (const b of ORDER) { const nb = this.node(b); if (nb) this.restLocal[b] = nb.quaternion.clone(); }
     for (const b of Object.keys(FRAME)) { const nb = this.node(b); if (nb) this.restLocal[b] = nb.quaternion.clone(); }
     // capture the resting local quaternions the idle sway oscillates around
@@ -856,7 +863,7 @@ class VRMMotionPlayer {
    *  and legs full (the legs are already uprighted upstream). */
   private gainFor(bone: string): number {
     if (/Shoulder$/.test(bone)) return this.shoulderGain; // clavicles
-    if (/(Proximal|Intermediate|Metacarpal)$/.test(bone)) return this.fingerGain; // fingers
+    if (FINGER_GAIN_BONE.test(bone)) return this.fingerGain; // fingers
     if (/(UpperLeg|LowerLeg|Foot)$/.test(bone)) return 1; // legs
     if (bone === "neck") return this.neckGain; // the neck swings the HEAD-world, which whips the twintails at seams
     return this.gestureGain; // spine, chest, upper/lower arm, hand
@@ -2966,9 +2973,19 @@ class VRMMotionPlayer {
       if (!sq) { sq = this._pq.clone(); this._smoothQ[b] = sq; }
       else sq.slerp(this._pq, this.smoothFor(b));
       // Damp toward the idle rest pose (kills the clavicle shrug / tames the torso).
-      const g = this.gainFor(b); const rl = this.restLocal[b];
+      const g = this.gainFor(b);
+      // Damped FINGERS settle toward the relaxed hand learned from the idles, not the
+      // rest pose: rest is the T-pose's flat hand, so at the LSM finger gain (0.12) every
+      // reply opened both hands flat like a mannequin's (measured 4-10 deg of curl while
+      // talking vs 10-20 in the idles).
+      const finger = FINGER_GAIN_BONE.test(b);
+      const rl = (finger && this._relaxQ[b]) || this.restLocal[b];
       if (g >= 0.999 || !rl) nb.quaternion.copy(sq);
       else nb.quaternion.copy(rl).slerp(sq, g);
+      if (finger && this._idleW() > 0.99 && this.restLocal[b]) {
+        // ~3s running average of the idle hand (60fps)
+        (this._relaxQ[b] ??= this.restLocal[b].clone()).slerp(nb.quaternion, 0.006);
+      }
       nb.updateMatrixWorld(true);
     }
     // Head look direction LAST — the neck (its parent) is now posed by the aim loop.

@@ -42,7 +42,13 @@ const BgUrlContext = createContext<BgUrlContextState | null>(null);
  */
 export function BgUrlProvider({ children }: { children: React.ReactNode }) {
   const { baseUrl } = useWebSocket();
-  const DEFAULT_BACKGROUND = `${baseUrl}/bg/ceiling-window-room-night.jpeg`;
+  // No default picture. The 3D scene draws its own field over the whole canvas, so
+  // the upstream room photo only ever showed while the model was LOADING — and on
+  // the PROTO panel (white = see-through) a dark night-city photo is an opaque
+  // slab. It used to be requested from :12393 and fail, which hid this; with the
+  // URL fixed it appeared on every reload. A chosen background still works.
+  void baseUrl;
+  const DEFAULT_BACKGROUND = '';
 
   // Local storage for persistent background URL
   const [backgroundUrl, setBackgroundUrl] = useLocalStorage<string>(

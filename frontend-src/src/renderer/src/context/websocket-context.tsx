@@ -3,8 +3,16 @@ import React, { useContext, useCallback } from 'react';
 import { wsService } from '@/services/websocket-service';
 import { useLocalStorage } from '@/hooks/utils/use-local-storage';
 
-const DEFAULT_WS_URL = 'ws://127.0.0.1:12393/client-ws';
-const DEFAULT_BASE_URL = 'http://127.0.0.1:12393';
+// Served by the KEHAI server itself (the web build), the page's own origin IS the
+// server. The upstream constant (:12393) is this project's port only in Electron
+// (file://). It was the default everywhere: a fresh browser profile connected to a
+// port nothing listens on, and the background provider — which reads this default,
+// not the saved setting — requested every backdrop from :12393 (ERR_CONNECTION_REFUSED).
+const SERVED = typeof window !== 'undefined' && /^https?:$/.test(window.location.protocol);
+const DEFAULT_WS_URL = SERVED
+  ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/client-ws`
+  : 'ws://127.0.0.1:12393/client-ws';
+const DEFAULT_BASE_URL = SERVED ? window.location.origin : 'http://127.0.0.1:12393';
 
 export interface HistoryInfo {
   uid: string;

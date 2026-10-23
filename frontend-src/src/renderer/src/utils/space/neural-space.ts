@@ -13,6 +13,13 @@ import { createHudRings } from "./hud-rings";
 import { createPanels } from "./panels";
 import { createTowers } from "./towers";
 import { applyParallax } from "./off-axis";
+import { createDataFlow } from "./data-flow";
+import { createPedestal } from "./pedestal";
+import { createBinaryRain } from "./binary-rain";
+import { createBacklight } from "./backlight";
+import { createFloorReflection } from "./floor-reflection";
+import { FlowState } from "./flow-state";
+import { vrmLipSync } from "../vrm-lipsync";
 import type { SpaceModule, SpaceMood } from "./types";
 import {
   SPACE,
@@ -73,6 +80,16 @@ class NeuralSpace {
 
   private mood: SpaceMood = { ...MOOD_TARGETS.idle };
 
+  /** Thinking vs speaking, which the mood cannot tell apart (see flow-state.ts). */
+  private flow = new FlowState(() => this.state, () => vrmLipSync.voice);
+
+  /** Console handle: `__flowState.w` shows the eased idle/listen/think/speak mix. */
+  constructor() {
+    (window as unknown as { __flowState: FlowState }).__flowState = this.flow;
+  }
+
+  private builtScene = "";
+
   private moodTarget: SpaceMood = { ...MOOD_TARGETS.idle };
 
   /** Build the environment and attach it to the scene. Call once, after lights. */
@@ -110,6 +127,20 @@ class NeuralSpace {
   private build() {
     if (!this.scene || !this.renderer || !this.camera) return;
     this.teardownModules();
+    if (SPACE.scene === "dataflow") {
+      // No text, no drawn structure: the base she stands on, the shadow that puts
+      // her on the box floor, and the data cloud. See data-flow.ts for why.
+      this.builtScene = SPACE.scene;
+      this.attachModules([
+        createBackdrop(), createShadow(),
+        createBinaryRain(this.flow, this.camera, this.renderer),
+        createBinaryRain(this.flow, this.camera, this.renderer, true),
+        createBacklight(this.flow), createFloorReflection(this.renderer),
+        createPedestal(this.flow), createDataFlow(this.flow, this.camera),
+      ]);
+      return;
+    }
+    this.builtScene = SPACE.scene;
     this.attachModules([
       createBackdrop(), createShadow(), createWireframe(), createTraffic(), createParticles(),
       // The two that carry depth now that no room is drawn: rings crossing her
@@ -147,6 +178,8 @@ class NeuralSpace {
   update(dt: number) {
     if (!this.root || !SPACE.enabled) return;
     this.elapsed += dt;
+    if (SPACE.scene !== this.builtScene) this.build(); // __space({ scene: ... })
+    this.flow.update(dt);
     // Optional exaggerated layer separation on top of the physically-correct
     // parallax that off-axis projection already produces (Phase 3).
     applyParallax(this.bands);

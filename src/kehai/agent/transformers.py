@@ -23,6 +23,34 @@ _BARE_GESTURE_TAG = re.compile(
     r"\[(" + "|".join(sorted(EMOTE_TAGS, key=len, reverse=True)) + r")\]"
 )
 
+# LABELLED forms the model drifts into instead of the prompt's bare [joy]: it writes
+# "[expression: joy]" and an empty "[emoji: ]". Neither matched the emotion
+# extractor (so every sentence went out as neutral — face AND body motion), and the
+# colon/space dodged the generic [tag] strip, so they reached the subtitle and chat
+# history, where set_memory_from_history replayed them to the model as examples.
+# Measured 2026-10-22: 2387 [expression: ...] + 221 [emoji: ...] across 51 histories,
+# and every reply of the current android conversation in this form.
+_LABELLED_EMOTION_TAG = re.compile(
+    r"\[\s*(?:expression|emotion|face|mood)\s*[:：]\s*([A-Za-z_]+)\s*\]", re.IGNORECASE
+)
+_EMOJI_TAG = re.compile(r"\[\s*emoji\s*[:：]\s*([^\]]*)\]", re.IGNORECASE)
+
+
+# Any OTHER labelled tag the model makes up — "[time: 3:17 PM]" after a time answer —
+# for the same subtitle/history leak. Applied after the [g:...] gesture is extracted.
+_LABELLED_ANY = re.compile(r"\[\s*[A-Za-z_]+\s*[:：][^\]\n]{0,60}\]")
+
+
+def strip_labelled_tags(text: str) -> str:
+    return _LABELLED_ANY.sub("", text)
+
+
+def normalize_labelled_tags(text: str) -> str:
+    """[expression: joy] -> [joy]; [emoji: 😊] -> 😊 (an empty one just goes)."""
+    text = _LABELLED_EMOTION_TAG.sub(lambda m: f"[{m.group(1).lower()}]", text)
+    return _EMOJI_TAG.sub(lambda m: m.group(1).strip(), text)
+
+
 # Characters that count as a sentence ending. Used to decide whether a "。"
 # needs to be restored after a trailing emoji (which LLMs sometimes use in
 # place of a full stop) is stripped out.
@@ -190,6 +218,7 @@ def actions_extractor(live2d_model: Live2dModel):
                         # Content GESTURE intent, e.g. [g:point] -> a sentence-
                         # matching body clip. Extract + strip (its colon dodges the
                         # generic [tag] strip below).
+                        sentence.text = normalize_labelled_tags(sentence.text)
                         gm = _GESTURE_TAG.search(sentence.text)  # [g:key]
                         if gm:
                             key = gm.group(1)
@@ -252,7 +281,7 @@ def actions_extractor(live2d_model: Live2dModel):
                         # LLM invents (e.g. "[anger_thinking]") from leaking into
                         # the subtitle / TTS audio.
                         sentence.text = re.sub(
-                            r"\[[a-zA-Z_][a-zA-Z0-9_]*\]", "", sentence.text
+                            r"\[[a-zA-Z_][a-zA-Z0-9_]*\]", "", strip_labelled_tags(sentence.text)
                         )
                         # Emojis are motion triggers only — remove them from the
                         # text so they appear in neither the subtitle nor the

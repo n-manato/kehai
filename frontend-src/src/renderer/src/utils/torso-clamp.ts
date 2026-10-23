@@ -24,6 +24,8 @@
  */
 
 const ARM = ["L_Elbow", "R_Elbow", "L_Wrist", "R_Wrist"];
+/** Share of `radius` an AUTHORED clip's wrist is kept out of the torso (skirtOnly). */
+const AUTHORED_CORE = 0.6;
 
 /** Finger joints that ride along with each wrist (whatever of them the layout carries:
  *  GestureLSM has 3 per finger, the KAWAII clips 4 including a fingertip). */
@@ -116,7 +118,12 @@ export function clampHandsOutsideTorso(
     const cz = pel[2] + (nek[2] - pel[2]) * t;
     // Bump profile: widest across the CHEST/belly (t~0.55) where gesturing hands cross
     // in, narrower at the HIPS (so resting arms-at-side aren't flared out) and the neck.
-    let r = skirtOnly ? 0 : radius * (1 - 1.1 * (t - 0.55) * (t - 0.55));
+    // Authored clips keep a SHALLOW wrist guard over the torso too (AUTHORED_CORE): they
+    // were cleaned against Miku's body, and on a bustier rig (female_android) a hand-to-
+    // chest idle put the wrist 0.3 of the way to the spine — clean through her. A core
+    // this small leaves crossed arms and hands resting on the chest alone.
+    const prof = 1 - 1.1 * (t - 0.55) * (t - 0.55);
+    let r = skirtOnly ? (isWrist ? radius * AUTHORED_CORE * prof : 0) : radius * prof;
     // Widen to the cloth radius inside the skirt band (see SKIRT). tRaw, not t: the band
     // reaches BELOW the pelvis, where t is clamped to 0 and carries no height information.
     // WRISTS only: the band exists so a resting hand stays on the cloth surface; applying

@@ -11,10 +11,11 @@ import * as THREE from "three";
  * .glb avatars never see it, and no model_dict field has to be plumbed through
  * the React tree to reach the render closure.
  *
- * Why the body and not the room: on the PROTO panel black is transparent, and
- * every drawn environment tried there argued with the real depth behind the
- * glass (see body-depth.ts). Light that comes from HER — trim lines on black —
- * is the one thing the panel shows at full strength.
+ * Why the body and not the room: every drawn environment tried on the PROTO panel
+ * argued with the real depth behind the glass (see body-depth.ts). Note the panel
+ * is a transparent LCD on a light box: WHITE is see-through and only dark or
+ * saturated colour holds, so "glow" there reads as saturated cyan, never as light
+ * brighter than the box.
  *
  * State language, read at a glance from across a room:
  *   idle      — cyan, slow breathing (the unit is on)
@@ -66,6 +67,9 @@ const GLOW_BASE = 2.5;
 // `thinking-speaking` alone cannot tell the LLM wait from playback.
 const SPEAKING_LEVEL = 0.03;
 const SPEAKING_HOLD_S = 0.35;
+// Inside a reply, a gap this short is the pause BETWEEN sentences, not the LLM wait:
+// at 0.35s every sentence boundary flickered the eyes toward thinking-violet.
+const SENTENCE_GAP_S = 1.5;
 
 // Pearl shell. Shared by every shell material, so one console poke retunes all.
 //   uPearlSat  — albedo saturation kept (0 = grey, 1 = authored)
@@ -233,6 +237,8 @@ class AiFx {
     if (this.pinned) return this.pinned;
     if (this.appState === "loading") return "loading";
     if (this.lastVoiceAt >= 0 && this.t - this.lastVoiceAt < SPEAKING_HOLD_S) return "speaking";
+    if (this.appState === "thinking-speaking" && this.lastVoiceAt >= 0
+      && this.t - this.lastVoiceAt < SENTENCE_GAP_S) return "speaking";
     if (this.appState === "listening") return "listening";
     if (this.appState === "thinking-speaking") return "thinking";
     return "idle";

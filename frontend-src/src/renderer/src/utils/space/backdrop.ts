@@ -44,7 +44,7 @@ export function createBackdrop(): SpaceModule {
 
     update() {
       mesh.visible = !!SPACE.backdrop;
-      mat.color.set(SPACE.backdropColor);
+      mat.color.set(SPACE.scene === "dataflow" ? SPACE.flowBackdrop : SPACE.backdropColor);
     },
 
     dispose() {
