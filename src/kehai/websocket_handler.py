@@ -1044,6 +1044,9 @@ class WebSocketHandler:
             else:
                 context.history_uid = create_new_history(conf_uid)
                 logger.info(f"[history] started new conversation {context.history_uid}")
+                # No history to load, but the system prompt alone is worth
+                # prefilling (Rem's is ~12k tokens).
+                context.agent_engine.schedule_prefix_warm()
         except Exception as e:  # noqa: BLE001 — never block a connection over this
             logger.warning(f"[history] could not resume conversation: {e!r}")
 

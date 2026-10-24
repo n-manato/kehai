@@ -40,6 +40,13 @@ export GSV_STREAM=1                                   # low-latency streaming TT
 # real tokens, so the budget below leaves ~3k for generation at that cap.
 export LLM_CTX_BUDGET=21000
 export LLM_CTX_MAX=24576
+# No public-gateway fallback on PC-B. The fallback exists for PC-A's SSH tunnel;
+# here https://gpu.aiccore-uno.ai is this same box's gateway behind Cloudflare,
+# so it cannot help when the local one is slow or down. With it on, the client
+# also used a 12s read timeout: a long prefill on Qwen3.8 (Rem's first turn
+# ~10s, a 20k-token compaction ~17s) timed out, and every request for the next
+# 5 minutes went out through Cloudflare (2026-10-23: 502s). Empty = disabled.
+export LLM_BASE_FALLBACK=""
 export MOTION_GATEWAY_KEY="$(cat .motion_gateway_key 2>/dev/null || echo)"  # gateway bearer key (also used by gsv_stream.py)
 export ELEVENLABS_API_KEY="$(cat .elevenlabs_key 2>/dev/null || echo)"      # asr/elevenlabs_asr.py (shadow challenger)
 export BACKCHANNEL="${BACKCHANNEL:-1}"   # 相槌 on turn end (utils/backchannel.py); 0 = off

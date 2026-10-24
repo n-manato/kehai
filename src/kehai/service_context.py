@@ -727,6 +727,26 @@ class ServiceContext:
                 "spoken in one breath."
             )
 
+        # Every word is spoken, so tool use must be silent and reasoning must stay
+        # internal. Qwen3.8 (thinking off) opened tool turns with "Accessing the
+        # relevant records now." / "Hmm, let me check." and once wrote its plan
+        # into the reply ("The user is asking for the current time. I need to use
+        # the get_current_time function...") — all of which went to TTS.
+        if lang == "ja":
+            persona_prompt += (
+                "\n\n[ツールと考えの扱い] ツールが必要なときは、前置きを言わずにすぐ"
+                "呼び出してください（「確認しますね」「少々お待ちください」などは"
+                "言わない）。考えている過程や手順は書かず、相手への返事だけを"
+                "話してください。"
+            )
+        else:
+            persona_prompt += (
+                "\n\n[Tools and reasoning] When you need a tool, call it at once "
+                "and say nothing before it: no 'let me check', 'one moment', "
+                "'retrieving', 'accessing'. Never write out your reasoning, plans "
+                "or what the user is asking for; say only your reply to them."
+            )
+
         logger.debug("\n === System Prompt ===")
         logger.debug(persona_prompt)
 

@@ -8,4 +8,9 @@ character_config:
   conf_uid: "miku_yyb_001"
   live2d_model_name: "yyb_miku_10th"
   character_name: "Miku"
-  persona_prompt_file: "prompts/personas/miku.txt"
+  # English, stated rather than inherited: the voice, ASR and speech rules all
+  # come from conf.yaml's "en", and the Japanese-written miku.txt under them made
+  # the model answer in Japanese to be read by an English voice. miku_en.txt is
+  # the same character in English; miku.txt stays for a Japanese setup.
+  language: "en"
+  persona_prompt_file: "prompts/personas/miku_en.txt"

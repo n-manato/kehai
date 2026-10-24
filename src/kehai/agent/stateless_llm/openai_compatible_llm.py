@@ -458,3 +458,42 @@ class AsyncLLM(StatelessLLMInterface):
                 logger.debug("Chat completion finished.")
                 await stream.close()
                 logger.debug("Stream closed.")
+
+    async def warm_prefix(
+        self,
+        messages: List[Dict[str, Any]],
+        system: str = None,
+        tools: List[Dict[str, Any]] = None,
+    ) -> None:
+        """Prefill system prompt + history into vLLM's prefix cache.
+
+        The first turn of a session otherwise prefills all of it while the user
+        waits: ~2.5s for ~3k tokens with Qwen3.8-27B, ~10s for Rem's ~12k-token
+        prompt. The request is shaped exactly like chat_completion's (same body
+        cap, same trim, same tools — the template renders tools into the system
+        turn) but stops after the last message instead of opening an assistant
+        turn, so the next real request extends it byte for byte. Best effort:
+        a failure is logged and the turn simply runs cold. LLM_PREFIX_WARM=0
+        turns it off.
+        """
+        if os.getenv("LLM_PREFIX_WARM", "1") == "0":
+            return
+        budget = int(os.getenv("LLM_CTX_BUDGET", "12000"))
+        messages = _trim_to_context(_cap_message_bodies(messages), system, budget)
+        if system:
+            messages = [{"role": "system", "content": system}, *messages]
+        t0 = time.monotonic()
+        try:
+            await self.client.chat.completions.create(
+                messages=messages,
+                model=self.model,
+                max_tokens=1,
+                tools=tools if self.support_tools else NOT_GIVEN,
+                extra_body={"add_generation_prompt": False},
+            )
+            logger.info(
+                f"[prefix-warm] {len(messages)} messages prefilled in "
+                f"{time.monotonic() - t0:.2f}s"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[prefix-warm] skipped: {e}")

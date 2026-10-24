@@ -29,6 +29,28 @@ cd ~/Documents/DEV/KEHAI
 見た目の確認が要るときは、この箱の Chrome を headless で `http://127.0.0.1:12394/` に
 向ければスクリーンショットは撮れる（描画に音は要らない）。ただし対話の音は判定できない。
 
+### LLM は Qwen3.8-27B（2026-10-23 から）
+
+`scripts/pcb-vllm/serve-qwen38.sh` が :8807 で Qwen3.8-27B（4bit、思考オフ、MTP）を出す。venv と重みは
+`AICCORE-Nexus/stack/vllm-next/` にあり、そこの `serve-qwen38.sh` はこのファイルへのシンボリックリンク
+（Nexus は `stack/` を git 管理していないので、設定はこちらで管理する）。旧 id `qwen3-30b-a3b` を別名で
+受けるので、gateway と conf.yaml はそのまま。旧モデル（Qwen3-30B-A3B）は容量のため削除済みで、
+戻す手順は `scripts/pcb-stack-up.sh` のコメントにある。
+
+- **e2e_probe の PASS だけを見ないこと。** 音声さえ出れば PASS になるので、LLM がエラーでもエラー文を
+  喋って PASS する。`spoken` の行を必ず読む。
+- Qwen3.8 の元のテンプレートは、会話の途中の system を 400 で拒否する。KEHAI は毎ターン時刻の system 行を
+  入れるので、`scripts/pcb-vllm/chat_template_kehai.jinja`（途中の system を受け入れる版）を外すと
+  全ターンが失敗する。
+- 時刻の行は履歴にも残す（`basic_memory_agent._to_messages`）。残さないと前のターンのプロンプトが次の先頭に
+  ならず、GDN 混合型の prefix cache が毎ターン外れる。
+- 接続したとき・履歴を読んだときに、システムプロンプトと履歴を裏で先読みする
+  （`warm_prefix`、`LLM_PREFIX_WARM=0` で無効）。実測の TTFA は最初のターンから約1.0〜1.5s。
+- `start_server.sh` は `LLM_BASE_FALLBACK=""`。公開 gateway はこの箱自身なので切り替えても無意味なうえ、
+  切り替えが有効だと12秒の読み取りタイムアウトが付き、長いプロンプトの読み込みで5分間 Cloudflare 経由になった。
+- Rem（システムプロンプト約1.2万トークン）は、キャッシュが空なら読み込みに約10秒かかる。キャラを切り替えると
+  先読みが裏で走るので、切り替え直後に話しかけなければ待たされない。
+
 ## 触ってはいけない / 間違えやすい
 
 1. **`bash start_server.sh` 以外で起動しない**。素の `run_server.py` は env が入らず、

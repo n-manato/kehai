@@ -350,6 +350,27 @@ class BasicMemoryAgent(AgentInterface):
             + (f" ({merged} unanswered user turns merged)" if merged else "")
             + (f" ({deduped} repeated replies dropped)" if deduped else "")
         )
+        self.schedule_prefix_warm()
+
+    def schedule_prefix_warm(self) -> None:
+        """Prefill the LLM's cache with system prompt + memory in the background,
+        so the first turn of a session does not pay for it. Called whenever the
+        memory is (re)established; the work runs in a task."""
+        if not isinstance(self._llm, OpenAICompatibleAsyncLLM):
+            return
+        tools = (
+            self._formatted_tools_openai
+            if self._use_mcpp and self._tool_manager
+            else None
+        )
+        try:
+            import asyncio
+
+            asyncio.get_running_loop().create_task(
+                self._llm.warm_prefix(list(self._memory), self._system, tools)
+            )
+        except RuntimeError:
+            pass  # no loop (sync context) — skip; the first turn just runs cold
 
     def handle_interrupt(self, heard_response: str) -> None:
         """Handle user interruption."""
@@ -441,13 +462,14 @@ class BasicMemoryAgent(AgentInterface):
             # ("It's 3:17 PM." at 17:31) — the persona does not tell it to use the
             # time tool and it did not. Sent just before the user turn, not in the
             # system prompt: a prompt that changes every minute would void vLLM's
-            # prefix cache for the whole history behind it. Not stored in memory.
+            # prefix cache for the whole history behind it.
             now = datetime.now().astimezone()
-            messages.append({
+            time_message = {
                 "role": "system",
                 "content": f"Current local time: {now.strftime('%A, %d %B %Y, %H:%M')} "
                 f"(UTC{now.strftime('%z')[:3]}:{now.strftime('%z')[3:]}).",
-            })
+            }
+            messages.append(time_message)
             user_message = {"role": "user", "content": user_content}
             messages.append(user_message)
 
@@ -456,6 +478,16 @@ class BasicMemoryAgent(AgentInterface):
                 skip_memory = True
 
             if not skip_memory:
+                # Kept in memory too, so this request is an exact prefix of the
+                # next one. Left out of memory, it sat between the history and the
+                # new turn and was gone from the next request: the hybrid
+                # (Gated DeltaNet) Qwen3.8 caches its state only at block
+                # boundaries and at the end of a prompt, so every turn re-read up
+                # to a block of history (TTFT 0.54-0.81s against 0.23-0.28s).
+                # Skipped when this turn merges into an unanswered user turn, so
+                # the merge below still sees a user message last.
+                if not (self._memory and self._memory[-1]["role"] == "user"):
+                    self._memory.append(dict(time_message))
                 self._add_message(
                     text_prompt if text_prompt else "[User provided image(s)]", "user"
                 )
@@ -966,6 +998,8 @@ class BasicMemoryAgent(AgentInterface):
                 f"(memory now {len(self._memory)} msgs, "
                 f"~{self._mem_tokens(self._memory)} tok)"
             )
+            # The summary replaced the start of the prompt; re-warm the new one.
+            self.schedule_prefix_warm()
         except Exception as e:  # noqa: BLE001 — compaction must never break chat
             logger.warning(f"[compact] failed: {e!r}")
         finally:
@@ -1019,6 +1053,12 @@ class BasicMemoryAgent(AgentInterface):
                     out += chunk
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[compact] summarize LLM call failed: {e!r}")
+            return ""
+        # chat_completion reports API failures by YIELDING an error sentence (so
+        # a live turn speaks it) rather than raising. Taken as the summary, it
+        # replaced 337 messages of context with one error line (2026-10-23).
+        if out.lstrip().startswith("Error calling the chat endpoint"):
+            logger.warning(f"[compact] summarize LLM call failed: {out.strip()[:120]}")
             return ""
         return out.strip()
 

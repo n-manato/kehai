@@ -52,10 +52,18 @@ if ok http://127.0.0.1:8000/health; then log "STT sidecar already up"; else
   wait_for http://127.0.0.1:8000/health 60 "STT sidecar"
 fi
 
+# 2026-10-23: Qwen3.8-27B (stack/vllm-next). It answers to the old id
+# "qwen3-30b-a3b" too, so the gateway and conf.yaml are unchanged. The flags and
+# the reasons for them live in scripts/pcb-vllm/serve-qwen38.sh.
+# The previous model (Qwen3-30B-A3B) was DELETED for disk space the same day.
+# Rolling back means rebuilding stack/vllm-voice first — a venv with vllm==0.11.0
+# and `hf download stelterlab/Qwen3-30B-A3B-Instruct-2507-AWQ --local-dir
+# models/qwen3-30b-a3b-awq` — then serving it with:
+#   vllm serve models/qwen3-30b-a3b-awq --host 127.0.0.1 --port 8807 --served-model-name qwen3-30b-a3b --tensor-parallel-size 2 --max-model-len 24576 --max-num-seqs 4 --gpu-memory-utilization 0.52 --enable-auto-tool-choice --tool-call-parser hermes --enable-prefix-caching
 if ok http://127.0.0.1:8807/v1/models; then log "vLLM already up"; else
   if ! pgrep -f '[v]llm serve' >/dev/null; then
-    log "starting vLLM"
-    (cd "$NEXUS/stack/vllm-voice" && setsid --fork bash -c 'export PATH="$PWD/.venv/bin:$PATH"; exec vllm serve models/qwen3-30b-a3b-awq --host 127.0.0.1 --port 8807 --served-model-name qwen3-30b-a3b --tensor-parallel-size 2 --max-model-len 24576 --max-num-seqs 4 --gpu-memory-utilization 0.52 --enable-auto-tool-choice --tool-call-parser hermes --enable-prefix-caching </dev/null >>vllm.log 2>&1')
+    log "starting vLLM (Qwen3.8-27B)"
+    (cd "$NEXUS/stack/vllm-next" && setsid --fork bash -c 'exec ./serve-qwen38.sh </dev/null >>vllm.log 2>&1')
   fi
   wait_for http://127.0.0.1:8807/v1/models 600 vLLM
 fi
