@@ -153,3 +153,17 @@ Live2D Characters/vrm/female_android.glb
 
 # Purchased animation pack: kept locally, never committed
 /KAWAII ANIMATIONS*/
+
+# Third-party and personal assets: kept locally, never committed
+/Live2D Characters/
+/YYB Hatsune Miku/
+/vrm_face_edit/
+/msToonCoordinator*/
+/Chancelor glb/
+/Chancelor fbx/
+/.removed/
+/prompts/personas/chancelor_li_en.txt
+/motion-lib-kawaii/
+/motion-lib-catalog/
+/reference_audio/
+/model_dict.json.bak-*
