@@ -147,3 +147,6 @@ scripts/pcb-render-x/glgrab/kehai-glgrab
 
 # purchased third-party model (not redistributable); rebuilt from KEHAI-assets
 Live2D Characters/vrm/female_android.glb
+
+# purchased source assets for the android avatar (not redistributable); see KEHAI-assets/female_android_rig/README.md
+/KEHAI-assets/
