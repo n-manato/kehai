@@ -9,7 +9,14 @@ from ..message_handler import message_handler
 from .types import WebSocketSend, BroadcastContext
 from .tts_manager import TTSTaskManager
 from ..agent.output_types import SentenceOutput, AudioOutput
-from ..agent.input_types import BatchInput, TextData, ImageData, TextSource, ImageSource
+from ..agent.input_types import (
+    BatchInput,
+    TextData,
+    ImageData,
+    AudioData,
+    TextSource,
+    ImageSource,
+)
 from ..asr.asr_interface import ASRInterface
 from ..live2d_model import Live2dModel
 from ..tts.tts_interface import TTSInterface
@@ -30,8 +37,12 @@ def create_batch_input(
     images: Optional[List[Dict[str, Any]]],
     from_name: str,
     metadata: Optional[Dict[str, Any]] = None,
+    audio: Optional[str] = None,
 ) -> BatchInput:
-    """Create batch input for agent processing"""
+    """Create batch input for agent processing.
+
+    `audio` is the spoken turn as a base64 WAV (omni mode, from the server VAD);
+    the agent attaches it to the user message when its LLM can hear."""
     return BatchInput(
         texts=[
             TextData(source=TextSource.INPUT, content=input_text, from_name=from_name)
@@ -46,6 +57,7 @@ def create_batch_input(
         ]
         if images
         else None,
+        audio=AudioData(data=audio) if audio else None,
         metadata=metadata,
     )
 
@@ -132,7 +144,8 @@ def join_spoken_pieces(acc: str, piece: str) -> str:
         and piece
         and acc[-1] in ",.!?;:)\u2019\"'"
         and piece[0].isascii()
-        and piece[0].isalnum()
+        # An opening quote too: 'Mm,"they" again.' was stored that way.
+        and (piece[0].isalnum() or piece[0] in "\"'(")
     ):
         return f"{acc} {piece}"
     return acc + piece
@@ -179,7 +192,11 @@ async def process_user_input(
     """Process user input, converting audio to text if needed"""
     if isinstance(user_input, np.ndarray):
         logger.info("Transcribing audio input...")
-        input_text = await asr_engine.async_transcribe_np(user_input)
+        try:
+            input_text = await asr_engine.async_transcribe_np(user_input)
+        except Exception as e:  # noqa: BLE001 — a failed ASR is an empty turn here
+            logger.warning(f"ASR failed: {e!r}")
+            input_text = ""
         await safe_websocket_send(
             websocket_send,
             json.dumps({"type": "user-input-transcription", "text": input_text})
@@ -195,6 +212,8 @@ async def finalize_conversation_turn(
     broadcast_ctx: Optional[BroadcastContext] = None,
 ) -> None:
     """Finalize a conversation turn"""
+    if hasattr(tts_manager, "flush"):
+        await tts_manager.flush()  # a short sentence held for merging (Qwen3-TTS)
     if tts_manager.task_list:
         await asyncio.gather(*tts_manager.task_list)
         await safe_websocket_send(

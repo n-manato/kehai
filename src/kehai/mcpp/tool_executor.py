@@ -164,6 +164,10 @@ class ToolExecutor:
         logger.info(f"Executing {len(tool_calls)} tool(s) for {caller_mode} caller.")
         # Voice filler: tool turns are otherwise silent for the whole
         # decide->execute->re-prompt loop (6-30s measured). Announce once.
+        # With OpenAI-style streaming the filler already fired at the first
+        # tool-call delta that named a function (openai_compatible_llm), and
+        # tool_notify.fire() is once per turn, so this is a no-op then; it is
+        # the trigger for prompt-mode JSON tools and the Claude stream.
         try:
             from ..conversations import tool_notify
 

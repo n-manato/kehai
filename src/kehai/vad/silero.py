@@ -1,3 +1,6 @@
+import copy
+import os
+import time
 import asyncio
 from collections import deque
 from enum import Enum
@@ -9,6 +12,7 @@ from pydantic import BaseModel
 from silero_vad import load_silero_vad
 
 from . import mic_tuning
+from .. import turn_contingency
 from .vad_interface import VADInterface
 
 
@@ -74,9 +78,16 @@ class VADEngine(VADInterface):
             prob_threshold=prob_threshold,
             db_threshold=db_threshold,
             required_hits=required_hits,
-            required_misses=required_misses,
+            # The PAUSE (segment close = where the speculative reply starts),
+            # in 32 ms frames. Live override like VAD_END_MISSES: omni runs 4
+            # (128 ms; conf.yaml's 6 = 192 ms) — the Thinker's first sentence is
+            # the floor now, so every frame here moves the whole chain earlier.
+            required_misses=int(os.getenv("VAD_PAUSE_MISSES", "") or required_misses or 24),
             smoothing_window=smoothing_window,
-            end_misses=end_misses or 12,
+            # Live override too (start_server.sh sets it per brain mode: the omni
+            # mode starts its speculative reply on the pause itself, so it can
+            # afford a shorter end-of-turn wait than the cascade).
+            end_misses=int(os.getenv("VAD_END_MISSES", "") or end_misses or 12),
             # Env override so the gate can be re-tuned live (calibration runs)
             # without editing conf.yaml and restarting twice.
             onset_db_threshold=int(
@@ -112,6 +123,21 @@ class VADEngine(VADInterface):
         logger.info("Loading Silero-VAD model...")
         return load_silero_vad()
 
+    def fresh(self) -> "VADEngine":
+        """Same settings, its own model and turn state — one per client.
+
+        Sessions used to share the default context's engine: one state machine
+        and one Silero RNN state for every connection, never reset. A reload
+        mid-utterance carried the old bytes into the new client's first segment,
+        and two clients streaming at once (the PROTO and a browser) fed one
+        turn between them."""
+        clone = copy.copy(self)
+        clone.model = self.load_vad_model()
+        clone.state = StateMachine(self.config)
+        return clone
+
+    _STATE_RESET_S = float(os.getenv("VAD_STATE_RESET_S", "2") or 0)
+
     def detect_speech(self, audio_data: list[float]):
         audio_np = np.array(audio_data, dtype=np.float32)
         for i in range(0, len(audio_np), self.window_size_samples):
@@ -122,6 +148,18 @@ class VADEngine(VADInterface):
 
             with torch.no_grad():
                 speech_prob = self.model(chunk, self.config.target_sr).item()
+
+            # The detector carries its memory from frame to frame and ran for
+            # hours without ever clearing it. After a long quiet stretch, one
+            # utterance and ~10 s of digital silence, a weak recording scored
+            # 0.16-0.34 against the 0.4 it needs and left no trace (2026-11-09
+            # 20:18-20:24, reproduced offline; 0.99 with the memory cleared).
+            # Cleared after _STATE_RESET_S of clear silence while no turn is open.
+            if self._STATE_RESET_S:
+                idle = self.state.state == State.IDLE
+                self._quiet_n = getattr(self, "_quiet_n", 0) + 1 if (idle and speech_prob < 0.1) else 0
+                if self._quiet_n == int(self._STATE_RESET_S / 0.032):
+                    self.model.reset_states()
 
             if speech_prob:
                 # print(speech_prob)
@@ -244,6 +282,83 @@ class StateMachine:
         )
         return False
 
+    # The onset gate follows the room (2026-11-09, for a crowded venue): a fixed
+    # 68 dB let the murmur of a full hall open turns on its own. The floor is the
+    # 20th percentile of the last ~8 s of level heard while nobody was mid-turn;
+    # the gate is that + VAD_ADAPT_MARGIN_DB (10), never below the configured gate
+    # and never above VAD_ADAPT_MAX_DB (74 — the visitors' speech peaks at 70-80
+    # dB with the PROTO's AGC). VAD_ADAPT_MARGIN_DB=0 turns it off.
+    _ADAPT_MARGIN = float(os.getenv("VAD_ADAPT_MARGIN_DB", "10") or 0)
+    _ADAPT_MAX = float(os.getenv("VAD_ADAPT_MAX_DB", "74") or 74)
+
+    # Follow the speaker who opened the turn (2026-11-09 04:02): once a turn was
+    # open, any speech at or above the sustain level (45 dB) kept it open, so with
+    # someone in front of her the TV beside the PROTO ran on as "their" turn and
+    # was answered. The turn's own level is taken from its first ~0.6 s of speech
+    # (75th percentile); speech more than _REL_DROP dB under it (a voice further
+    # away) neither keeps the turn open nor resumes it. Generous, because people
+    # do trail off — the second half of a sentence comes back softer (see the
+    # INACTIVE note below). VAD_REL_DROP_DB=0 turns it off.
+    _REL_DROP = float(os.getenv("VAD_REL_DROP_DB", "15") or 0)
+
+    def _sustain(self, smoothed_prob: float, smoothed_db: float) -> float:
+        """The level that keeps this turn going (and learns the turn's level)."""
+        ref_hist = getattr(self, "_ref_hist", None)
+        if ref_hist is None:
+            ref_hist = self._ref_hist = []
+            self._ref, self._rel_cut = None, 0
+        if self._ref is None and smoothed_prob >= self.prob_threshold and np.isfinite(smoothed_db):
+            ref_hist.append(float(smoothed_db))
+            if len(ref_hist) >= 20:
+                self._ref = float(np.percentile(ref_hist, 75))
+        if not self._REL_DROP or self._ref is None:
+            return self.db_threshold
+        sustain = max(self.db_threshold, self._ref - self._REL_DROP)
+        if smoothed_prob >= self.prob_threshold and self.db_threshold <= smoothed_db < sustain:
+            self._rel_cut += 1
+        return sustain
+
+    def _turn_reset(self) -> None:
+        if getattr(self, "_rel_cut", 0) >= 10:
+            logger.info(
+                f"[vad] {self._rel_cut * 32} ms of speech more than {self._REL_DROP:.0f} dB under the "
+                f"turn's own level ({self._ref:.0f} dB) not taken as the speaker's — a voice further away"
+            )
+        self._ref_hist, self._ref, self._rel_cut = [], None, 0
+
+    def _base_gate(self) -> float:
+        """The onset level before the noise floor is added: the mic panel's value,
+        or — VAD_ROOM_GATE, see turn_contingency — just above the voices this
+        room produces while nobody stands in front of her."""
+        if not turn_contingency.ROOM_GATE:
+            return self.onset_db
+        gate, top, n = turn_contingency.room_gate()
+        if abs(gate - getattr(self, "_room_gate_logged", -1.0)) >= 1.0:
+            self._room_gate_logged = gate
+            heard = "no voices heard with nobody in front" if top is None else f"room voices reach {top:.1f} dB over {n * 0.032:.0f} s"
+            logger.info(f"[vad] room gate: onset {gate:.1f} dB ({heard}; mic panel {self.onset_db})")
+        return gate
+
+    def _adaptive_gate(self, smoothed_db: float) -> float:
+        hist = getattr(self, "_floor_hist", None)
+        if hist is None:
+            hist = self._floor_hist = deque(maxlen=250)  # 8 s of 32 ms frames
+            self._floor_gate, self._floor_n, self._floor_logged = self._base_gate(), 0, 0.0
+        if np.isfinite(smoothed_db):
+            hist.append(float(smoothed_db))
+        self._floor_n += 1
+        if self._floor_n % 31 == 0:  # ~1 s
+            base = self._base_gate()
+            self._floor_gate = base
+            if self._ADAPT_MARGIN and len(hist) >= 60:
+                floor = float(np.percentile(hist, 20))
+                self._floor_gate = min(max(base, floor + self._ADAPT_MARGIN), max(base, self._ADAPT_MAX))
+                now = time.monotonic()
+                if self._floor_gate > base and now - self._floor_logged > 30:
+                    self._floor_logged = now
+                    logger.info(f"[vad] noisy room: onset gate {self._floor_gate:.0f} dB (floor {floor:.0f} dB)")
+        return self._floor_gate
+
     def get_smoothed_values(self, prob, db):
         self.prob_window.append(prob)
         self.db_window.append(db)
@@ -260,27 +375,45 @@ class StateMachine:
         # Obtain the smoothed prob and db
         smoothed_prob, smoothed_db = self.get_smoothed_values(prob, db)
         mic_tuning.MONITOR.frame(smoothed_prob, smoothed_db, self.state.name.lower())
+        turn_contingency.frame(smoothed_prob, smoothed_db, self.prob_threshold, self.db_threshold)
 
         if self.state == State.IDLE:
             self.pre_buffer.append(chunk_bytes)
+            gate = self._adaptive_gate(smoothed_db)
             # ONSET uses the strict proximity gate: this is where a far-away
             # voice or a room noise would otherwise open a turn.
-            if smoothed_prob >= self.prob_threshold and smoothed_db >= self.onset_db:
+            if smoothed_prob >= self.prob_threshold and smoothed_db >= gate:
                 self.hit_count += 1
                 if self.hit_count >= self.required_hits:
                     self.state = State.ACTIVE
+                    self._turn_reset()
                     self.update(chunk_bytes, smoothed_prob, smoothed_db)
                     self.hit_count = 0
+                    self._under = 0
                     mic_tuning.MONITOR.event("start", db=round(float(smoothed_db), 1))
                     yield [], [], b"<|PAUSE|>"
             else:
                 self.hit_count = 0
+                # Speech the onset gate kept out leaves no trace otherwise, and
+                # "sometimes she does not answer" could not be told apart from
+                # the addressee checks (2026-11-04). Log a run of clear speech
+                # (Silero sure) that stayed under the gate for >= 0.32 s.
+                if smoothed_prob >= max(self.prob_threshold, 0.6):
+                    self._under = getattr(self, "_under", 0) + 1
+                    self._under_db = max(getattr(self, "_under_db", -1e9), float(smoothed_db))
+                elif getattr(self, "_under", 0):
+                    if self._under >= 10:
+                        logger.info(
+                            f"[vad-level] speech UNDER the onset gate: {self._under * 32} ms, "
+                            f"loudest {self._under_db:.1f} dB < {gate:.0f} dB — not a turn"
+                        )
+                    self._under, self._under_db = 0, -1e9
 
         elif self.state == State.ACTIVE:
             self.update(chunk_bytes, smoothed_prob, smoothed_db)
             if (
                 smoothed_prob >= self.prob_threshold
-                and smoothed_db >= self.db_threshold
+                and smoothed_db >= self._sustain(smoothed_prob, smoothed_db)
             ):
                 self.miss_count = 0
             else:
@@ -315,7 +448,7 @@ class StateMachine:
             # at turn START (IDLE); once the turn is yours, keep it.
             if (
                 smoothed_prob >= self.prob_threshold
-                and smoothed_db >= self.db_threshold
+                and smoothed_db >= self._sustain(smoothed_prob, smoothed_db)
             ):
                 self.hit_count += 1
                 if self.hit_count >= self.required_hits:
@@ -332,11 +465,28 @@ class StateMachine:
                 if self.miss_count >= self.end_misses:
                     self.state = State.IDLE
                     self.miss_count = 0
+                    self._turn_reset()
                     yield [], [], b"<|RESUME|>"
                     # Any speech that accumulated since the last segment (i.e. a
                     # brief resume that didn't survive) goes out as a final
                     # segment; pure-silence tails are dropped by the prob guard.
+                    # ...and only if it ever reached the SUSTAIN level, the one
+                    # that keeps speech alive in ACTIVE. Tails peaking at 39-44 dB
+                    # (breath, a chair, a far voice) passed the other checks, and
+                    # with cumulative ASR each one re-transcribed the WHOLE
+                    # utterance at the endpoint: 1.2-1.3 s of extra wait, a
+                    # transcript that changed under the speculative reply, and
+                    # that reply thrown away (2026-10-23 21:55:37, 22:19:28).
+                    tail_peak = max(
+                        (d for d in self.dbs if np.isfinite(d)), default=-np.inf
+                    )
                     if (
+                        len(self.probs) > 8
+                        and max(self.probs, default=0.0) >= self.prob_threshold
+                        and tail_peak < self.db_threshold
+                    ):
+                        self._log_level("SEG-END below sustain, not transcribed")
+                    elif (
                         len(self.probs) > 8
                         and max(self.probs, default=0.0) >= self.prob_threshold
                         and self._loud_enough("SEG-END")

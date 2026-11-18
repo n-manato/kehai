@@ -94,7 +94,13 @@ def _params(text: str, cfg: GSVStreamConfig, split_method: str | None = None) ->
         "parallel_infer": "false",
         "split_bucket": "false",
         "media_type": "raw",
-        "streaming_mode": "true",
+        # GSV api_v2 streaming modes: "true"/1 = best quality, but the first
+        # chunk only leaves when the WHOLE sentence is synthesized (0.2 s for
+        # "Hello.", 0.8 s for a 7-word line, 1.6 s for a 20-word one — measured
+        # 2026-11-03 against :9880 directly); 3 = chunk-by-chunk out of the AR
+        # decoder, first chunk 0.18-0.22 s whatever the length, "lower quality"
+        # per GSV's own doc (chunk joins). Try GSV_STREAMING_MODE=3 by ear.
+        "streaming_mode": os.getenv("GSV_STREAMING_MODE", "true"),
         "fragment_interval": cfg.fragment_interval,
         **cfg.tuning,
     }

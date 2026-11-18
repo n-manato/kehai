@@ -10,10 +10,11 @@ import { smplBodyPlayer } from '@/utils/smpl-body-player';
 import { mmdExpression } from '@/utils/mmd-expression';
 import { vrmExpression } from '@/utils/vrm-expression';
 import { vrmLipSync } from '@/utils/vrm-lipsync';
+import { streamingControl } from '@/utils/streaming-audio-player';
 import { useAudioTask } from './use-audio-task';
 
 export const useInterrupt = () => {
-  const { aiState, setAiState } = useAiState();
+  const { getAiState, setAiState } = useAiState();
   const { sendMessage } = useWebSocket();
   const { fullResponse, clearResponse } = useChatHistory();
   // const { currentModel } = useLive2DModel();
@@ -21,9 +22,10 @@ export const useInterrupt = () => {
   const { stopCurrentAudioAndLipSync } = useAudioTask();
 
   const interrupt = (sendSignal = true) => {
-    if (aiState !== 'thinking-speaking') return;
+    if (getAiState() !== 'thinking-speaking') return;
     console.log('Interrupting conversation chain');
 
+    streamingControl.stopNow?.(); // the streamed reply (see streamingControl)
     stopCurrentAudioAndLipSync();
     talkingMotionController.onSpeechEnd(); // fade talking sway back to idle
     mmdMotionPlayer.stop(); // fade the MMD HY-Motion clip back to idle

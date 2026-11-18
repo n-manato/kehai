@@ -19,6 +19,7 @@ import numpy as np
 from loguru import logger
 
 from .asr_interface import ASRInterface
+from ..utils.sentence_spacing import unglue
 
 
 class VoiceRecognition(ASRInterface):
@@ -34,7 +35,12 @@ class VoiceRecognition(ASRInterface):
         vad_filter: bool = False,
     ) -> None:
         self.base_url = base_url
-        self.model = model
+        # Live overrides (start_server.sh, omni mode): there the LLM hears the
+        # audio itself and this transcript only gates the turn and fills the
+        # history, so the faster turbo model with greedy decoding is enough —
+        # and with a 0.6 s endpoint the text has to be back before the endpoint,
+        # or the speculative reply sits released-but-waiting on it (2026-11-03).
+        self.model = os.getenv("ASR_MODEL_OVERRIDE", "") or model
         # Whisper language hint; empty = per-utterance auto-detect. The PC-B
         # sidecar forwards it to WhisperModel.transcribe(language=...).
         self.language = language
@@ -42,7 +48,7 @@ class VoiceRecognition(ASRInterface):
         # recovers a lot of what greedy decoding mangles; initial_prompt biases
         # the decoder toward the names and terms this deployment actually uses,
         # so they stop turning into similar-sounding everyday words.
-        self.beam_size = beam_size
+        self.beam_size = int(os.getenv("ASR_BEAM_OVERRIDE", "") or beam_size)
         self.initial_prompt = initial_prompt
         # Strip non-speech spans before decoding: whisper otherwise "hears"
         # breath and room tone as words and reports them with full confidence.
@@ -104,15 +110,33 @@ class VoiceRecognition(ASRInterface):
 
     # Public route used when base_url (usually the SSH LAN tunnel) is down —
     # a dead tunnel must degrade to +~0.35s latency, not to deaf ears.
-    _PUBLIC_URL = "https://gpu.aiccore-uno.ai/v1/audio/transcriptions"
+    # ASR_PUBLIC_FALLBACK="" turns it off: on PC-B the public gateway is this
+    # same box behind Cloudflare, so it cannot help, and the detour cost a turn
+    # 35 s on 2026-10-23 21:22 (5 s local timeout, then a 30 s wait for a 502).
+    _PUBLIC_URL = os.getenv(
+        "ASR_PUBLIC_FALLBACK", "https://gpu.aiccore-uno.ai/v1/audio/transcriptions"
+    )
 
-    def transcribe_np(self, audio: np.ndarray) -> str:
+    async def async_transcribe_fast(self, audio: np.ndarray) -> str:
+        """The quick model, greedy (ASR_FAST_MODEL, default the turbo id): for a
+        transcript that has to be back before the turn's endpoint (~280 ms after
+        the pause) — the busy-room check against the Thinker's own transcript.
+        large-v3 with beam 5 takes 370-1300 ms; this ~180-260 ms."""
+        import asyncio
+
+        if audio.dtype != np.float32:
+            audio = audio.astype(np.float32)
+        return await asyncio.to_thread(self.transcribe_np, audio, True)
+
+    def transcribe_np(self, audio: np.ndarray, fast: bool = False) -> str:
         # Opus only pays off on a real network leg. On loopback (PC-B: the
         # gateway is on this box) it is pure cost: ~25ms to encode here, ~8ms
         # to decode in the sidecar, and a lossy copy of the speech whisper
         # then has to recognize. Loopback gets the raw WAV — except PC-A's
         # :13000, which is an SSH tunnel and so a network leg after all.
+        _tw = time.monotonic()
         wav_files = {"file": ("utterance.wav", self._wav_bytes(audio), "audio/wav")}
+        _wav_ms = (time.monotonic() - _tw) * 1000
         ogg_files = None
 
         def files_for(url: str) -> dict:
@@ -129,10 +153,10 @@ class VoiceRecognition(ASRInterface):
                 )
             return ogg_files
 
-        data = {"model": self.model}
+        data = {"model": os.getenv("ASR_FAST_MODEL", "faster-whisper-large-v3") if fast else self.model}
         if self.language:
             data["language"] = self.language
-        if self.beam_size and self.beam_size > 1:
+        if self.beam_size and self.beam_size > 1 and not fast:
             data["beam_size"] = str(self.beam_size)
         if self.initial_prompt:
             data["initial_prompt"] = self.initial_prompt
@@ -140,7 +164,7 @@ class VoiceRecognition(ASRInterface):
             data["vad_filter"] = "1"
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         urls = [self.base_url]
-        if self._PUBLIC_URL not in urls:
+        if self._PUBLIC_URL and self._PUBLIC_URL not in urls:
             urls.append(self._PUBLIC_URL)
         for i, url in enumerate(urls):
             # The tunnel (127.0.0.1:13000) gets a SHORT timeout: a half-dead
@@ -148,7 +172,9 @@ class VoiceRecognition(ASRInterface):
             # over to the public route in seconds, not block up to `timeout`
             # (60s) which reads as "しゃべっても反応しない". Public keeps the long
             # timeout (a real transcription can take a while).
-            is_tunnel = "127.0.0.1" in url or "localhost" in url
+            # Only when there IS a fallback to fail over to: with none, cutting a
+            # slow loopback transcription short just loses the turn.
+            is_tunnel = ("127.0.0.1" in url or "localhost" in url) and i + 1 < len(urls)
             per_to = (
                 httpx.Timeout(5.0, connect=2.0) if is_tunnel else self._client.timeout
             )
@@ -178,8 +204,15 @@ class VoiceRecognition(ASRInterface):
                 logger.debug(
                     f"[gateway_asr] {used or '?'} {(time.monotonic() - t0) * 1000:.0f}ms"
                 )
-                return (body.get("text") or "").strip()
-            except Exception as e:  # noqa: BLE001 — try fallback, else ""
+                if fast:  # where a quick transcript's time goes (it has to beat the endpoint)
+                    self.last_fast = (_wav_ms, (time.monotonic() - t0) * 1000, r.elapsed.total_seconds() * 1000)
+                # The sidecar joins whisper's segments without a space between
+                # them: "Bye.All you." — see sentence_spacing.
+                return unglue((body.get("text") or "").strip())
+            except Exception as e:  # noqa: BLE001 — try fallback, else raise
                 more = " — trying public fallback" if i + 1 < len(urls) else ""
                 logger.warning(f"[gateway_asr] {url} failed: {e!r}{more}")
-        return ""
+        # A failure is not silence. Returned as "", the cumulative ASR took it as
+        # "nothing more was said" and answered the previous, shorter transcript —
+        # the sentence cut off where the last pause had been.
+        raise RuntimeError("gateway ASR failed on every route")

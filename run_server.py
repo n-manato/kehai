@@ -394,6 +394,10 @@ def run(console_log_level: str, auto_sovits: bool = True):
         # disconnects, so without a bound the shutdown hangs forever on
         # "Waiting for connections to close." Force-close after a few seconds.
         timeout_graceful_shutdown=5,
+        # No per-message deflate: it ran on the event loop over every frame — the PROTO's
+        # H.264 (30 Mbit/s, incompressible), her PCM, its camera JPEGs — and showed up as
+        # 44-57 ms stalls in permessage_deflate encode/decode (2026-11-05).
+        ws_per_message_deflate=False,
         **ssl_kwargs,
     )
 
@@ -417,6 +421,7 @@ def run(console_log_level: str, auto_sovits: bool = True):
         log_level=console_log_level.lower(),
         timeout_graceful_shutdown=5,
         lifespan="off",  # the main listener already ran the app's startup
+        ws_per_message_deflate=False,  # see main_config
         ssl_certfile=certfile,
         ssl_keyfile=keyfile,
     )

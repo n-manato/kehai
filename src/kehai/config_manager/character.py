@@ -29,6 +29,9 @@ class CharacterConfig(I18nMixin):
     # Per character: the two bodies read very differently, and mixing styles is
     # only jarring on the one whose motion is meant to be generated.
     gesture_lsm_only: bool = Field(default=False, alias="gesture_lsm_only")
+    # The pre-generated turn opener this character plays until its first generated clip
+    # lands: motion-lib-bridge/<name>.json. Empty = the shared default ("opener").
+    gesture_bridge: str = Field(default="", alias="gesture_bridge")
     human_name: str = Field(default="Human", alias="human_name")
     avatar: str = Field(default="", alias="avatar")
     persona_prompt: str = Field(default="", alias="persona_prompt")

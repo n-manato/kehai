@@ -83,7 +83,8 @@ const SERVER_STALE_S = 2.0;
  * so a speaker she lets interrupt her is one the server will then answer.
  */
 const ADDRESS_LEAD_MS = 1000;
-const ADDRESS_MIN_FRAC = 0.3;
+// 0.3 -> 0.12 -> 0.05 with the server (2026-10-23): see face_detect.Attention.MIN_FRAC.
+const ADDRESS_MIN_FRAC = 0.05;
 
 class HeadTracker {
   private video: HTMLVideoElement | null = null;

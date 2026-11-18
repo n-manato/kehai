@@ -7,6 +7,17 @@ from .types import FormattedTool
 from .mcp_client import MCPClient
 from .server_registry import ServerRegistry
 
+# Tool info fetched from the MCP servers, cached for the life of the process and
+# keyed by the enabled-servers config (order kept: it is the prompt order).
+# Listing tools spawns every enabled server and tears it down again (~0.5-1 s
+# per server), and it ran on EVERY connection — twice (get_tools + the raw dict)
+# — and again on each character switch. Tool lists do not change while the
+# process lives. Only a complete fetch is cached, so a server that failed to
+# start is retried by the next caller instead of being hidden for the whole run.
+_TOOL_INFO_CACHE: Dict[
+    Tuple[str, ...], Tuple[Dict[str, Dict[str, str]], Dict[str, FormattedTool]]
+] = {}
+
 
 class ToolAdapter:
     """Dynamically fetches tool information from enabled MCP servers and formats it."""
@@ -28,8 +39,15 @@ class ToolAdapter:
             )
             return servers_info, formatted_tools
 
+        cache_key = tuple(enabled_servers)
+        cached = _TOOL_INFO_CACHE.get(cache_key)
+        if cached is not None:
+            logger.debug(f"MC: Tool info cache hit for servers: {enabled_servers}")
+            return dict(cached[0]), dict(cached[1])
+
         logger.debug(f"MC: Fetching tool info for enabled servers: {enabled_servers}")
 
+        complete = True  # every known server listed its tools
         # Use a single client instance for efficiency
         async with MCPClient(self.server_registery) as client:
             for server_name in enabled_servers:
@@ -61,6 +79,7 @@ class ToolAdapter:
                             generic_schema=None,
                         )
                 except (ValueError, RuntimeError, ConnectionError) as e:
+                    complete = False
                     logger.error(
                         f"MC: Failed to get info for server '{server_name}': {e}"
                     )
@@ -70,6 +89,7 @@ class ToolAdapter:
                         servers_info[server_name] = {}
                     continue  # Continue to next server
                 except Exception as e:
+                    complete = False
                     logger.error(
                         f"MC: Unexpected error for server '{server_name}': {e}"
                     )
@@ -77,6 +97,8 @@ class ToolAdapter:
                         servers_info[server_name] = {}
                     continue  # Continue to next server
 
+        if complete:
+            _TOOL_INFO_CACHE[cache_key] = (dict(servers_info), dict(formatted_tools))
         logger.debug(
             f"MC: Finished fetching tool info. Found {len(formatted_tools)} tools across enabled servers."
         )

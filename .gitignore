@@ -38,6 +38,11 @@ conda
 # Local conda/miniconda environment (must never be committed)
 third_party/miniconda3/
 
+# PC-B brain switch (./kehai.sh mode): per-box state, never shared
+.mode
+.render-display
+.mode-stage
+
 # Sensitive data
 .env
 .motion_gateway_key
@@ -136,3 +141,9 @@ certs/
 # exhibition mic calibration (render_view mic panel)
 mic_tuning.json
 mic_tuning.tmp
+
+# kehai-glgrab is built by scripts/pcb-render-x/glgrab/build.sh (start_server.sh runs it when missing)
+scripts/pcb-render-x/glgrab/kehai-glgrab
+
+# purchased third-party model (not redistributable); rebuilt from KEHAI-assets
+Live2D Characters/vrm/female_android.glb

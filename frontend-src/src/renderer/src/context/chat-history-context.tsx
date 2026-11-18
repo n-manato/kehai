@@ -197,7 +197,15 @@ export function ChatHistoryProvider({ children }: { children: React.ReactNode })
   );
 
   const appendResponse = useCallback((text: string) => {
-    setFullResponse((prev) => prev + (text || ''));
+    // Pieces arrive one sentence (or clause) at a time, trimmed: put the space
+    // back between Latin text so the heard part reads "Mm, I'm fine." rather
+    // than "Mm,I'm fine." (CJK runs on without one). Same rule as the server's
+    // join_spoken_pieces.
+    setFullResponse((prev) => {
+      const piece = text || '';
+      const glue = prev && piece && /[,.!?;:)"'’]$/.test(prev) && /^[A-Za-z0-9"'“(]/.test(piece);
+      return glue ? `${prev} ${piece}` : prev + piece;
+    });
   }, []);
 
   const clearResponse = useCallback(() => {

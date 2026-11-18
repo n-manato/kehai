@@ -23,6 +23,14 @@
 // fires AFTER the audio actually finished, not ~2.5x too early.
 export const streamingPlaybackState = { active: false };
 
+// Hard stop for the streamed reply, registered by the websocket handler that
+// owns the player. A barge-in must call it DIRECTLY: it used to happen in an
+// effect on aiState === 'interrupted', and the VAD sets 'interrupted' then
+// 'listening' in the same tick — React batches the two, the effect never saw
+// 'interrupted', and she kept talking under the user (ducked, then back at full
+// volume when they stopped).
+export const streamingControl: { stopNow: (() => void) | null } = { stopNow: null };
+
 // The most recent (single) live player, so UI layers without a ref to it (the
 // VAD context) can duck the output while the USER is speaking. Cleared on
 // stop/drain.

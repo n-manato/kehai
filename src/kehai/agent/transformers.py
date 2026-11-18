@@ -1,3 +1,4 @@
+import os
 import re
 from typing import AsyncIterator, Tuple, Callable, List, Union, Dict, Any
 from functools import wraps
@@ -9,12 +10,20 @@ from ..live2d_model import Live2dModel
 from ..config_manager import TTSPreprocessorConfig
 from ..utils.sentence_divider import SentenceDivider
 from ..utils.sentence_divider import SentenceWithTags, TagState
+from ..utils.sentence_spacing import unglue
 from loguru import logger
 
 # Content gesture tag the LLM emits per sentence, e.g. "[g:point]". Has a colon,
 # so it is NOT caught by the generic [tag] strip in actions_extractor — extract +
 # remove it there.
 _GESTURE_TAG = re.compile(r"\[g:([a-z_]+)\]")
+# A tag written just before punctuation ("Hello [g:greet].") left a space
+# behind it: "Hello ." in the subtitle and the history (2026-11-04, Iris).
+_SPACE_BEFORE_PUNCT = re.compile(r"\s+([.,!?;:…])")
+
+
+def _close_tag_gap(text: str) -> str:
+    return _SPACE_BEFORE_PUNCT.sub(r"\1", text).replace("  ", " ")
 # The local LLM (qwen3) reliably EMITS gesture tags but usually DROPS the persona's
 # "g:" prefix, writing a bare [key] (e.g. [wave], [thumbsup]). Accept [key] too, but
 # ONLY for the curated KAWAII emote tags — they don't overlap the emotion keys, so an
@@ -49,6 +58,61 @@ def normalize_labelled_tags(text: str) -> str:
     """[expression: joy] -> [joy]; [emoji: 😊] -> 😊 (an empty one just goes)."""
     text = _LABELLED_EMOTION_TAG.sub(lambda m: f"[{m.group(1).lower()}]", text)
     return _EMOJI_TAG.sub(lambda m: m.group(1).strip(), text)
+
+
+# Reply-restart guard. Qwen3.8 now and then writes the whole reply, a blank line,
+# and the same reply AGAIN in one turn — 2026-10-23 on the PROTO she said "Mm,
+# I'm fine. Same as always, really. How about you?" twice. About 2 in 100
+# replies, not reproducible on demand, the same with and without tools, and the
+# model's EOS settings are right — so it is caught here instead.
+_SENTENCE_END = re.compile(r"[.!?。！？]+")
+_NOT_WORD = re.compile(r"\[[^\]]*\]|[^\w\s']")
+
+
+def repeat_key(text: str) -> str:
+    """Text reduced to its words: no tags, emoji or punctuation, lower case."""
+    return " ".join(_NOT_WORD.sub(" ", text).lower().split())
+
+
+def _substantial(key: str) -> bool:
+    # Three words, or for unspaced Japanese eight characters: short fillers
+    # ("Hm.", "はい。") may legitimately come up twice.
+    return len(key.split()) >= 3 or (" " not in key and len(key) >= 8)
+
+
+def cut_repeat(text: str) -> str | None:
+    """The reply up to where it starts saying itself over again, or None.
+
+    The cut is at the first COMPLETE sentence that already appeared earlier in
+    the same reply.
+    """
+    seen = set()
+    start = 0
+    for m in _SENTENCE_END.finditer(text):
+        key = repeat_key(text[start : m.end()])
+        if _substantial(key):
+            if key in seen:
+                return text[:start].rstrip()
+            seen.add(key)
+        start = m.end()
+    return None
+
+
+def starts_over(spoken: str, fragment: str) -> bool:
+    """Would saying `fragment` after `spoken` restart the reply?
+
+    Also catches an UNFINISHED sentence — the tail the divider flushes when the
+    agent stops the stream mid-repeat — by matching it against the opening of
+    what was already said.
+    """
+    if cut_repeat(f"{spoken} {fragment}") is not None:
+        return True
+    said, new = repeat_key(spoken), repeat_key(fragment)
+    return (
+        len(new.split()) >= 2
+        and len(_SENTENCE_END.findall(spoken)) >= 2
+        and said.startswith(new)
+    )
 
 
 # Characters that count as a sentence ending. Used to decide whether a "。"
@@ -103,6 +167,17 @@ def _is_negative_emotion(keyword: str) -> bool:
 MOTION_DWELL_CHARS = 28
 
 
+_MAX_WORDS = int(os.getenv("REPLY_MAX_WORDS", "70") or 0)
+_CLOSER_FILTER = os.getenv("REPLY_CLOSER_FILTER", "1") == "1"
+_CLOSER_RE = re.compile(
+    r"^(?:\W|[\U0001F300-\U0001FAFF])*(?:let me know if|feel free to (?:ask|reach|let)|if you (?:have|need) (?:any |any other |more |other |further )"
+    r"(?:questions|help|assistance|information)|is there (?:anything|something) (?:else|specific|more)|do you have any (?:other|more|further) questions"
+    r"|how (?:else )?(?:can|may) i (?:help|assist)|what else (?:can|would|do) |i'?m (?:always )?here (?:to help|if you)|i am here (?:to help|if you)"
+    r"|don'?t hesitate|please let me know)",
+    re.I,
+)
+
+
 def sentence_divider(
     faster_first_response: bool = True,
     segment_method: str = "pysbd",
@@ -136,8 +211,40 @@ def sentence_divider(
             stream_from_func = func(*args, **kwargs)
 
             # Process the mixed stream using the updated SentenceDivider
-            async for item in divider.process_stream(stream_from_func):
+            sentences = divider.process_stream(stream_from_func)
+            spoken = ""  # this reply so far, for the restart guard (cut_repeat)
+            async for item in sentences:
                 if isinstance(item, SentenceWithTags):
+                    # The model copies the glued sentences it finds in its own
+                    # history ("fine.Same as always") — see sentence_spacing.
+                    item.text = unglue(item.text)
+                    if starts_over(spoken, item.text):
+                        logger.warning(
+                            f"[repeat-guard] reply started over — not speaking "
+                            f"{item.text[:60]!r} or anything after it"
+                        )
+                        await sentences.aclose()
+                        break
+                    # Assistant boilerplate tacked onto an answer ("Let me know if
+                    # there's anything else you'd like to explore!"): the persona
+                    # forbids it, the 7B-class model adds it anyway, and spoken
+                    # aloud it is 3 more seconds before the visitor can go on
+                    # (2026-11-09 20:18: a 20 s reply, the last 4 s of it this).
+                    # Never the first sentence — a reply is not left empty.
+                    if _CLOSER_FILTER and spoken.strip() and _CLOSER_RE.match(item.text.strip()):
+                        logger.info(f"[closer] not spoken: {item.text[:80]!r}")
+                        continue
+                    # A reply that will not stop: "Tell me about Japan." once ran to
+                    # 30 sentences, 272 words — two minutes of speech nobody asked
+                    # for (the persona says 1-3 short sentences; the model mostly
+                    # keeps to it, median 24 words). Past _MAX_WORDS already spoken,
+                    # nothing more is started; a story or an explanation of four or
+                    # five sentences fits under it.
+                    if _MAX_WORDS and len(spoken.split()) >= _MAX_WORDS:
+                        logger.info(f"[length] reply cut after {len(spoken.split())} words — not speaking {item.text[:50]!r} or anything after it")
+                        await sentences.aclose()
+                        break
+                    spoken = f"{spoken} {item.text}"
                     logger.debug(f"sentence_divider yielding sentence: {item}")
                 elif isinstance(item, dict):
                     logger.debug(f"sentence_divider yielding dict: {item}")
@@ -242,13 +349,13 @@ def actions_extractor(live2d_model: Live2dModel):
                             # 2026-08-13: ~3000 leaked tags across chat_history/.
                             # The generic [tag] strip further down cannot catch
                             # them — its character class has no ":".
-                            sentence.text = _GESTURE_TAG.sub("", sentence.text)
+                            sentence.text = _close_tag_gap(_GESTURE_TAG.sub("", sentence.text))
                         else:
                             # bare [key] (qwen3's usual form) for a known gesture key
                             bm = _BARE_GESTURE_TAG.search(sentence.text)
                             if bm:
                                 actions.gesture = bm.group(1)
-                                sentence.text = _BARE_GESTURE_TAG.sub("", sentence.text)
+                                sentence.text = _close_tag_gap(_BARE_GESTURE_TAG.sub("", sentence.text))
                         emotion_keywords = live2d_model.extract_emotion_keywords(
                             sentence.text
                         )
@@ -298,7 +405,9 @@ def actions_extractor(live2d_model: Live2dModel):
                         ended_with_emoji = bool(before) and (
                             not cleaned or before[-1] != cleaned[-1]
                         )
-                        sentence.text = cleaned.lstrip()
+                        # An emoji (or a tag) just before the punctuation leaves a
+                        # gap once removed: "Wednesday 🙂." -> "Wednesday ."
+                        sentence.text = _close_tag_gap(cleaned.lstrip())
                         if (
                             ended_with_emoji
                             and sentence.text

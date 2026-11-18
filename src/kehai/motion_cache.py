@@ -62,9 +62,11 @@ class _Entry:
         "duration",
         "streaming",
         "keep",
+        "lazy_vmd",
     )
 
     def __init__(self, emotion: str, duration: float) -> None:
+        self.lazy_vmd = False  # GestureLSM clip: the MMD .vmd is built on first request
         self.event = asyncio.Event()
         self.vmd: bytes | None = None
         self.joints: dict | None = None  # raw SMPL joints for the VRM viewer
@@ -345,6 +347,7 @@ def start_gesture(
 
     mid = uuid.uuid4().hex
     ent = _Entry("gesture", 0.0)
+    ent.lazy_vmd = os.getenv("MOTION_VMD_EAGER", "0") != "1"
     _bespoke[mid] = ent
     _evict_bespoke()
 
@@ -374,7 +377,7 @@ def start_gesture(
                 vmd, joints = await gesture_client.generate_gesture_vmd(
                     audio_bytes,
                     text,
-                    str(PMX_PATH),
+                    None if ent.lazy_vmd else str(PMX_PATH),
                     client=_client,
                     dur_override=dur_override,
                     on_joints=_publish,
@@ -431,6 +434,7 @@ def start_gesture_text(
     gesture: str | None = None,
     prefer_bridge: bool = False,
     lsm_only: bool = False,
+    bridge: str | None = None,
 ) -> str:
     """Fire a TEXT-DRIVEN STREAMING gesture (ActionPlan via /v1/motion/stream) in
     the background; returns its id synchronously (never blocks speech). The entry's
@@ -469,12 +473,15 @@ def start_gesture_text(
     # the ~1.4s before the audio-driven clip can exist. Without it the body would
     # simply hold still at the start of every sentence.
     if lsm_only:
-        _b = motion_lib.bridge_clip()
+        _b = motion_lib.bridge_clip(bridge)
         if _b is not None:
             ent.joints = _b
             ent.keep = True
             ent.event.set()
-            logger.info(f"[gesture-tag] {mid[:8]} LSM-ONLY bridge emo={emotion}")
+            logger.info(
+                f"[gesture-tag] {mid[:8]} LSM-ONLY bridge '{bridge or 'opener'}' "
+                f"({len(_b['joints'])}f) emo={emotion}"
+            )
         else:
             # No bridge installed: leave the entry EMPTY rather than substituting a
             # KAWAII clip. The real clip lands shortly; until then the body holds,
@@ -498,7 +505,7 @@ def start_gesture_text(
     #      keeps the opening GestureLSM-styled instead of visibly starting on a KAWAII
     #      loop and switching. The real clip crossfades over it when it lands.
     if prefer_bridge:
-        _b = motion_lib.bridge_clip()
+        _b = motion_lib.bridge_clip(bridge)
         if _b is not None:
             ent.joints = _b
             ent.keep = True
@@ -684,7 +691,22 @@ async def get_clip(motion_id: str, wait_s: float = CLIP_WAIT_S) -> bytes | None:
         _mark_dead(motion_id, "generation failed")
         return None
     _mark_dead(motion_id, "already delivered")
+    if ent.vmd is None and ent.lazy_vmd and ent.joints:
+        # MMD model: build the .vmd now (see start_gesture). Off the loop as far as
+        # the GIL allows; only an MMD frontend ever reaches this.
+        ent.vmd = await asyncio.to_thread(_vmd_from_joints, ent.joints)
     return ent.vmd
+
+
+def _vmd_from_joints(joints: dict) -> bytes | None:
+    from .motion.smpl_to_mmd import smpl_dict_to_vmd_bytes  # lazy
+    from .motion_routes import PMX_PATH  # lazy
+
+    try:
+        return smpl_dict_to_vmd_bytes(joints, str(PMX_PATH))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[motion_cache] lazy .vmd retarget failed: {e!r}")
+        return None
 
 
 async def get_clip_joints(motion_id: str, wait_s: float = CLIP_WAIT_S) -> dict | None:

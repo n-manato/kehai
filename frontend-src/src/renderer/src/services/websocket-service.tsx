@@ -175,6 +175,13 @@ class WebSocketService {
       this.disconnect();
     }
 
+    // The render tab tells the server it is one: its "microphone" is the PROTO
+    // viewer's, and the server transcribes the original of that audio rather
+    // than this tab's copy of it (src/kehai/routes.py, websocket_handler).
+    if (new URLSearchParams(window.location.search).get('render') === '1') {
+      url += (url.includes('?') ? '&' : '?') + 'render=1';
+    }
+
     try {
       this.ws = new WebSocket(url);
       this.currentState = 'CONNECTING';

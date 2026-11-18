@@ -34,6 +34,16 @@ def init_client_ws_route(default_context_cache: ServiceContext) -> APIRouter:
         """WebSocket endpoint for client connections"""
         await websocket.accept()
         client_uid = str(uuid4())
+        # The render tab says so (?render=1): its mic is the PROTO's, and ASR
+        # takes the PROTO's original audio instead (websocket_handler._transcribe).
+        if websocket.query_params.get("render") == "1":
+            ws_handler.render_clients.add(client_uid)
+            logger.info(f"[render] client {client_uid[:8]} is the render tab (PROTO mic)")
+            from .render_stream import ViewerMirror, hub as render_hub
+
+            if render_hub.direct_pcm:
+                websocket = ViewerMirror(websocket)  # the reply's PCM goes to the viewer from here
+                logger.info(f"[render] client {client_uid[:8]}: reply PCM mirrored to the viewer directly (VIEWER_PCM_DIRECT)")
 
         try:
             await ws_handler.handle_new_connection(websocket, client_uid)

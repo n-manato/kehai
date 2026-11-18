@@ -129,7 +129,14 @@ class ServiceContext:
             f"Initializing MCP components: use_mcpp={use_mcpp}, enabled_servers={enabled_servers}"
         )
 
-        # Reset MCP components first
+        # Reset MCP components first. A previous client (character switch via
+        # load_from_config) owns live server processes: close it, never just
+        # drop it.
+        if self.mcp_client is not None:
+            try:
+                await self.mcp_client.aclose()
+            except Exception as e:  # noqa: BLE001 — a stuck close must not block the switch
+                logger.warning(f"Closing the previous MCPClient failed: {e!r}")
         self.mcp_server_registery = None
         self.tool_manager = None
         self.mcp_client = None
@@ -191,6 +198,16 @@ class ServiceContext:
                     self.mcp_server_registery, self.send_text, self.client_uid
                 )
                 logger.info("MCPClient initialized for this session.")
+                # Pre-spawn the enabled servers in the background so the first
+                # tool call of this connection finds a live session (the uvx
+                # `time` server cost 478 ms of silence on first use). Only for
+                # connection-bound contexts: the boot-time default context runs
+                # under run_server.py's temporary asyncio.run() loop and never
+                # holds a conversation, so its tasks would just die with that
+                # loop. Failures fall back to the lazy spawn. MCP_PRESPAWN=0
+                # turns it off.
+                if self.client_uid and os.getenv("MCP_PRESPAWN", "1") != "0":
+                    self.mcp_client.start_servers(enabled_servers)
             else:
                 logger.error(
                     "MCP enabled but ServerRegistry not available. MCPClient not created."
@@ -571,6 +588,28 @@ class ServiceContext:
                 cfg.text_lang = prof.text_lang
             if prof.prompt_lang:
                 cfg.prompt_lang = prof.prompt_lang
+        # omni mode, OMNI_TTS=qwen3tts (start_server.sh): the SAME reference clip
+        # and transcript, spoken by Qwen3-TTS (vLLM-Omni :8809) as a zero-shot
+        # clone instead of the GSV fine-tune — first audio 0.1 s instead of 0.4-1.2.
+        if os.getenv("OMNI_TTS", "gsv") == "qwen3tts":
+            from .tts.qwen3tts_stream import Qwen3TTSStreamConfig
+
+            # A longer prompt anchors the zero-shot clone: if the voice's refs
+            # folder holds <voice>_qwen3tts.wav (+ .txt transcript; the GSV ref
+            # clips joined, ~22 s for Aura) prefer it over the single GSV clip.
+            ref_path, ref_text = cfg.ref_audio_path, cfg.prompt_text
+            stem = os.path.basename(ref_path).split("_ref")[0]
+            long_wav = os.path.join(os.path.dirname(ref_path), f"{stem}_qwen3tts.wav")
+            long_txt = long_wav[:-4] + ".txt"
+            if os.path.isfile(long_wav) and os.path.isfile(long_txt):
+                with open(long_txt, encoding="utf-8") as f:
+                    ref_path, ref_text = long_wav, f.read().strip()
+            return Qwen3TTSStreamConfig(
+                ref_audio_path=ref_path,
+                ref_text=ref_text,
+                text_lang=cfg.text_lang,
+                x_vector_only=os.getenv("QWEN3TTS_XVEC_ONLY", "0") == "1",
+            )
         return cfg
 
     async def sync_gsv_weights(self) -> None:
@@ -585,6 +624,14 @@ class ServiceContext:
             else None
         )
         if prof is None or not (prof.gpt_weights or prof.sovits_weights):
+            return
+        # Only when GPT-SoVITS is the voice actually speaking. With Qwen3-TTS
+        # (omni) GSV is stopped (scripts/pcb-mode.sh): asking it would fail
+        # and, the swap never being recorded as done, be retried — with this
+        # call's 25 s bound — on every turn.
+        from .tts.gsv_stream import GSVStreamConfig
+
+        if not isinstance(self.gsv_stream_config(), GSVStreamConfig):
             return
         want = (prof.gpt_weights or "", prof.sovits_weights or "")
         async with _GSV_WEIGHTS_LOCK:

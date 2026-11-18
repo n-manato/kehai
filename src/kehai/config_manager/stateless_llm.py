@@ -249,6 +249,43 @@ class LlamaCppConfig(StatelessLLMBaseConfig):
     }
 
 
+class OpenAIOmniLLMConfig(OpenAICompatibleConfig):
+    """Qwen3-Omni served by vLLM-Omni (PC-B `omni` mode): the user turn is sent
+    as audio, text comes back; with audio_output the Talker speaks too."""
+
+    base_url: str = Field("http://127.0.0.1:8808/v1", alias="base_url")
+    speaker: str | None = Field(None, alias="speaker")
+    audio_output: bool = Field(False, alias="audio_output")
+    # vLLM-Omni keeps its stage defaults (top_k 1, seed 42) for every sampling
+    # field a request leaves out, so without top_k the Thinker decodes greedily
+    # and `temperature` does nothing.
+    top_k: int | None = Field(None, alias="top_k")
+    interrupt_method: Literal["system", "user"] = Field(
+        "system", alias="interrupt_method"
+    )
+
+    _OMNI_DESCRIPTIONS: ClassVar[dict[str, Description]] = {
+        "speaker": Description(
+            en="Talker voice (Qwen3-Omni: Chelsie / Ethan / Aiden). Unset = server default.",
+            zh="Talker 的音色（Qwen3-Omni: Chelsie / Ethan / Aiden）。不设置则使用服务端默认。",
+        ),
+        "top_k": Description(
+            en="Sampling top-k sent with every request (vLLM-Omni otherwise uses its stage default top_k 1 = greedy).",
+            zh="每个请求附带的 top-k（不设置时 vLLM-Omni 使用阶段默认值 top_k 1，即贪心解码）。",
+        ),
+        "audio_output": Description(
+            en="true: the Talker's speech replaces the TTS engine; false: text only, "
+            "the configured TTS speaks.",
+            zh="true：由 Talker 直接输出语音，替代 TTS；false：仅输出文本，由 TTS 朗读。",
+        ),
+    }
+
+    DESCRIPTIONS: ClassVar[dict[str, Description]] = {
+        **OpenAICompatibleConfig.DESCRIPTIONS,
+        **_OMNI_DESCRIPTIONS,
+    }
+
+
 class StatelessLLMConfigs(I18nMixin, BaseModel):
     """Pool of LLM provider configurations.
     This class contains configurations for different LLM providers."""
@@ -262,6 +299,7 @@ class StatelessLLMConfigs(I18nMixin, BaseModel):
     ollama_llm: OllamaConfig | None = Field(None, alias="ollama_llm")
     lmstudio_llm: LmStudioConfig | None = Field(None, alias="lmstudio_llm")
     openai_llm: OpenAIConfig | None = Field(None, alias="openai_llm")
+    openai_omni_llm: OpenAIOmniLLMConfig | None = Field(None, alias="openai_omni_llm")
     gemini_llm: GeminiConfig | None = Field(None, alias="gemini_llm")
     zhipu_llm: ZhipuConfig | None = Field(None, alias="zhipu_llm")
     deepseek_llm: DeepseekConfig | None = Field(None, alias="deepseek_llm")
@@ -284,6 +322,10 @@ class StatelessLLMConfigs(I18nMixin, BaseModel):
         ),
         "openai_llm": Description(
             en="Configuration for Official OpenAI API", zh="官方 OpenAI API 配置"
+        ),
+        "openai_omni_llm": Description(
+            en="Configuration for Qwen3-Omni on vLLM-Omni (speech in / speech out)",
+            zh="vLLM-Omni 上的 Qwen3-Omni 配置（语音输入 / 语音输出）",
         ),
         "gemini_llm": Description(
             en="Configuration for Gemini API", zh="Gemini API 配置"

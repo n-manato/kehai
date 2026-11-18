@@ -45,6 +45,20 @@ _DEFAULT_BASE = "https://gpu.aiccore-uno.ai/v1"
 GESTURE_MIN_SECONDS = 6.0
 
 
+_WIN_FRAMES, _WIN_OVERLAP, _GEN_FPS = 128, 16, 30
+
+
+def _window_cover_seconds(seconds: float) -> float:
+    """Audio length (s) for which GestureLSM returns at least `seconds` of motion
+    (see the window note in start_gesture), never under GESTURE_MIN_SECONDS."""
+    import math
+
+    need = max(_WIN_FRAMES, math.ceil(seconds * _GEN_FPS))
+    k = max(1, math.ceil((need - _WIN_OVERLAP) / (_WIN_FRAMES - _WIN_OVERLAP)))
+    frames = _WIN_OVERLAP + k * (_WIN_FRAMES - _WIN_OVERLAP)
+    return max(GESTURE_MIN_SECONDS, (frames + 2) / _GEN_FPS)
+
+
 def enabled() -> bool:
     return os.getenv("GESTURE_ENABLED", "0") == "1"
 
@@ -268,23 +282,33 @@ def _face_front(smpl: dict, keep: float | None = None) -> dict:
         if abs(sr0[0]) < 1e-6:
             return smpl
         ref = np.array([1.0 if sr0[0] > 0 else -1.0, 0.0, 0.0])
+        # VECTORISED (2026-11-05): the per-frame x per-joint loop took ~22 ms for a 5 s
+        # clip on the event loop, which the 20 ms audio frames paced to the PROTO viewer
+        # share. Same result: each frame's yaw is measured on its own unrotated collars,
+        # low-passed in order (cheap scalars), then every upper joint of every frame is
+        # turned in one batched product.
+        sr = out[:, n["L_Collar"]] - out[:, n["R_Collar"]]
+        m = np.hypot(sr[:, 0], sr[:, 2])
+        ok = m >= 1e-6
+        cx = np.where(ok, sr[:, 0] / np.where(ok, m, 1.0), 0.0)
+        cz = np.where(ok, sr[:, 2] / np.where(ok, m, 1.0), 0.0)
+        ang = np.arctan2(ref[2] * cx - ref[0] * cz, ref[0] * cx + ref[2] * cz)
+        corr = np.zeros(out.shape[0])
         yaw_s, have = 0.0, False
         for f in range(out.shape[0]):
-            sr = out[f, n["L_Collar"]] - out[f, n["R_Collar"]]
-            cur = np.array([sr[0], 0.0, sr[2]])
-            m = np.linalg.norm(cur)
-            if m < 1e-6:
-                continue
-            cur /= m
-            ang = np.arctan2(ref[2] * cur[0] - ref[0] * cur[2], ref[0] * cur[0] + ref[2] * cur[2])
-            yaw_s = ang if not have else (0.85 * yaw_s + 0.15 * ang)  # temporal low-pass
+            if not ok[f]:
+                continue  # no rotation for this frame; the low-pass state carries over
+            yaw_s = ang[f] if not have else (0.85 * yaw_s + 0.15 * ang[f])  # temporal low-pass
             have = True
-            corr = -yaw_s * (1.0 - keep)
-            ca, sa = np.cos(corr), np.sin(corr)
-            Ry = np.array([[ca, 0.0, sa], [0.0, 1.0, 0.0], [-sa, 0.0, ca]])
-            piv = out[f, piv_i].copy()
-            for j in upper:
-                out[f, j] = Ry @ (out[f, j] - piv) + piv
+            corr[f] = -yaw_s * (1.0 - keep)
+        ca, sa = np.cos(corr)[:, None], np.sin(corr)[:, None]
+        piv = out[:, piv_i][:, None, :]  # (F,1,3)
+        d = out[:, upper] - piv
+        out[:, upper, 0] = ca * d[..., 0] + sa * d[..., 2] + piv[..., 0]
+        out[:, upper, 2] = -sa * d[..., 0] + ca * d[..., 2] + piv[..., 2]
+        # 0.1 mm: the wire values came in as float16 (~3 significant digits), and the
+        # full float64 repr made the JSON of an 8 s clip ~2x slower to encode and 2.3x larger.
+        out = np.round(out, 4)
         return {**smpl, "joints": out.tolist()}
     except Exception as e:  # noqa: BLE001 — never break the gesture path
         logger.warning(f"[gesture] face-front failed: {e!r}")
@@ -336,7 +360,14 @@ async def generate_gesture_vmd(
     # "こんにちは" was costing a 6s / ~860KB clip). The gateway trims to `dur`.
     _tt0 = time.monotonic()
     real_seconds = _wav_seconds(audio_bytes)
-    audio_bytes = _pad_audio_to_min(audio_bytes)
+    # GestureLSM makes motion in 128-frame windows (30 fps) that overlap by 16:
+    # n frames of audio give 16 + 112 * floor((n - 16) / 112) frames, the rest is
+    # dropped. Padded to 6 s that is ONE window, 4.27 s, whatever `dur` asked for —
+    # every longer sentence ran out of motion and froze (2026-11-05). Pad to the
+    # window count that covers the requested length.
+    want = max(real_seconds, dur_override or 0.0)
+    pad_to = _window_cover_seconds(want)
+    audio_bytes = _pad_audio_to_min(audio_bytes, pad_to)
     _tt_pad = time.monotonic()
     files = {"audio": ("speech.wav", audio_bytes, "audio/wav")}
     data = {"text": text or "", "format": "joints"}
@@ -353,7 +384,7 @@ async def generate_gesture_vmd(
         # trimming the clip to the window and freezing in a hold. Capped at the
         # padded audio length so the gateway never trims beyond what it has.
         eff = max(real_seconds, dur_override or 0.0)
-        eff = min(eff, max(real_seconds, GESTURE_MIN_SECONDS))
+        eff = min(eff, max(real_seconds, pad_to))
         data["dur"] = f"{eff:.2f}"
     global _chain_seed, _chain_ts
     chain_seed = _chain_seed if (time.time() - _chain_ts) < _CHAIN_TTL_S else None
@@ -462,10 +493,15 @@ async def generate_gesture_vmd(
             on_joints(smpl)
         except Exception:  # noqa: BLE001 — never let a consumer break generation
             logger.warning("[gesture] on_joints callback failed", exc_info=False)
-    try:
-        vmd = smpl_dict_to_vmd_bytes(smpl, pmx_path)
-    except Exception:  # noqa: BLE001
-        vmd = None
+    # pmx_path=None: no MMD retarget here (motion_cache builds it on the first
+    # /motion/clip request instead). It is 60-170 ms of pure Python per clip, ran on
+    # the event loop for every clip, and only an MMD model ever asks for it.
+    vmd = None
+    if pmx_path:
+        try:
+            vmd = smpl_dict_to_vmd_bytes(smpl, pmx_path)
+        except Exception:  # noqa: BLE001
+            vmd = None
     _tt_end = time.monotonic()
     logger.info(
         "[gesture-prof] pad {:.0f}ms + post {:.0f}ms + decode {:.0f}ms + vmd {:.0f}ms "

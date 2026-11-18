@@ -3,8 +3,10 @@ voice pipeline.
 
 A tool-using reply is silent until the whole decide-tool -> execute -> re-prompt
 loop finishes (measured 6-30s of dead air — "ツールを使うとしゃべらなくなる").
-single_conversation registers a per-turn callback here; the tool executor fires
-it when the FIRST tool starts, and the callback speaks a short canned filler
+single_conversation registers a per-turn callback here; the OpenAI stream
+fires it at the first tool-call delta that names a function (the tool executor
+fires it as the fallback for prompt-mode / Claude tools), and the callback
+speaks a short canned filler
 ("ちょっと調べてみるね!") through the normal TTS pipeline — the ChatGPT-Voice
 acknowledgement pattern. Fired at most once per turn; cleared in the turn's
 finally so a stale callback can never speak into a later turn.

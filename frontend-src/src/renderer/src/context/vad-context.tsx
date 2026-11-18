@@ -269,6 +269,15 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
       webrtcAudio.duck(false);
       return;
     }
+    if (serverVadRef.current) {
+      // Server-VAD mode: the SERVER decides what is a turn (and so a barge-in)
+      // and says so with 'user-speech-start' (websocket-handler). This VAD has
+      // no level gate — it fires for voices across the room the server then
+      // ignores, and interrupting on those stopped her with no reply to follow.
+      // Only show that she is listening; leave a reply in progress alone.
+      setAiStateRef.current((s: AiState) => (s === 'idle' ? 'listening' : s));
+      return;
+    }
     console.log('Real speech confirmed - checking if need to interrupt');
     // Check if we need to interrupt based on the PREVIOUS state (before speech started)
     if (previousAiStateRef.current === 'thinking-speaking') {
@@ -317,6 +326,18 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
     if (asideRef.current && !aside && previousAiStateRef.current === 'thinking-speaking') {
       interruptRef.current();
     }
+    if (serverVadRef.current) {
+      // The server's VAD ends the turn and starts the reply (conversation-
+      // chain-start sets 'thinking-speaking'), or drops it. Setting
+      // 'thinking-speaking' here wedged the state whenever the server never
+      // took the speech at all — no chain-end ever came, and the next
+      // utterance counted as a barge-in.
+      asideRef.current = false;
+      isProcessingRef.current = false;
+      setPreviousTriggeredProbability(0);
+      setAiStateRef.current((s: AiState) => (s === 'listening' ? 'idle' : s));
+      return;
+    }
     asideRef.current = false;
     // An aside leaves her reply alone: clearing the queue here would drop the
     // rest of what she is saying.
@@ -358,9 +379,13 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
     setPreviousTriggeredProbability(0);
     isProcessingRef.current = false;
 
-    // Restore previous AI state and show helpful misfire message
-    setAiStateRef.current(previousAiStateRef.current);
-    setSubtitleTextRef.current(t('error.vadMisfire'));
+    // A misfire ends before onSpeechRealStart, so nothing here changed the
+    // state — leave it. Restoring the snapshot from speech start wrote back a
+    // stale state: 'thinking-speaking' after her reply had drained in the
+    // meantime wedged the next turn as a barge-in.
+    // The hint is for someone at the desktop app; in server-VAD mode (the
+    // PROTO) it would replace her subtitle on the kiosk.
+    if (!serverVadRef.current) setSubtitleTextRef.current(t('error.vadMisfire'));
   }, [t]);
 
   /**
@@ -446,6 +471,11 @@ export function VADProvider({ children }: { children: React.ReactNode }) {
     // mute the outgoing mic so the server VAD hears silence.
     webrtcAudio.setMicEnabled(false);
     setMicOn(false);
+    // Stopped mid-utterance: the speech end that would undo the duck never comes.
+    if (isProcessingRef.current) {
+      duckStreamingAudio(false);
+      webrtcAudio.duck(false);
+    }
     isProcessingRef.current = false;
   }, []);
 

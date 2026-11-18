@@ -52,6 +52,22 @@ class FileData:
 
 
 @dataclass
+class AudioData:
+    """
+    The user's spoken turn itself, for a speech-in LLM (omni mode)
+
+    Attributes:
+        data: Base64 encoded audio file (WAV container, mono)
+        mime_type: MIME type of the audio (e.g., 'audio/wav')
+        sample_rate: Sample rate of the encoded audio
+    """
+
+    data: str  # Base64 encoded
+    mime_type: str = "audio/wav"
+    sample_rate: int = 16000
+
+
+@dataclass
 class TextData:
     """
     Represents text data from various sources
@@ -82,6 +98,7 @@ class BatchInput(BaseInput):
         texts: List of text data from different sources
         images: Optional list of images
         files: Optional list of files
+        audio: Optional spoken turn (omni mode: the LLM hears it instead of the ASR text)
         metadata: Optional dictionary of metadata flags for special inputs
             - 'proactive_speak': Boolean flag indicating if this is a proactive speak input
             - 'skip_memory': Boolean flag indicating if this input should be skipped in AI's internal memory
@@ -91,4 +108,5 @@ class BatchInput(BaseInput):
     texts: List[TextData]
     images: Optional[List[ImageData]] = None
     files: Optional[List[FileData]] = None
+    audio: Optional[AudioData] = None
     metadata: Optional[Dict[str, Any]] = None

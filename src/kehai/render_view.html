@@ -90,7 +90,7 @@
  * loopback/LAN/tailnet, 15 through the public hostname); ?q=50 lowers
  * the fallback's JPEG quality.
  */
-const KIND_AUDIO = 1, KIND_VIDEO = 2, KIND_MIC = 3, KIND_H264 = 4, KIND_CAM = 5, RATE = 48000;
+const KIND_AUDIO = 1, KIND_VIDEO = 2, KIND_MIC = 3, KIND_H264 = 4, KIND_CAM = 5, KIND_FACE = 6, RATE = 48000;
 if (new URLSearchParams(location.search).get("hud") === "1") document.body.classList.add("hud");
 const params = new URLSearchParams(location.search);
 const canvas = document.getElementById("view");
@@ -101,7 +101,13 @@ if (params.get("hud") === "0") hud.style.display = "none";
 
 let ws, audioNode, micNode, ctx, mode = "", streamSize = "2160x3840", rotate = 0;
 let frames = 0, bytes = 0, rtt = 0, decodeMs = 0, decoded = 0, lastErr = "", codecStr = "", playQ = -1;
-let pending = null, drawing = false, jbTarget = -1, starves = 0;
+// Stall guards (2026-11-05): the page's own main-thread lag (worst timer overrun per
+// second, reported to the server log), frames skipped to catch up, and when anything last
+// arrived — a socket that goes quiet while "open" is torn down and redialed instead of
+// leaving the screen frozen until someone walks over and reloads it.
+let lagMax = 0, lagLast = performance.now(), skipped = 0, lastMsgAt = performance.now();
+setInterval(() => { const n = performance.now(); lagMax = Math.max(lagMax, n - lagLast - 100); lagLast = n; }, 100);
+let pending = null, drawing = false, jbTarget = -1, starves = 0, trimmedMs = 0;
 // Same box / tailnet / LAN vs. the public Cloudflare hostname. Through Cloudflare
 // the PROTO's link could not hold 30 Mbps (RTT climbed 70 -> 340 ms, frames fell
 // to 47 fps, and the audio queued behind the video on the shared stream), so the
@@ -118,10 +124,13 @@ class Play extends AudioWorkletProcessor {
   // by 40 ms (cap 400); 10 s without one shrinks it 10 ms back toward the floor.
   constructor(opts) {
     super(); this.q = []; this.cur = null; this.pos = 0; this.queued = 0; this.primed = false;
-    this.n = 0; this.starves = 0; this.calm = 0; this.prev = null; this.minQ = Infinity; this.win = 0;
+    this.n = 0; this.starves = 0; this.calm = 0; this.prev = null; this.minQ = Infinity; this.win = 0; this.trimmed = 0;
     this.floor = (opts.processorOptions && opts.processorOptions.floor) || 0.04;
     this.target = this.floor;
     this.port.onmessage = (e) => {
+      if (e.data === "flush") {  // barge-in / interrupt on the direct PCM path: drop what is queued
+        this.q = []; this.queued = 0; this.primed = false; this.cur = null; this.pos = 0; return;
+      }
       const f = new Float32Array(e.data.length);
       for (let i = 0; i < f.length; i++) f[i] = e.data[i] / 0x7fff;
       this.q.push(f); this.queued += f.length;
@@ -131,8 +140,12 @@ class Play extends AudioWorkletProcessor {
       if (this.queued > 48000 * 1.0) {
         while (this.q.length > 1 && this.queued > 48000 * (this.target + 0.05)) this.queued -= this.q.shift().length;
       }
-      if (++this.n % 50 === 0) this.port.postMessage([this.queued / 48, this.target * 1000, this.starves]);
+      if (++this.n % 50 === 0) this.port.postMessage([this.queued / 48, this.target * 1000, this.starves, this.trimmed / 48]);
     };
+  }
+  quiet(f) {  // peak under ~-48 dBFS: a pause, or the zero padding between sentences
+    for (let i = 0; i < f.length; i += 3) if (Math.abs(f[i]) > 0.004) return false;
+    return true;
   }
   loudTail(f) {
     for (let i = Math.max(0, f.length - 240); i < f.length; i++) if (Math.abs(f[i]) > 0.01) return true;
@@ -141,14 +154,22 @@ class Play extends AudioWorkletProcessor {
   process(_, outputs) {
     const out = outputs[0][0];
     this.calm += out.length;
-    if (this.calm > 48000 * 10) { this.calm = 0; this.target = Math.max(this.floor, this.target - 0.01); }
+    if (this.calm > 48000 * 4) { this.calm = 0; this.target = Math.max(this.floor, this.target - 0.01); }  // 4 s calm: -10 ms (was 10 s; a burst of starves parked the target at 100 ms for minutes, 2026-11-04)
     // Catch up rather than cap: if even the low point of the last second sat
     // well above target, that excess is standing lag — drop it, once.
     this.minQ = Math.min(this.minQ, this.queued); this.win += out.length;
     if (this.win >= 48000) {
       let excess = this.primed ? this.minQ - 48000 * (this.target + 0.04) : 0;
-      while (excess > 0 && this.q.length > 1 && this.q[0].length <= excess) {
-        const f = this.q.shift(); this.queued -= f.length; excess -= f.length;
+      // Only QUIET frames go (pauses, the padding between sentences). Cutting
+      // whatever sat at the head dropped 20-40 ms of speech about a second into
+      // a sentence whenever ~40 ms of standing lag had built up — the later
+      // part of the sentence skipped ahead (2026-11-04). Lag that only speech
+      // holds waits for the next pause.
+      for (let k = 0; excess > 0 && k < this.q.length; ) {
+        const f = this.q[k];
+        if (f.length <= excess && this.quiet(f)) {
+          this.q.splice(k, 1); this.queued -= f.length; excess -= f.length; this.trimmed += f.length;
+        } else k++;
       }
       this.win = 0; this.minQ = Infinity;
     }
@@ -264,7 +285,7 @@ function onH264(b) {
   if (!decoder) return;
   waitKey = false;
   // Never queue behind the screen: if decode lags, skip to the next keyframe.
-  if (decoder.decodeQueueSize > 3 && !key) { waitKey = true; return; }
+  if (decoder.decodeQueueSize > 3 && !key) { waitKey = true; skipped++; return; }
   decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: performance.now() * 1000, data: au }));
 }
 
@@ -288,7 +309,7 @@ function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/render-stream/view`);
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { hud.textContent = "connected"; size(); if (!micEl.hidden) send({ t: "mic-monitor", on: true }); };
+  ws.onopen = () => { hud.textContent = "connected"; size(); if (!micEl.hidden) send({ t: "mic-monitor", on: true }); if (camReport) send(camReport); if (micReport) send(micReport); if (dirReport) send(dirReport); };
   ws.onclose = (e) => {
     // 4000 = another viewer took over. Reconnecting would evict it in turn and
     // the two tabs would kick each other forever, neither ever showing a frame.
@@ -296,6 +317,7 @@ function connect() {
     hud.textContent = `disconnected (${e.reason || e.code}) — retrying`; setTimeout(connect, 1500);
   };
   ws.onmessage = (e) => {
+    lastMsgAt = performance.now();
     if (typeof e.data === "string") {
       const m = JSON.parse(e.data);
       if (m.t === "pong") rtt = performance.now() - m.c;
@@ -303,6 +325,9 @@ function connect() {
       // The server can ask the page to load its latest copy — the PROTO has no
       // keyboard to press F5 on (POST /render-stream/reload, loopback only).
       else if (m.t === "reload") location.reload();
+      else if (m.t === "mic-probe") void micProbe(m.seconds || 4);
+      else if (m.t === "flush") { if (audioNode) audioNode.port.postMessage("flush"); }
+      else if (m.t === "asd-faces") { asdFaces = m.faces || []; asdFacesAt = performance.now(); }
       else if (m.t === "mic") micApply(m);
       else if (m.t === "mic-level") micLevel(m);
       else if (m.t === "mode") {
@@ -383,14 +408,14 @@ document.addEventListener("keydown", (e) => {
 ime.addEventListener("compositionend", () => { if (ime.value) { send({ t: "text", text: ime.value }); ime.value = ""; } });
 
 // ---- audio + mic (needs a gesture) ---------------------------------------------
-document.getElementById("start").addEventListener("click", async (e) => {
-  e.currentTarget.remove();
-  ime.focus();
+const startBtn = document.getElementById("start");
+async function startAll() {
+  if (ctx) return;
   ctx = new AudioContext({ sampleRate: RATE, latencyHint: "interactive" });
   await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([PLAY_WORKLET], { type: "application/javascript" })));
-  audioNode = new AudioWorkletNode(ctx, "kehai-play", { numberOfInputs: 0, outputChannelCount: [1], processorOptions: { floor: LOCAL ? 0.04 : 0.12 } });
+  audioNode = new AudioWorkletNode(ctx, "kehai-play", { numberOfInputs: 0, outputChannelCount: [1], processorOptions: { floor: LOCAL ? 0.02 : 0.12 } });  // 20 ms: the server now paces 20 ms frames on a clock (VIEWER_PCM_DIRECT); starves still grow it
   audioNode.connect(ctx.destination);
-  audioNode.port.onmessage = (ev) => { [playQ, jbTarget, starves] = ev.data.map(Math.round); };
+  audioNode.port.onmessage = (ev) => { [playQ, jbTarget, starves, trimmedMs] = ev.data.map(Math.round); };
   micNode = new AudioWorkletNode(ctx, "kehai-cap", { numberOfOutputs: 0 });
   micNode.port.onmessage = (ev) => {
     if (ws?.readyState !== 1) return;
@@ -401,13 +426,120 @@ document.getElementById("start").addEventListener("click", async (e) => {
   micGain.connect(micNode);
   await openMic();
   if (params.get("cam") !== "0") startCam();
+  if (ctx.state !== "running") { try { await ctx.resume(); } catch {} }
+  if (ctx.state === "running") { startBtn.remove(); ime.focus(); }
+  else startBtn.textContent = "タップして音声を有効にします";
+}
+startBtn.addEventListener("click", async () => {
+  try { localStorage.setItem("autostart", "1"); } catch {}
+  if (ctx) { try { await ctx.resume(); } catch {} if (ctx.state === "running") { startBtn.remove(); ime.focus(); } return; }
+  await startAll();
 });
+// After a reload (POST /render-stream/reload, or a crash) nobody is at the PROTO
+// to tap: start without a gesture once the page has been tapped before. Chrome
+// allows the AudioContext on a site it has seen interaction on (kiosk flags
+// aside) and the mic/camera permissions are remembered; if it stays suspended
+// the button stays and says so. (2026-11-04: a reload left the PROTO on the
+// start screen until someone tapped.)
+try { if (localStorage.getItem("autostart") === "1") startAll(); } catch {}
 
 // The capture as the mic panel set it (server-stored, see vad/mic_tuning.py):
 // browser noise suppression / auto gain are getUserMedia constraints, so changing
 // them re-opens the mic; the gain is a GainNode in front of the capture worklet.
 let micStream = null, micSrc = null, micGain = null, micCfg = {}, micOpenWith = "";
-async function openMic() {
+
+// Which microphone. The PROTO's speech arrives band-limited at 4.0 kHz — 0.00%
+// of its energy in 4-8 kHz, where clean speech reaches 8 kHz — so the s/f/th/t
+// cues are gone and whisper mishears words of every kind (2026-10-23). A device
+// picker was tried and taken out the same evening: the PROTO has ONE live input
+// ("Default"; its HDMI and line inputs are digital silence), and spectrum checks
+// run inside the page read silence even from the working mic. So the default
+// input is used as before and REPORTED — track label, settings and the inputs
+// present — for the server log; the band is measured from the audio that arrives.
+let micReport = null;   // re-sent on every (re)connect so the server log has it
+
+async function openMicStream(audio) {
+  try { localStorage.removeItem("micId"); } catch {}   // left by the removed picker
+  // ?micid=<deviceId, or part of the input's name>: a chosen input instead of the
+  // default one — for when scripts/proto/proto-audio-check.sh finds an input that
+  // is full-band while "Default" is cut at 4 kHz. Nothing is guessed here (the
+  // automatic picker grabbed a silent HDMI input once and was removed).
+  const wantMic = params.get("micid");
+  if (wantMic) {
+    try {
+      const devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "audioinput");
+      const d = devs.find((x) => x.deviceId === wantMic)
+        || devs.find((x) => x.label && x.label.toLowerCase().includes(wantMic.toLowerCase()));
+      if (d) audio = { ...audio, deviceId: { exact: d.deviceId } };
+    } catch {}
+  }
+  const s = await navigator.mediaDevices.getUserMedia({ audio });
+  const tr = s.getAudioTracks()[0], st = tr?.getSettings() || {};
+  let inputs = [];
+  try {
+    inputs = (await navigator.mediaDevices.enumerateDevices())
+      .filter((d) => d.kind === "audioinput").map((d) => d.label || d.deviceId.slice(0, 8));
+  } catch {}
+  micReport = {
+    t: "mics", using: tr?.label || "?",
+    settings: { sampleRate: st.sampleRate, channelCount: st.channelCount, echoCancellation: st.echoCancellation, noiseSuppression: st.noiseSuppression, autoGainControl: st.autoGainControl },
+    asked: { autoGainControl: audio.autoGainControl, noiseSuppression: audio.noiseSuppression },
+    constraints: (() => { try { return tr?.getConstraints(); } catch { return null; } })(),
+    inputs,
+  };
+  send(micReport);
+  return s;
+}
+
+// Diagnostic (POST /render-stream/mic-probe): every audio input, opened RAW in
+// stereo (no echo cancelling, noise suppression or auto gain) for a few seconds
+// and sent to the server as kind 7 — does the PROTO have two real microphones
+// (the sound's direction can then be told), and is any input not cut at 4 kHz?
+// The normal capture is closed meanwhile and reopened after.
+async function micProbe(seconds) {
+  if (!ctx) return;
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "audioinput");
+  micSrc?.disconnect(); micStream?.getTracks().forEach((t) => t.stop()); micStream = null; micOpenWith = "";
+  dirNodes?.forEach((n) => n.disconnect()); dirStream?.getTracks().forEach((t) => t.stop()); dirStream = null; dirNodes = null;
+  for (let i = 0; i < devs.length; i++) {
+    const d = devs[i]; let st = null;
+    try {
+      st = await navigator.mediaDevices.getUserMedia({ audio: {
+        deviceId: { exact: d.deviceId }, channelCount: { ideal: 2 }, echoCancellation: false,
+        noiseSuppression: false, autoGainControl: false } });
+      const set = st.getAudioTracks()[0].getSettings();
+      const src = ctx.createMediaStreamSource(st), sp = ctx.createScriptProcessor(4096, 2, 1), mute = ctx.createGain();
+      mute.gain.value = 0;
+      const L = [], R = [];
+      sp.onaudioprocess = (e) => { L.push(new Float32Array(e.inputBuffer.getChannelData(0))); R.push(new Float32Array(e.inputBuffer.getChannelData(1))); };
+      src.connect(sp); sp.connect(mute); mute.connect(ctx.destination);
+      await new Promise((r) => setTimeout(r, seconds * 1000));
+      src.disconnect(); sp.disconnect(); mute.disconnect();
+      const n = L.reduce((a, x) => a + x.length, 0), pcm = new Int16Array(n * 2);
+      let k = 0;
+      for (let b = 0; b < L.length; b++) for (let j = 0; j < L[b].length; j++) {
+        pcm[k++] = Math.max(-1, Math.min(1, L[b][j])) * 32767; pcm[k++] = Math.max(-1, Math.min(1, R[b][j])) * 32767;
+      }
+      send({ t: "mic-probe", i, label: d.label, settings: set, rate: ctx.sampleRate, frames: n });
+      const msg = new Uint8Array(2 + pcm.byteLength); msg[0] = 7; msg[1] = i; msg.set(new Uint8Array(pcm.buffer), 2);
+      if (ws?.readyState === 1) ws.send(msg);
+    } catch (err) { send({ t: "mic-probe", i, label: d.label, error: String(err) }); }
+    finally { st?.getTracks().forEach((t) => t.stop()); }
+  }
+  send({ t: "mic-probe", done: true });
+  void openMic();
+}
+
+// One open at a time: at page load the default open and the one for the stored
+// setup ("mic" message) ran together, both captures were live at once, and the
+// device kept the first one's auto gain (2026-11-09 04:14: asked off, ran on).
+let micQueue = Promise.resolve();
+function openMic() {
+  micQueue = micQueue.then(openMicNow, openMicNow);
+  return micQueue;
+}
+
+async function openMicNow() {
   if (!ctx || !micGain) return;
   const ns = micCfg.noise_suppression !== false, agc = micCfg.auto_gain !== false;
   micGain.gain.value = Math.pow(10, (micCfg.gain_db || 0) / 20);
@@ -415,13 +547,59 @@ async function openMic() {
   if (micStream && micOpenWith === want) return;
   micOpenWith = want;
   try {
-    const mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: ns, autoGainControl: agc, channelCount: 1 } });
+    // Close the old capture FIRST: Chrome shares one audio-processing setup per
+    // device while a capture is open, so a new one opened beside it kept the old
+    // auto gain (2026-11-09: auto_gain off was asked, the track still reported
+    // autoGainControl true).
     micSrc?.disconnect();
     micStream?.getTracks().forEach((t) => t.stop());
+    micStream = null;
+    // googAutoGainControl: Chrome's own name for the same switch, for builds
+    // that keep the platform AGC on when only the standard one is given.
+    const mic = await openMicStream({ echoCancellation: true, noiseSuppression: ns, autoGainControl: agc, googAutoGainControl: agc, channelCount: 1 });
     micStream = mic;
     micSrc = ctx.createMediaStreamSource(mic);
     micSrc.connect(micGain);
+    void openDirMic();
   } catch (err) { hud.textContent = "mic unavailable: " + err.name; micOpenWith = ""; }
+}
+
+// Where the voice comes from (2026-11-09, voice_direction.py): the small PROTO's
+// camera has two microphones. Beside the normal capture (the "Default" input,
+// processed, mono) the same hardware is opened by its OWN device entry, raw and
+// in stereo, and sent up as kind 8 for the server to compare left with right.
+// A separate device entry so that Chrome keeps the two setups apart; the report
+// says what each really got. Nothing here feeds the VAD or the recogniser.
+// ?dir=0 turns it off.
+let dirStream = null, dirNodes = null, dirReport = null;
+async function openDirMic() {
+  if (!ctx || dirStream || new URLSearchParams(location.search).get("dir") === "0") return;
+  try {
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "audioinput");
+    const d = devs.find((x) => x.deviceId !== "default" && x.deviceId !== "communications" && /stereo/i.test(x.label) && !/hdmi/i.test(x.label));
+    if (!d) { dirReport = { t: "dir-mic", error: "no stereo input", inputs: devs.map((x) => x.label) }; send(dirReport); return; }
+    const st = await navigator.mediaDevices.getUserMedia({ audio: {
+      deviceId: { exact: d.deviceId }, channelCount: { ideal: 2 }, echoCancellation: false,
+      noiseSuppression: false, autoGainControl: false } });
+    dirStream = st;
+    const src = ctx.createMediaStreamSource(st), sp = ctx.createScriptProcessor(4096, 2, 1), mute = ctx.createGain();
+    mute.gain.value = 0;
+    sp.onaudioprocess = (e) => {
+      if (ws?.readyState !== 1 || ws.bufferedAmount > 262144) return;
+      const L = e.inputBuffer.getChannelData(0), R = e.inputBuffer.getChannelData(1);
+      const msg = new Uint8Array(2 + L.length * 4), pcm = new Int16Array(msg.buffer, 2);
+      msg[0] = 8;
+      for (let j = 0; j < L.length; j++) {
+        pcm[2 * j] = Math.max(-1, Math.min(1, L[j])) * 32767; pcm[2 * j + 1] = Math.max(-1, Math.min(1, R[j])) * 32767;
+      }
+      ws.send(msg);
+    };
+    src.connect(sp); sp.connect(mute); mute.connect(ctx.destination);
+    dirNodes = [src, sp, mute];
+    dirReport = { t: "dir-mic", label: d.label, rate: ctx.sampleRate, settings: st.getAudioTracks()[0].getSettings(),
+      main: micStream?.getAudioTracks()[0]?.getSettings() };
+    send(dirReport);
+  } catch (err) { dirReport = { t: "dir-mic", error: String(err) }; send(dirReport); }
 }
 
 // ---- camera -> head-coupled perspective ----------------------------------------
@@ -430,16 +608,123 @@ async function openMic() {
 // as if they came from a local webcam, and the 3D view shifts with the viewer's
 // head (off-axis perspective). No camera, or no permission: the view simply stays
 // fixed. ?cam=0 turns it off.
+//
+// Which camera: the browser default is not necessarily the one facing people. On
+// the PROTO it was the unit's video INPUT, which sends a black "PROTO / No Input
+// Signal" card while nothing is plugged into it — the server saw no faces and
+// dropped every utterance as not addressed to her (2026-10-23). facingMode means
+// nothing on Linux and labels differ per machine, so each video input is opened
+// and judged by its picture: one that is almost all black is passed over. The
+// last good device is remembered; ?camid=<deviceId> forces one.
+const DARK_SKIP = 0.95;   // share of near-black pixels that marks "no picture"
+let camReport = null;     // re-sent on every (re)connect so the server log has it
+
+// Full resolution (2026-11-08): the server tells who is talking by whether a face's
+// lips move with the voice (active_speaker.py), and in the 640-wide picture a
+// visitor 2 m away has a ~20 px face. The camera is opened at 4K (?camw=1920 for
+// less), the 640 frames for face finding are scaled from it as before, and the
+// near faces the server names are cut out at full resolution (sendFaces).
+// 2026-11-09: back to 640 by default — the lip check did not work on the PROTO,
+// and 4K at 30 fps loaded the PROTO itself ("heavy when she starts to talk").
+// ?camw=3840 to try the full-resolution lip crops again.
+// 1920 (a quarter of 4K's pixels) for the picture-only lip check (lip_motion.py):
+// at 640 a visitor's mouth is ~10 px.
+let camW = +(params.get("camw") || 0) || 1920;
+function openCam(deviceId) {
+  const video = { width: { ideal: camW }, height: { ideal: Math.round(camW * 9 / 16) }, frameRate: { ideal: 30 } };
+  if (deviceId) video.deviceId = { exact: deviceId };
+  else video.facingMode = "user";
+  return navigator.mediaDevices.getUserMedia({ video });
+}
+
+async function darkness(stream) {
+  const v = document.createElement("video");
+  v.muted = true; v.playsInline = true; v.srcObject = stream;
+  await v.play().catch(() => {});
+  for (let i = 0; i < 40 && !v.videoWidth; i++) await new Promise((r) => setTimeout(r, 50));
+  await new Promise((r) => setTimeout(r, 400));   // let auto-exposure settle
+  const c = document.createElement("canvas"); c.width = 64; c.height = 36;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.drawImage(v, 0, 0, 64, 36);
+  const px = g.getImageData(0, 0, 64, 36).data;
+  let dark = 0;
+  for (let i = 0; i < px.length; i += 4) if (px[i] + px[i + 1] + px[i + 2] < 60) dark++;
+  v.srcObject = null;
+  return dark / (px.length / 4);
+}
+
+async function pickCam() {
+  const forced = params.get("camid");
+  if (forced) return openCam(forced);
+  let remembered = null;
+  try { remembered = localStorage.getItem("camId"); } catch {}
+  // Labels and ids stay hidden until one stream is granted: open the last good
+  // (or default) device first, then walk the rest.
+  const first = await openCam(remembered).catch(() => openCam(null));
+  const firstId = first.getVideoTracks()[0]?.getSettings().deviceId;
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+  const labelOf = (id) => devs.find((d) => d.deviceId === id)?.label || String(id).slice(0, 8);
+  const ids = [firstId, ...devs.map((d) => d.deviceId)].filter((id, i, a) => id && a.indexOf(id) === i);
+  const tried = [];
+  let best = null;
+  for (const id of ids) {
+    let s;
+    try { s = id === firstId ? first : await openCam(id); }
+    catch (err) { tried.push({ label: labelOf(id), err: err.name }); continue; }
+    const dark = await darkness(s);
+    tried.push({ label: labelOf(id), dark: +dark.toFixed(2) });
+    if (!best || dark < best.dark) { best?.stream.getTracks().forEach((t) => t.stop()); best = { stream: s, dark, id }; }
+    else s.getTracks().forEach((t) => t.stop());
+    if (dark < DARK_SKIP) break;
+  }
+  if (!best) best = { stream: first, dark: 1, id: firstId };
+  else if (best.stream !== first && !ids.includes(firstId)) first.getTracks().forEach((t) => t.stop());
+  if (best.dark < DARK_SKIP) { try { localStorage.setItem("camId", best.id); } catch {} }
+  camReport = { t: "cams", tried, chosen: labelOf(best.id), dark: +best.dark.toFixed(2) };
+  send(camReport);
+  return best.stream;
+}
+
+// What the camera can do, once, to the server log ("[render] viewer hardware
+// decode: {caps}"). Asked for to see whether the view can be aimed lower in
+// software: the PROTO's camera sits ~2.2 m up and faces land at the bottom edge.
+// Chrome reports pan/tilt/zoom ranges only when they are requested in
+// getUserMedia, which may show a one-time PTZ permission prompt on the PROTO.
+// groupId tells whether the "Default" mic is part of the camera module.
+async function reportCamCaps(stream) {
+  const main = stream.getVideoTracks()[0];
+  let probe = null;
+  try {
+    probe = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: { exact: main.getSettings().deviceId }, pan: true, tilt: true, zoom: true },
+    });
+  } catch (err) { probe = null; }
+  const t = probe ? probe.getVideoTracks()[0] : main;
+  let devices = [];
+  try {
+    devices = (await navigator.mediaDevices.enumerateDevices())
+      .map((d) => ({ kind: d.kind, label: d.label, group: d.groupId.slice(0, 8) }));
+  } catch {}
+  const mic = micStream?.getAudioTracks()[0]?.getSettings() || {};
+  send({ t: "caps", caps: { camera: {
+    label: t.label, ptzRequested: !!probe, settings: t.getSettings(),
+    capabilities: t.getCapabilities ? t.getCapabilities() : null,
+  }, mic: { label: micStream?.getAudioTracks()[0]?.label, group: (mic.groupId || "").slice(0, 8) }, devices } });
+  if (probe) probe.getTracks().forEach((x) => x.stop());
+}
+
 async function startCam() {
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 360 }, facingMode: "user" } });
+    stream = await pickCam();
   } catch (err) { console.info("camera unavailable:", err.name); return; }
+  void reportCamCaps(stream);
   const video = document.createElement("video");
   video.muted = true; video.playsInline = true; video.srcObject = stream;
   await video.play().catch(() => {});
   const c = document.createElement("canvas"), g = c.getContext("2d");
   let busy = false;
+  sendFaces(video, stream);
   setInterval(() => {
     // Never queue frames behind a slow link: a stale head pose is worse than none.
     if (busy || ws?.readyState !== 1 || ws.bufferedAmount > 200000 || !video.videoWidth) return;
@@ -455,6 +740,72 @@ async function startCam() {
       } finally { busy = false; }
     }, "image/jpeg", 0.7);
   }, 66);
+}
+
+// The near faces (server: active_speaker.TRACKS.boxes(), normalised to the frame)
+// cut from the full-resolution camera picture on every camera frame, in the crop
+// the lip model was trained on (LR-ASD: the middle of a square 2.8x the face's
+// half-size, i.e. 1.4x half-size wide, from 0.3 above the face centre to 1.1
+// below), 112x112, as KIND_FACE: <u8 6><u16 track id><u16 face px><u16 ms since
+// the camera took it> + JPEG.
+let asdFaces = [], asdFacesAt = 0;
+let faceSent = 0, camFrames = 0;
+function sendFaces(video, stream) {
+  const fc = document.createElement("canvas"); fc.width = fc.height = 112;
+  const fg = fc.getContext("2d");
+  let inflight = 0, checked = false;
+  const t0 = performance.now();
+  const onFrame = (now, meta) => {
+    camFrames++;
+    // When the camera took this picture (rVFC metadata). The server times the lip
+    // crops by it: the 4K picture reaches the server ~0.5 s after the sound of the
+    // same moment, and the lip model needs the two in step (2026-11-09 on the PROTO).
+    const shotAt = (meta && (meta.captureTime || meta.presentationTime)) || performance.now();
+    // A camera that cannot keep 20 fps at 4K (USB or decode limits on this machine)
+    // is reopened at 1080p once, remembered for next time.
+    if (!checked && performance.now() - t0 > 4000) {
+      checked = true;
+      const fps = camFrames / ((performance.now() - t0) / 1000);
+      const st = stream.getVideoTracks()[0]?.getSettings() || {};
+      send({ t: "cam-res", w: st.width, h: st.height, fps: +fps.toFixed(1) });
+      if (fps < 20 && (st.width || 0) > 1920) {
+        try { localStorage.setItem("camW", "1920"); } catch {}
+        stream.getVideoTracks()[0]?.applyConstraints({ width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } })
+          .then(() => send({ t: "cam-res", w: 1920, h: 1080, note: "4K under 20 fps, now 1080p" })).catch(() => {});
+      }
+    }
+    if (ws?.readyState === 1 && ws.bufferedAmount < 200000 && video.videoWidth &&
+        performance.now() - asdFacesAt < 1000 && inflight < 3) {
+      const W = video.videoWidth, H = video.videoHeight;
+      for (const f of asdFaces) {
+        const [nx, ny, nw, nh] = f.box;
+        const w = nw * W, h = nh * H, bs = Math.max(w, h) / 2;
+        const mx = (nx + nw / 2) * W, my = (ny + nh / 2) * H;
+        const sx = mx - 0.7 * bs, sy = my - 0.3 * bs, side = 1.4 * bs;
+        fg.fillStyle = "rgb(110,110,110)"; fg.fillRect(0, 0, 112, 112);
+        const x0 = Math.max(0, sx), y0 = Math.max(0, sy), x1 = Math.min(W, sx + side), y1 = Math.min(H, sy + side);
+        if (x1 <= x0 || y1 <= y0) continue;
+        const k = 112 / side;
+        fg.drawImage(video, x0, y0, x1 - x0, y1 - y0, (x0 - sx) * k, (y0 - sy) * k, (x1 - x0) * k, (y1 - y0) * k);
+        inflight++;
+        const id = f.id, px = Math.min(65535, Math.round(2 * bs));
+        fc.toBlob(async (blob) => {
+          try {
+            if (blob && ws?.readyState === 1) {
+              const jpg = new Uint8Array(await blob.arrayBuffer()), msg = new Uint8Array(jpg.length + 7);
+              const age = Math.max(0, Math.min(65535, Math.round(performance.now() - shotAt)));
+              const dv = new DataView(msg.buffer);
+              msg[0] = KIND_FACE; dv.setUint16(1, id, true); dv.setUint16(3, px, true); dv.setUint16(5, age, true);
+              msg.set(jpg, 7); ws.send(msg); faceSent++;
+            }
+          } finally { inflight--; }
+        }, "image/jpeg", 0.85);
+      }
+    }
+    if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onFrame);
+  };
+  if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onFrame);
+  else setInterval(() => onFrame(performance.now(), null), 40);
 }
 
 // One-off capability report: which codec/orientation this machine can decode in
@@ -483,13 +834,22 @@ setTimeout(probeCaps, 1500);
 
 addEventListener("resize", () => { clearTimeout(size.t); size.t = setTimeout(size, 200); });
 setInterval(() => send({ t: "ping", c: performance.now() }), 1000);
+// Video arrives continuously (60 fps even of a still frame), so 4 s of nothing on an
+// "open" socket means it is wedged: close it; onclose redials after 1.5 s.
+setInterval(() => {
+  if (ws && ws.readyState === WebSocket.OPEN && performance.now() - lastMsgAt > 4000) {
+    hud.textContent = "stream stalled — reconnecting"; lastMsgAt = performance.now();
+    try { ws.close(4001, "stalled"); } catch { /* already closing */ }
+  }
+}, 1000);
 setInterval(() => {
   hud.textContent = `${mode} · ${frames} fps in / ${decoded} drawn · ${(bytes * 8 / 1e6).toFixed(1)} Mbps · rtt ${rtt.toFixed(0)} ms · ${canvas.width}x${canvas.height}${lastErr ? " · " + lastErr : ""}`;
   // Report to the server log too: the person watching cannot always read this line out.
   send({ t: "stat", inFps: frames, drawn: decoded, mbps: +(bytes * 8 / 1e6).toFixed(1), rtt: Math.round(rtt),
-         codec: codecStr, dec: decoder?.state || "none", q: decoder?.decodeQueueSize ?? -1, err: lastErr, playQ, jbTarget, starves, ctxRate: ctx ? ctx.sampleRate : -1,
-         baseLatency: ctx ? Math.round((ctx.baseLatency + (ctx.outputLatency || 0)) * 1000) : -1, ua: navigator.userAgent.slice(0, 120) });
-  frames = 0; bytes = 0; decoded = 0;
+         codec: codecStr, dec: decoder?.state || "none", q: decoder?.decodeQueueSize ?? -1, err: lastErr, playQ, jbTarget, starves, trimmedMs, ctxRate: ctx ? ctx.sampleRate : -1,
+         baseLatency: ctx ? Math.round((ctx.baseLatency + (ctx.outputLatency || 0)) * 1000) : -1, ua: navigator.userAgent.slice(0, 120),
+         lagMax: Math.round(lagMax), skipped });
+  frames = 0; bytes = 0; decoded = 0; lagMax = 0; skipped = 0;
 }, 1000);
 
 // ---- mic panel ------------------------------------------------------------------

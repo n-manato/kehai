@@ -49,6 +49,7 @@ import { calibrateHeadDistance, hidePanelCalibration, showPanelCalibration } fro
 import { hideSpaceHud, showSpaceHud } from "@/utils/space/space-hud";
 import { hideHeadPreview, showHeadPreview } from "@/utils/space/head-preview";
 import { applyViewerLookAt, resetViewerLookAt, undoViewerLookAt } from "@/utils/space/look-at-viewer";
+import { isRenderSource } from "@/utils/render-source";
 import { useAiState } from "@/context/ai-state-context";
 
 /** Materials hidden on load, by material name. Empty by default.
@@ -2081,6 +2082,26 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     gtaoPass.updateGtaoMaterial({ radius: 0.25, distanceExponent: 1, thickness: 1, scale: 1, samples: 16 });
     gtaoPass.blendIntensity = LOOK.ssao;
     gtaoPass.enabled = LOOK.ssao > 0.001;
+    // HALF-RESOLUTION AO on the render host (2026-11-05, 60 fps on the PROTO). At the full
+    // 2160x3840 GTAO (its own scene pass for normals + 16-sample AO + denoise) was the
+    // biggest GPU cost of a frame — the render used ~60% of GPU0, ~25% with AO off — and with
+    // the TTS on the same GPU the frame no longer fit: 38-46 fps while she spoke, 54-58 with AO
+    // off. AO is low-frequency and denoised, so half size reads the same at a quarter of the
+    // cost; it is blended back at full size. Desktop viewers keep full size.
+    // localStorage.gtaoScale overrides (1 = full size).
+    const gtaoScale = (() => {
+      try {
+        const v = parseFloat(localStorage.getItem("gtaoScale") || "");
+        if (v > 0 && v <= 1) return v;
+      } catch { /* storage blocked */ }
+      return isRenderSource ? 0.5 : 1;
+    })();
+    if (gtaoScale !== 1) {
+      const setSizeFull = gtaoPass.setSize.bind(gtaoPass);
+      gtaoPass.setSize = (w: number, h: number) =>
+        setSizeFull(Math.max(1, Math.round(w * gtaoScale)), Math.max(1, Math.round(h * gtaoScale)));
+      gtaoPass.setSize(container.clientWidth, container.clientHeight);
+    }
     // Objects flagged userData.hideFromOverrides sit out GTAO's depth/normal render
     // (an override material, so it draws everything): the floor mirror there was
     // solid floor to the AO and darkened the air behind her shins — the "shadow
@@ -3051,6 +3072,11 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       avertBackMin: 0.5, // s into her speech before she looks back
       avertBackMax: 1.1,
       avertMax: 4,       // s: a long think still comes back
+      // A listener's nod when the visitor pauses or finishes a sentence (server
+      // "listening-nod"): the first thing they see after they stop is that she
+      // took it in, ~0.3-0.5 s before her voice. 0 turns it off.
+      listenDeg: 4,
+      listenDur: 0.45,   // s, down and back up
     };
     let focusSeen = headTracker.focusEvent().seq;
     let noticeAt = -1e9;
@@ -3060,6 +3086,9 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
     let speakSeen = false;
     let avertUntil = 0;
     let avertSide = 1;
+    let listenAt = -1e9;
+    const onListen = () => { listenAt = aiDebug.now() / 1000; };
+    window.addEventListener("kehai-listen", onListen);
     const onTurn = (e: Event) => {
       const kind = (e as CustomEvent).detail;
       const t = aiDebug.now() / 1000;
@@ -3138,10 +3167,15 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
         attendPoint.add(avertOff);
         headPoint.addScaledVector(avertOff, ATTEND.avertHead);
       }
-      // The nod: one smooth dip over its window, and not while she is mid-reply.
+      // The nods: one smooth dip over its window, and not while she is mid-reply.
+      if (turnLive) return 0;
       const nt = (t - noticeAt - ATTEND.nodDelay) / ATTEND.nodDur;
-      if (turnLive || nt <= 0 || nt >= 1) return 0;
-      return THREE.MathUtils.degToRad(ATTEND.nodDeg * (noticeNew ? 1 : 0.6)) * Math.sin(Math.PI * nt);
+      const noticeNod = nt <= 0 || nt >= 1 ? 0
+        : THREE.MathUtils.degToRad(ATTEND.nodDeg * (noticeNew ? 1 : 0.6)) * Math.sin(Math.PI * nt);
+      const lt = (t - listenAt) / ATTEND.listenDur;
+      const listenNod = lt <= 0 || lt >= 1 ? 0
+        : THREE.MathUtils.degToRad(ATTEND.listenDeg) * Math.sin(Math.PI * lt);
+      return Math.max(noticeNod, listenNod);
     };
     const gazeWant = new THREE.Vector3();
     const gazeTmp = new THREE.Vector3();
@@ -5488,6 +5522,7 @@ export const VRMViewer = memo(({ url }: VRMViewerProps): JSX.Element => {
       delete (window as any).__offAxis;
       delete (window as any).__follow;
       window.removeEventListener("kehai-turn", onTurn);
+      window.removeEventListener("kehai-listen", onListen);
       delete (window as any).__attend;
       delete (window as any).__notice;
       delete (window as any).__headIngest;

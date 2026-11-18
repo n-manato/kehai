@@ -55,6 +55,8 @@ export type AiState = `${AiStateEnum}`;
  */
 interface AiStateContextType {
   aiState: AiState;
+  /** The latest state, including a set made earlier in the same tick. */
+  getAiState: () => AiState;
   setAiState: {
     (state: AiState): void;
     (updater: (currentState: AiState) => AiState): void;
@@ -87,27 +89,40 @@ export function AiStateProvider({ children }: { children: ReactNode }) {
   const [aiState, setAiStateInternal] = useState<AiState>(initialState);
   const [backendSynthComplete, setBackendSynthComplete] = useState(false);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  // The state as last SET, not as last rendered. Updaters used to run against
+  // the `aiState` of the render that created this setter, so a callback holding
+  // an old setter (the stream player's onEnded is built once per turn) wrote its
+  // decision over a newer state — e.g. 'idle' over the 'listening' of a user who
+  // had just started talking. Two sets in one tick (interrupt -> 'interrupted'
+  // -> 'listening') also need the second to see the first.
+  const stateRef = useRef<AiState>(initialState);
+  const commit = (s: AiState) => {
+    stateRef.current = s;
+    setAiStateInternal(s);
+  };
+  const getAiState = useCallback(() => stateRef.current, []);
 
   const setAiState = useCallback((newState: AiState | ((currentState: AiState) => AiState)) => {
+    const current = stateRef.current;
     const nextState = typeof newState === 'function'
-      ? (newState as (currentState: AiState) => AiState)(aiState)
+      ? (newState as (currentState: AiState) => AiState)(current)
       : newState;
 
     if (nextState === AiStateEnum.WAITING) {
-      if (aiState !== AiStateEnum.THINKING_SPEAKING) {
-        setAiStateInternal(nextState);
+      if (current !== AiStateEnum.THINKING_SPEAKING) {
+        commit(nextState);
 
         if (timerRef.current) {
           clearTimeout(timerRef.current);
         }
 
         timerRef.current = setTimeout(() => {
-          setAiStateInternal(AiStateEnum.IDLE);
+          commit(AiStateEnum.IDLE);
           timerRef.current = null;
         }, 2000);
       }
     } else {
-      setAiStateInternal(nextState);
+      commit(nextState);
       if (timerRef.current) {
         clearTimeout(timerRef.current);
         timerRef.current = null;
@@ -143,13 +158,14 @@ export function AiStateProvider({ children }: { children: ReactNode }) {
   const contextValue = useMemo(
     () => ({
       aiState,
+      getAiState,
       setAiState,
       backendSynthComplete,
       setBackendSynthComplete,
       ...stateChecks,
       resetState,
     }),
-    [aiState, setAiState, backendSynthComplete, stateChecks, resetState],
+    [aiState, getAiState, setAiState, backendSynthComplete, stateChecks, resetState],
   );
 
   return (

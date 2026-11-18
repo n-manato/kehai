@@ -4,6 +4,7 @@ endpoints for language generation.
 """
 
 import os
+import re
 import time
 import httpx
 from typing import AsyncIterator, List, Dict, Any
@@ -22,6 +23,7 @@ from loguru import logger
 
 from .stateless_llm_interface import StatelessLLMInterface
 from ...mcpp.types import ToolCallObject
+from ...conversations import tool_notify
 
 
 def _est_tokens(messages: List[Dict[str, Any]], system: str | None) -> int:
@@ -40,6 +42,38 @@ def _est_tokens(messages: List[Dict[str, Any]], system: str | None) -> int:
         for tc in m.get("tool_calls") or []:
             n += len(str(tc))
     return int(n / 1.3)
+
+
+# CALIBRATION of the char estimate against the REAL prompt_tokens vLLM reports
+# in the trailing usage chunk. chars/1.3 is right for JA text and tool blobs,
+# but ~3x too high for an English persona with an English history (measured
+# 2026-11-04: 4.44 chars/token on the system prompt, ~4.17 on history), so the
+# kept window was only ~1.9k real tokens and "[context-trim] dropped 80 oldest
+# message(s)" fired on every turn. Each AsyncLLM keeps `_cal`, an EMA of
+# real/estimated over its own requests, and the estimate is multiplied by it.
+# 1.0 = raw estimate (startup, and the ceiling: the estimate is never scaled
+# UP, so the cap stays conservative); the floor keeps one odd usage report from
+# opening the window too far.
+_CAL_ALPHA = 0.3
+_CAL_MIN, _CAL_MAX = 0.25, 1.0
+
+
+def _safe_cal(cal: Any) -> float:
+    """Clamp a calibration factor into [_CAL_MIN, _CAL_MAX]; junk -> 1.0."""
+    try:
+        cal = float(cal)
+    except (TypeError, ValueError):
+        return 1.0
+    if cal != cal or cal <= 0:  # NaN / zero / negative
+        return 1.0
+    return min(_CAL_MAX, max(_CAL_MIN, cal))
+
+
+def _est_request_tokens(messages: List[Dict[str, Any]], system: str | None) -> int:
+    """RAW (uncalibrated) estimate of one request, summed the way
+    _trim_to_context sums it (system term + message term), so the real
+    prompt_tokens of that request can be set against it."""
+    return int(len(system or "") / 1.3) + _est_tokens(messages, None)
 
 
 # Hard per-message content cap (chars) for OLD messages. A single fetch_content
@@ -72,9 +106,15 @@ def _cap_message_bodies(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _trim_to_context(
-    messages: List[Dict[str, Any]], system: str | None, budget_tokens: int
+    messages: List[Dict[str, Any]],
+    system: str | None,
+    budget_tokens: int,
+    cal: float = 1.0,
 ) -> List[Dict[str, Any]]:
     """Drop the OLDEST turns until the estimated input fits budget_tokens.
+
+    `cal` scales the char estimate (AsyncLLM._cal, see _CAL_ALPHA). The default
+    1.0 is the raw chars/1.3 estimate — bit-identical to the uncalibrated trim.
 
     A long chat history + accumulated tool results (each fetch_content adds a
     big web-page blob) blew past vLLM's max context (16384) -> HTTP 502 -> the
@@ -84,16 +124,17 @@ def _trim_to_context(
     system prompt (Rem persona is 24.5KB!) can exceed the whole budget by
     itself, and that case must degrade to tail-only, not crash.
     """
-    sys_est = int(len(system or "") / 1.3)
+    cal = _safe_cal(cal)
+    sys_est = int(int(len(system or "") / 1.3) * cal)
     msg_budget = max(2500, budget_tokens - sys_est)
-    total_est = _est_tokens(messages, None)
+    total_est = int(_est_tokens(messages, None) * cal)
     if total_est <= msg_budget:
         return messages
     # Walk from the newest, keeping a growing suffix that fits. Costs are
     # accumulated per message rather than re-estimating the whole suffix on every
     # iteration — the old form called _est_tokens(messages[i:]) inside the loop,
     # which is O(k^2) over the kept window and runs on the request path.
-    per_msg = [_est_tokens([m], None) for m in messages]
+    per_msg = [int(_est_tokens([m], None) * cal) for m in messages]
     keep_from = len(messages) - 1  # floor: always keep the newest message
     running = 0
     for i in range(len(messages) - 1, -1, -1):
@@ -131,9 +172,26 @@ def _trim_to_context(
         logger.warning(
             f"[context-trim] dropped {dropped} oldest message(s) to fit msg-budget "
             f"~{msg_budget} tok (msgs were ~{total_est}, "
-            f"system est ~{sys_est})"
+            f"system est ~{sys_est}, cal x{cal:.2f})"
         )
     return trimmed or messages[-1:]
+
+
+_DATA_URI = re.compile(r"data:([\w/.+-]+);base64,[A-Za-z0-9+/=]+")
+
+
+def _debug_summary(messages: list, tail: int = 12) -> str:
+    """What the DEBUG file log keeps of a request: the count, the role sequence
+    and the newest messages, with media data URIs shortened. The full list with
+    the turn's base64 audio was ~160 KB a line: the debug log rotated every
+    4 minutes during a conversation and kept visitors' speech for 30 days
+    (2026-11-04)."""
+    roles = "".join((m.get("role") or "?")[0] for m in messages)
+
+    def short(v):
+        return _DATA_URI.sub(lambda mm: f"<{mm.group(1)} {len(mm.group(0)) * 3 // 4 // 1024} KB>", str(v))
+
+    return f"{len(messages)} msgs, roles={roles} | last {min(tail, len(messages))}: " + short(messages[-tail:])
 
 
 class AsyncLLM(StatelessLLMInterface):
@@ -197,6 +255,12 @@ class AsyncLLM(StatelessLLMInterface):
             ),
         )
         self.support_tools = True
+        # Whether the user turn may carry an `audio_url` part (speech-in models;
+        # see openai_omni_llm). The agent asks before attaching audio.
+        self.accepts_audio = False
+        # EMA of real/estimated prompt tokens (see _CAL_ALPHA). 1.0 = raw char
+        # estimate; the usage chunk of every completion refines it.
+        self._cal = 1.0
         # While the primary is known-down, go STRAIGHT to the fallback for this
         # many seconds (skip even the fast-fail probe), then re-probe.
         self._primary_down_until = 0.0
@@ -239,6 +303,11 @@ class AsyncLLM(StatelessLLMInterface):
         # Tool call related state variables
         accumulated_tool_calls = {}
         in_tool_call = False
+        # Tool-call indexes already announced to the voice filler (tool_notify).
+        # The filler is fired on the FIRST delta that carries function.name:
+        # the executor fired it only once the arguments had finished streaming
+        # and the call was being run, 126-285 ms later, all of it silence.
+        announced_tool_calls: set = set()
 
         try:
             # Fit the context window: vLLM caps input at max_model_len (16384
@@ -249,7 +318,7 @@ class AsyncLLM(StatelessLLMInterface):
             budget = int(os.getenv("LLM_CTX_BUDGET", "12000"))
             messages = _cap_message_bodies(messages)
             _tool_before = sum(1 for m in messages if m.get("role") == "tool")
-            messages = _trim_to_context(messages, system, budget)
+            messages = _trim_to_context(messages, system, budget, cal=self._cal)
             _tool_after = sum(1 for m in messages if m.get("role") == "tool")
             if _tool_before and _tool_after < _tool_before:
                 logger.warning(
@@ -259,6 +328,9 @@ class AsyncLLM(StatelessLLMInterface):
                 )
             elif _tool_after:
                 logger.info(f"[context] {_tool_after} tool result(s) reaching LLM")
+            # Raw estimate of exactly what is sent, set against the REAL
+            # prompt_tokens from the usage chunk below to refine self._cal.
+            est_prompt = _est_request_tokens(messages, system)
 
             # If system prompt is provided, add it to the messages
             messages_with_system = messages
@@ -267,7 +339,7 @@ class AsyncLLM(StatelessLLMInterface):
                     {"role": "system", "content": system},
                     *messages,
                 ]
-            logger.debug(f"Messages: {messages_with_system}")
+            logger.debug(f"Messages: {_debug_summary(messages_with_system)}")
 
             available_tools = tools if self.support_tools else NOT_GIVEN
 
@@ -295,6 +367,8 @@ class AsyncLLM(StatelessLLMInterface):
             ):
                 if value is not None:
                     request_kwargs[name] = value
+            # Subclass additions (vLLM-Omni: modalities / speaker). Empty here.
+            request_kwargs.update(self._extra_request_kwargs())
             # Sticky fallback: while the tunnel is known-down, don't pay even
             # the probe — go straight to the public gateway. After the window
             # expires one turn re-probes the primary (fail-fast, max_retries=0).
@@ -304,10 +378,26 @@ class AsyncLLM(StatelessLLMInterface):
                 and time.monotonic() < self._primary_down_until
             ):
                 primary = self._fallback_client
+            _t_req = time.monotonic()  # [timing] request -> first token
+            from ...utils.turn_timing import wall_ms as _wall_ms
+
+            logger.info(f"[timing] llm request sent @{_wall_ms()} ({len(request_kwargs.get('messages') or [])} msgs)")
+            if os.getenv("LLM_REQ_DUMP", ""):
+                try:  # one JSON per request, for replaying it outside KEHAI (latency triage)
+                    import json as _json
+
+                    _d = os.getenv("LLM_REQ_DUMP")
+                    os.makedirs(_d, exist_ok=True)
+                    with open(os.path.join(_d, f"req_{int(time.time() * 1000)}.json"), "w") as _f:
+                        _json.dump({k: v for k, v in request_kwargs.items() if k not in ("extra_headers",)}, _f, default=str)
+                except Exception as _e:  # noqa: BLE001
+                    logger.debug(f"[timing] request dump failed: {_e!r}")
+            _first_tok_logged = False
             try:
                 stream: AsyncStream[
                     ChatCompletionChunk
                 ] = await primary.chat.completions.create(**request_kwargs)
+                logger.info(f"[timing] llm headers +{(time.monotonic() - _t_req) * 1000:.0f} ms after the request")
             except APIConnectionError as e:
                 if (
                     self._fallback_client is None
@@ -327,6 +417,10 @@ class AsyncLLM(StatelessLLMInterface):
             )
 
             async for chunk in stream:
+                _n_chunks = locals().get('_n_chunks', 0) + 1
+                if _n_chunks <= 4 and os.getenv('LLM_CHUNK_TIMING', '0') == '1':
+                    _c0 = chunk.choices[0].delta if chunk.choices else None
+                    logger.info(f"[timing] chunk {_n_chunks} +{(time.monotonic() - _t_req) * 1000:.0f} ms: content={getattr(_c0, 'content', None)!r} role={getattr(_c0, 'role', None)!r} usage={bool(getattr(chunk, 'usage', None))}")
                 # usage rides a trailing chunk with EMPTY choices — read it
                 # before the choices guard below skips it.
                 if getattr(chunk, "usage", None) and chunk.usage.prompt_tokens:
@@ -334,6 +428,11 @@ class AsyncLLM(StatelessLLMInterface):
                         f"[context] REAL prompt_tokens={chunk.usage.prompt_tokens} "
                         f"(vLLM cap {os.getenv('LLM_CTX_MAX', '24576')})"
                     )
+                    self._calibrate(chunk.usage.prompt_tokens, est_prompt)
+                # A chunk that is not text (vLLM-Omni's audio deltas) is taken
+                # here, before it could be yielded as a "token".
+                if self._consume_side_channel(chunk):
+                    continue
                 # Guard against chunks with missing choices field (e.g., from OpenWebUI)
                 if not chunk.choices:
                     continue
@@ -379,6 +478,12 @@ class AsyncLLM(StatelessLLMInterface):
                                     accumulated_tool_calls[index]["function"][
                                         "name"
                                     ] = tool_call.function.name
+                                    if index not in announced_tool_calls:
+                                        announced_tool_calls.add(index)
+                                        try:
+                                            tool_notify.fire(tool_call.function.name)
+                                        except Exception:  # noqa: BLE001 — never break the stream
+                                            pass
                                 if (
                                     hasattr(tool_call.function, "arguments")
                                     and tool_call.function.arguments
@@ -403,6 +508,7 @@ class AsyncLLM(StatelessLLMInterface):
 
                         yield complete_tool_calls
                         accumulated_tool_calls = {}  # Reset for potential future tool calls
+                        announced_tool_calls = set()
 
                 # Process regular content chunks
                 if len(chunk.choices) == 0:
@@ -410,6 +516,11 @@ class AsyncLLM(StatelessLLMInterface):
                     continue
                 elif chunk.choices[0].delta.content is None:
                     chunk.choices[0].delta.content = ""
+                if not _first_tok_logged and chunk.choices[0].delta.content:
+                    _first_tok_logged = True
+                    from ...utils.turn_timing import wall_ms
+
+                    logger.info(f"[timing] llm first token +{(time.monotonic() - _t_req) * 1000:.0f} ms after the request @{wall_ms()}")
                 yield chunk.choices[0].delta.content
 
             # If stream ends while still in a tool call, make sure to yield the tool call
@@ -452,12 +563,44 @@ class AsyncLLM(StatelessLLMInterface):
             yield "Error calling the chat endpoint: Error occurred while generating response. See the logs for details."
 
         finally:
+            self._on_stream_end()
             # make sure the stream is properly closed
             # so when interrupted, no more tokens will being generated.
             if stream:
                 logger.debug("Chat completion finished.")
                 await stream.close()
                 logger.debug("Stream closed.")
+
+    # --- hooks for subclasses speaking a richer protocol (openai_omni_llm) ---
+    # No-ops here, so every existing provider keeps its exact request shape and
+    # sees every chunk as text.
+
+    def _extra_request_kwargs(self) -> Dict[str, Any]:
+        """Merged into the chat.completions.create() kwargs."""
+        return {}
+
+    def _consume_side_channel(self, chunk) -> bool:
+        """True = this chunk is not text and has been dealt with (skip it)."""
+        return False
+
+    def _on_stream_end(self) -> None:
+        """Called once per chat_completion call, also on cancel."""
+
+    def _calibrate(self, real: int, est: int) -> None:
+        """Fold one (real prompt_tokens, raw estimate) pair into self._cal."""
+        try:
+            real, est = int(real), int(est)
+        except (TypeError, ValueError):
+            return
+        if real <= 0 or est <= 0:
+            return  # nothing to divide by — keep the current factor
+        new = _safe_cal((1.0 - _CAL_ALPHA) * self._cal + _CAL_ALPHA * (real / est))
+        if abs(new - self._cal) > 0.05:
+            logger.info(
+                f"[context] token estimate calibrated: x{new:.2f} "
+                f"(real {real} vs est {est})"
+            )
+        self._cal = new
 
     async def warm_prefix(
         self,
@@ -479,7 +622,9 @@ class AsyncLLM(StatelessLLMInterface):
         if os.getenv("LLM_PREFIX_WARM", "1") == "0":
             return
         budget = int(os.getenv("LLM_CTX_BUDGET", "12000"))
-        messages = _trim_to_context(_cap_message_bodies(messages), system, budget)
+        messages = _trim_to_context(
+            _cap_message_bodies(messages), system, budget, cal=self._cal
+        )
         if system:
             messages = [{"role": "system", "content": system}, *messages]
         t0 = time.monotonic()

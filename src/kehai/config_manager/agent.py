@@ -22,6 +22,7 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         "ollama_llm",
         "lmstudio_llm",
         "openai_llm",
+        "openai_omni_llm",
         "gemini_llm",
         "zhipu_llm",
         "deepseek_llm",

@@ -13,6 +13,7 @@ from .conversation_utils import (
     process_user_input,
     finalize_conversation_turn,
     cleanup_conversation,
+    join_spoken_pieces,
     EMOJI_LIST,
 )
 from .types import (
@@ -68,6 +69,12 @@ async def process_group_conversation(
                 )
                 if uid in client_contexts
                 else False
+            ),
+            bridge=(
+                getattr(client_contexts[uid].character_config, "gesture_bridge", "")
+                or None
+                if uid in client_contexts
+                else None
             ),
         )
         for uid in group_members
@@ -397,7 +404,7 @@ async def process_member_response(
                     tts_manager=tts_manager,
                     translate_engine=context.translate_engine,
                 )
-                full_response += response_part  # Accumulate text response
+                full_response = join_spoken_pieces(full_response, response_part)
             else:
                 logger.warning(
                     f"Received unexpected item type from agent chat stream: {type(output_item)}"

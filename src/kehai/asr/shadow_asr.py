@@ -105,6 +105,19 @@ class VoiceRecognition(ASRInterface):
                     pass
         return text
 
+    async def async_transcribe_fast(self, audio: np.ndarray) -> str:
+        """The primary's quick model, when it has one (gateway_whisper_asr). This
+        wrapper did not pass the method through, so "the quick transcript" ran
+        large-v3/beam 5 after all (2026-11-13, two replays measured the wrong thing)."""
+        quick = getattr(self._primary, "async_transcribe_fast", None)
+        if quick is None:
+            return await self.async_transcribe_np(audio)
+        return await quick(audio)
+
+    @property
+    def last_fast(self):
+        return getattr(self._primary, "last_fast", (0, 0, 0))
+
     # --- the background comparison ------------------------------------------
 
     def _run(self) -> None:

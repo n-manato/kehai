@@ -15,6 +15,7 @@ from .conversation_utils import (
     finalize_conversation_turn,
     cleanup_conversation,
     safe_websocket_send,
+    join_spoken_pieces,
     EMOJI_LIST,
 )
 from .types import WebSocketSend
@@ -50,6 +51,7 @@ async def process_single_conversation(
     images: Optional[List[Dict[str, Any]]] = None,
     session_emoji: str = np.random.choice(EMOJI_LIST),
     metadata: Optional[Dict[str, Any]] = None,
+    audio: Optional[str] = None,
 ) -> str:
     """Process a single-user conversation turn
 
@@ -61,6 +63,8 @@ async def process_single_conversation(
         images: Optional list of image data
         session_emoji: Emoji identifier for the conversation
         metadata: Optional metadata for special processing flags
+        audio: The spoken turn as base64 WAV (omni mode) — heard by the LLM
+            alongside / instead of the ASR text in user_input
 
     Returns:
         str: Complete response text
@@ -87,6 +91,7 @@ async def process_single_conversation(
     tts_manager = TTSTaskManager(
         stream_cfg=context.gsv_stream_config(),
         lsm_only=_lsm,
+        bridge=getattr(context.character_config, "gesture_bridge", "") or None,
     )
     full_response = ""  # Initialize full_response here
 
@@ -129,6 +134,7 @@ async def process_single_conversation(
             images=images,
             from_name=context.character_config.human_name,
             metadata=metadata,
+            audio=audio,
         )
 
         # Store user message (check if we should skip storing to history)
@@ -179,7 +185,9 @@ async def process_single_conversation(
                     response_part_str = (
                         str(response_part) if response_part is not None else ""
                     )
-                    full_response += response_part_str  # Accumulate text response
+                    # One output item is one spoken piece: += glued them into
+                    # "Mm,I'm fine.Same as always" in the stored history.
+                    full_response = join_spoken_pieces(full_response, response_part_str)
                 else:
                     logger.warning(
                         f"Received unexpected item type from agent chat stream: {type(output_item)}"
@@ -203,6 +211,8 @@ async def process_single_conversation(
         # --- End processing agent response ---
 
         # Wait for any pending TTS tasks
+        if hasattr(tts_manager, "flush"):
+            await tts_manager.flush()  # a short sentence held for merging (Qwen3-TTS)
         if tts_manager.task_list:
             await asyncio.gather(*tts_manager.task_list)
             await safe_websocket_send(

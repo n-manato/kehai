@@ -119,6 +119,9 @@ SUPPORTED_LANGUAGES = {
 }
 
 
+_NON_LATIN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\u0400-\u04ff\u0600-\u06ff]")
+
+
 def detect_language(text: str) -> str:
     """
     Detect text language and check if it's supported by pysbd.
@@ -279,8 +282,12 @@ def segment_text_by_pysbd(text: str) -> Tuple[List[str], str]:
         return [], ""
 
     try:
-        # Detect language
-        lang = detect_language(text)
+        # Detect language — but text with no CJK/Hangul characters is English
+        # for every character this app runs, so it skips langdetect: that costs
+        # 3-10 ms each time the buffer holds a sentence end (the first
+        # sentence's critical path) and its first call loads ~50 profile files
+        # (a 421 ms event-loop stall on the first reply, 2026-11-04).
+        lang = "en" if not _NON_LATIN_RE.search(text) else detect_language(text)
 
         if lang is not None:
             # Use pysbd for supported languages

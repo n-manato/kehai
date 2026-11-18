@@ -22,7 +22,7 @@ from ..realtime.ws_opus import (
     client_supports_opus,
     opus_enabled,
 )
-from ..utils.turn_timing import turn_timing
+from ..utils.turn_timing import turn_timing, wall_ms
 from ..tts.tts_interface import TTSInterface
 from ..tts.gsv_stream import (
     GSVStreamConfig,
@@ -30,6 +30,10 @@ from ..tts.gsv_stream import (
     PCM_SAMPLE_RATE,
     PCM_SAMPLE_WIDTH,
     PCM_CHANNELS,
+)
+from ..tts.qwen3tts_stream import (
+    Qwen3TTSStreamConfig,
+    stream_sentence_pcm as qwen3tts_stream_sentence_pcm,
 )
 from ..tts.elevenlabs_stream import (
     ElevenStreamConfig,
@@ -39,6 +43,7 @@ from ..tts.visemes import cues_to_payload
 from ..utils.stream_audio import prepare_audio_payload
 from ..utils.speech_duration import estimate_speech_duration
 from .types import WebSocketSend
+from .speculative import GatedSocket
 from .. import motion_cache
 from ..motion import actionplan_client, gesture_client, motion_lib
 from ..motion.prompts import emotion_from_keyword, prompt_for_key
@@ -68,6 +73,10 @@ _HYBRID_EARLY_WIN_S = float(os.getenv("HYBRID_GESTURELSM_EARLY", "1.2"))
 # generate during the PREVIOUS sentence, so they keep the higher-fidelity 1.2s window.
 # Voice is untouched: the fire is fire-and-forget on a separate service slot.
 _HYBRID_FIRST_WIN_S = float(os.getenv("HYBRID_GESTURELSM_FIRST", "0.35"))
+# The GestureLSM upgrade alone (the KAWAII text layer stays). omni mode runs with
+# GestureLSM stopped in the gateway, so firing it only left clip ids that the
+# frontend polled for 20 s and never got (MOTION_LSM_UPGRADE=0 there).
+_LSM_UPGRADE = os.getenv("MOTION_LSM_UPGRADE", "1") == "1"
 
 
 def _is_emote_sentence(actions, text: str) -> bool:
@@ -92,6 +101,10 @@ def _wants_gesturelsm_upgrade(actions, text: str, secs: float) -> bool:
 # Enabled with GSV_STREAM=1 (base URL overridable via GSV_STREAM_URL). When off,
 # the classic file-based path below is used unchanged.
 _STREAM_ENABLED = os.getenv("GSV_STREAM", "0") == "1"
+# Longest a short sentence waits for the next one before it is spoken alone
+# (Qwen3-TTS short-sentence merge; QWEN3TTS_MERGE_SHORT sets the length).
+_HOLD_MAX_S = float(os.getenv("QWEN3TTS_MERGE_HOLD_S", "0.25") or 0.25)
+_MERGE_FIRST = os.getenv("QWEN3TTS_MERGE_FIRST", "0") == "1"
 # Co-speech gesture pacing (streaming). GestureLSM makes ONE ~6s clip per call, but
 # streaming feeds it a sentence at a time; firing per sentence (~2-3s) asks for 2-3x
 # more clips than it can generate during a bursty reply, so they queue and never
@@ -127,6 +140,26 @@ _TEXT_GESTURE_SPACING_S = float(os.getenv("MOTION_TEXT_SPACING", "4.0"))
 # every turn's first sentence (~0.2-0.4s of the felt TTFA). A shared client
 # keeps the connection warm across turns.
 _shared_stream_client: Optional[httpx.AsyncClient] = None
+
+
+def stream_backend(cfg):
+    """(stream_fn, where) for a voice config object: the ONE place that decides
+    which streaming backend speaks. ElevenStreamConfig -> ElevenLabs,
+    Qwen3TTSStreamConfig -> Qwen3-TTS (vLLM-Omni, omni mode), anything else ->
+    GPT-SoVITS (whose base_url follows GSV_STREAM_URL; mutated here). All three
+    expose the identical `stream_sentence_pcm(text, cfg, client=...)` at 32 kHz.
+
+    Shared with utils/backchannel, so the 相槌 is made by the same backend and
+    voice as the reply it opens. It went through the engine's non-streaming
+    route instead — the gateway's /v1/audio/speech, i.e. GSV with the gateway's
+    FIXED reference clip and Japanese prompt — and every reply began with an
+    "Mm-hm." in a voice that was not hers (2026-11-03, heard on the PROTO)."""
+    if isinstance(cfg, ElevenStreamConfig):
+        return eleven_stream_sentence_pcm, f"elevenlabs:{cfg.model_id}"
+    if isinstance(cfg, Qwen3TTSStreamConfig):
+        return qwen3tts_stream_sentence_pcm, f"qwen3tts:{cfg.base_url}"
+    cfg.base_url = os.getenv("GSV_STREAM_URL", cfg.base_url)
+    return stream_sentence_pcm, cfg.base_url
 
 
 def _get_stream_client() -> httpx.AsyncClient:
@@ -167,6 +200,7 @@ class TTSTaskManager:
         self,
         stream_cfg: Optional[GSVStreamConfig] = None,
         lsm_only: bool = False,
+        bridge: Optional[str] = None,
     ) -> None:
         self.task_list: List[asyncio.Task] = []
         self._lock = asyncio.Lock()
@@ -192,6 +226,15 @@ class TTSTaskManager:
         # tail to start a fresh chain. Awaiting the predecessor also serializes GSV
         # access (one synth at a time), so no extra lock is needed.
         self._stream_prev_done: Optional[asyncio.Future] = None
+        # [timing] lines for the latency bench (first sentence in, first PCM out)
+        self._timing_sent_first = False
+        self._timing_pcm_logged = False
+        self._timing_first_at = 0.0
+        # Short-sentence hold (Qwen3-TTS only; see speak()). 0 = off.
+        self._short_merge_chars = 0
+        self._held_short = None
+        self._held_at = 0.0
+        self._hold_timer: Optional[asyncio.Task] = None
         # Gesture pacing: accumulate spoken seconds; fire a co-speech gesture only
         # once per _GESTURE_MIN_SPACING_S (plus one at the very start so the body
         # starts moving early). Reset in clear().
@@ -207,6 +250,7 @@ class TTSTaskManager:
         # GestureLSM is this character's ONLY conversational body motion
         # (no KAWAII talk-loops / emotes). Per character, from config.
         self.lsm_only = lsm_only
+        self.bridge = bridge  # motion-lib-bridge/<name>.json for the turn opener
         if lsm_only:
             logger.info("[gesture] LSM-ONLY mode for this turn (no KAWAII clips)")
         self._stream_total_secs = 0.0  # spoken seconds this turn (gesture ledger)
@@ -223,19 +267,13 @@ class TTSTaskManager:
             # WAV writer, the WebRTC feed — can tell them apart. That is what
             # lets one character use a cloned ElevenLabs voice while another
             # keeps the fine-tuned GSV one.
-            if isinstance(self._stream_cfg, ElevenStreamConfig):
-                self._stream_fn = eleven_stream_sentence_pcm
-                where = f"elevenlabs:{self._stream_cfg.model_id}"
-            else:
-                self._stream_fn = stream_sentence_pcm
-                self._stream_cfg.base_url = os.getenv(
-                    "GSV_STREAM_URL", self._stream_cfg.base_url
-                )
-                where = self._stream_cfg.base_url
+            self._stream_fn, where = stream_backend(self._stream_cfg)
             # Shared, process-wide client: keeps the gateway TLS connection warm
             # across turns (the manager itself is per-turn).
             self._stream_client = _get_stream_client()
             logger.info(f"[tts_manager] TRUE TTS STREAMING enabled -> {where}")
+            if isinstance(self._stream_cfg, Qwen3TTSStreamConfig):
+                self._short_merge_chars = int(os.getenv("QWEN3TTS_MERGE_SHORT", "16") or 0)
 
     async def speak(
         self,
@@ -258,6 +296,51 @@ class TTSTaskManager:
             websocket_send: WebSocket send function
         """
         if self.streaming:
+            # Qwen3-TTS (omni mode): a very short sentence on its own — "Hello."
+            # "Good evening." "Okay." — comes out bright, 240-300 Hz against her
+            # 170-200 (every fine-tune of 2026-11-04 kept that habit; measured
+            # with librosa.pyin). Spoken together with the next sentence it sits
+            # at 190-215. So a short sentence is held and prepended to the one
+            # that follows; flush() speaks it alone at the end of the reply.
+            # Costs only the LLM's time to the next sentence, in that case.
+            # The turn's FIRST sentence is never held (QWEN3TTS_MERGE_FIRST=1
+            # to hold it too): with the endpoint at ~0.47 s the first sentence's
+            # PCM lands right on the release, so a 34-55 ms hold is heard in
+            # full; later sentences are off the critical path. A lone "Hello."
+            # then keeps its bright pitch (2026-11-04 review, finding 7).
+            _first = self._stream_total_secs == 0.0 and self._held_short is None and not self.task_list
+            if (
+                self._short_merge_chars
+                and len(tts_text.strip()) < self._short_merge_chars
+                and not (_first and not _MERGE_FIRST)
+            ):
+                if self._held_short is None:
+                    self._held_short = (tts_text, display_text, actions, live2d_model, tts_engine, websocket_send)
+                    self._held_at = time.monotonic()
+                    # Bounded wait: if the next sentence is not here within
+                    # _HOLD_MAX_S the short one is spoken alone (a slow LLM
+                    # must not turn a 0.05 s TTS into a 0.7 s one).
+                    self._hold_timer = asyncio.create_task(self._hold_timeout())
+                    return
+            if self._held_short is not None:
+                h_text, h_disp, h_actions, _, _, _ = self._held_short
+                self._held_short = None
+                if self._hold_timer is not None:
+                    self._hold_timer.cancel()
+                    self._hold_timer = None
+                held_ms = (time.monotonic() - self._held_at) * 1000
+                tts_text = f"{h_text.strip()} {tts_text.strip()}"
+                display_text = DisplayText(
+                    text=f"{h_disp.text} {display_text.text}".strip(),
+                    name=display_text.name,
+                    avatar=getattr(display_text, "avatar", None),
+                )
+                actions = actions or h_actions
+                logger.info(f"[tts_manager] short sentence merged with the next after {held_ms:.0f} ms: {tts_text[:50]!r}")
+            if not self._timing_sent_first:
+                self._timing_sent_first = True
+                self._timing_first_at = time.monotonic()
+                logger.info(f"[timing] first sentence to TTS @{wall_ms()}: {tts_text[:40]!r}")
             # All streaming logic (ordering, empty-text, gesture) lives in the
             # streaming methods; the classic file-based path below is untouched.
             prev = self._stream_prev_done
@@ -442,6 +525,7 @@ class TTSTaskManager:
                                 session=f"tts-{id(self)}",  # per-turn chain
                                 gesture=getattr(actions, "gesture", None),
                                 lsm_only=self.lsm_only,
+                                bridge=self.bridge,
                             )
                         else:
                             with open(audio_file_path, "rb") as _f:
@@ -537,7 +621,11 @@ class TTSTaskManager:
                     # Pace the fires (see _TEXT_GESTURE_SPACING_S): a skipped
                     # short sentence still counts toward the next fire, and its
                     # body is covered by the previous clip's tail + hold.
-                    _due = (not self._stream_gesture_fired) or (
+                    # LSM-only (Iris): EVERY sentence is due. Its motion is generated
+                    # from its own audio at the end of synthesis (below), and that path
+                    # needs this entry to hang the upgrade on — a skipped sentence had
+                    # no clip of its own and the body held the previous one.
+                    _due = self.lsm_only or (not self._stream_gesture_fired) or (
                         self._stream_gesture_accum + _est >= _TEXT_GESTURE_SPACING_S
                     )
                     if _due:
@@ -566,6 +654,7 @@ class TTSTaskManager:
                             # Character-scoped: GestureLSM is the only source of
                             # conversational body motion for this avatar.
                             lsm_only=self.lsm_only,
+                            bridge=self.bridge,
                             # Content-matched intent LLM on EVERY fire incl. the first
                             # (the emotion heuristic used to leave the opener generic).
                             # It runs on GPU0 during the deferred-launch wait, so the
@@ -579,8 +668,10 @@ class TTSTaskManager:
                             # 'talk' loops may be SKIPPED by the frontend while GestureLSM
                             # is already driving (keeps GestureLSM continuous); 'emote'
                             # always plays (the cute pose is the point).
+                            # LSM-only serves the bridge, never a pose: always 'talk', so
+                            # the frontend does not lay it over a running GestureLSM clip.
                             "kind": "emote"
-                            if _is_emote_sentence(actions, tts_text)
+                            if not self.lsm_only and _is_emote_sentence(actions, tts_text)
                             else "talk",
                         }
                         self._stream_gesture_fired = True
@@ -696,7 +787,15 @@ class TTSTaskManager:
                 if self._stream_upgrade_n == 0
                 else _HYBRID_EARLY_WIN_S
             )
-            turn_timing.mark("first_sentence")  # LLM's first sentence reached TTS
+            # A speculative reply is generated behind a closed gate (nothing
+            # reaches the client yet), possibly before the endpoint and possibly
+            # never released: timing it here logged TTFA for audio nobody heard
+            # (2026-10-23 22:19:29, "610ms" for a reply that was discarded) and
+            # used up the turn's measurement. The gate times its own release.
+            _gate = getattr(websocket_send, "__self__", None)
+            _timed = not (isinstance(_gate, GatedSocket) and not _gate.is_open)
+            if _timed:
+                turn_timing.mark("first_sentence")  # LLM's first sentence reached TTS
             if speakable and self._stream_cfg is not None:
                 # (cut0-per-sentence was tried here and REVERTED: whole-sentence
                 # lumps starved the track at sentence boundaries and made the
@@ -729,8 +828,22 @@ class TTSTaskManager:
                     acc_bytes += len(chunk)
                     if acc_bytes == len(chunk):  # first PCM of this sentence
                         _t_first_pcm = time.monotonic()  # voice can start NOW (gap ref)
-                        turn_timing.mark("first_pcm")
-                        turn_timing.finish_first_audio()
+                        if not self._timing_pcm_logged and self._timing_first_at:
+                            self._timing_pcm_logged = True
+                            logger.info(
+                                f"[timing] first PCM +{(_t_first_pcm - self._timing_first_at) * 1000:.0f} ms "
+                                f"after the first sentence reached TTS @{wall_ms()}"
+                            )
+                        if _timed:
+                            turn_timing.mark("first_pcm")
+                            turn_timing.finish_first_audio()
+                        elif isinstance(_gate, GatedSocket) and _gate.is_open and turn_timing.pending():
+                            # Fast release opened the gate before this sentence had
+                            # any PCM, so release() could not time it: this IS the
+                            # turn's first voice (the old [TTFA] then showed the
+                            # 2nd sentence's time, 2026-11-04).
+                            turn_timing.mark("first_pcm")
+                            turn_timing.finish_first_audio(note="first PCM after release")
                         if _gest_go is not None:
                             _gest_go.set()  # voice is out — NOW start motion gen
                     # Even out GPT-SoVITS' per-fragment level steps (measured up to
@@ -803,6 +916,8 @@ class TTSTaskManager:
                     # gets stale-dropped on all but long sentences). Non-emote only.
                     elif (
                         text_gesture
+                        and _LSM_UPGRADE
+                        and not self.lsm_only  # LSM-only: the whole sentence, below
                         and not _upgrade_fired
                         and actions is not None
                         and actions.motion
@@ -967,18 +1082,29 @@ class TTSTaskManager:
             # crossfade over the loop when it lands. Short/emote sentences stay KAWAII.
             elif (
                 text_gesture
+                and _LSM_UPGRADE
                 and not _upgrade_fired  # early-fire already handled it (the common path)
                 and actions is not None
                 and actions.motion
                 and pcm_parts
                 and has_content
-                and _wants_gesturelsm_upgrade(actions, tts_text, sent_secs)
+                and (
+                    (self.lsm_only and gesture_client.enabled() and sent_secs > 0.3)
+                    or _wants_gesturelsm_upgrade(actions, tts_text, sent_secs)
+                )
             ):
                 try:
+                    # GestureLSM-only (Iris): generated from the WHOLE sentence, sized
+                    # to it plus the pause before the next one. The early fire used the
+                    # first 0.35/1.2 s of voice padded with silence, so most of each
+                    # clip was the model settling to rest, and a clip never ran past
+                    # ~4.2 s (one 128-frame window, see gesture_client) while sentences
+                    # run 5-7 s — she stopped mid-sentence (2026-11-05). Sentences 2+ are
+                    # synthesized while the previous one plays, so this still lands in time.
                     _gid = motion_cache.start_gesture(
                         _pcm_to_wav_bytes(b"".join(pcm_parts)),
                         tts_text,
-                        dur_override=max(sent_secs + 1.5, 5.0),  # longest clip on offer
+                        dur_override=(sent_secs + 0.6) if self.lsm_only else max(sent_secs + 1.5, 5.0),
                     )
                     actions.motion["upgrade_id"] = _gid
                     self._stream_upgrade_n += 1
@@ -1036,7 +1162,34 @@ class TTSTaskManager:
                 file_name_no_ext=f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}",
             )
 
+    async def _hold_timeout(self) -> None:
+        try:
+            await asyncio.sleep(_HOLD_MAX_S)
+        except asyncio.CancelledError:
+            return
+        if self._held_short is not None:
+            logger.info(f"[tts_manager] short sentence spoken alone after {_HOLD_MAX_S * 1000:.0f} ms (no next sentence yet)")
+            self._hold_timer = None
+            await self.flush()
+
+    async def flush(self) -> None:
+        """Speak a sentence still held by the short-sentence merge (the reply
+        ended with it, or it was the whole reply)."""
+        held = self._held_short
+        if held is None:
+            return
+        self._held_short = None
+        self._short_merge_chars, keep = 0, self._short_merge_chars
+        try:
+            await self.speak(*held)
+        finally:
+            self._short_merge_chars = keep
+
     def clear(self) -> None:
+        self._held_short = None
+        if self._hold_timer is not None:
+            self._hold_timer.cancel()
+            self._hold_timer = None
         """Clear all pending tasks and reset state"""
         if self.streaming:
             # Cancel in-flight streams so an interrupted sentence stops sending

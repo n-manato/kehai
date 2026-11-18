@@ -384,6 +384,37 @@ def modify_latest_message(
         return False
 
 
+def replace_message_content(
+    conf_uid: str,
+    history_uid: str,
+    role: Literal["human", "ai", "system"],
+    old_content: str,
+    new_content: str,
+) -> bool:
+    """Replace the NEWEST message of `role` whose content is `old_content`.
+    Unlike modify_latest_message it does not require that message to be the
+    last one — an audio-first speculative turn stores its placeholder before
+    the transcript exists, and the reply may already have landed behind it."""
+    if not conf_uid or not history_uid:
+        return False
+    filepath = _get_safe_history_path(conf_uid, history_uid)
+    if not os.path.exists(filepath):
+        return False
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            history_data = json.load(f)
+        for msg in reversed(history_data):
+            if msg.get("role") == role and msg.get("content") == old_content:
+                msg["content"] = new_content
+                with open(filepath, "w", encoding="utf-8") as f:
+                    json.dump(history_data, f, ensure_ascii=False, indent=2)
+                return True
+        return False
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Failed to replace message content: {e}")
+        return False
+
+
 def rename_history_file(
     conf_uid: str, old_history_uid: str, new_history_uid: str
 ) -> bool:

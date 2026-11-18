@@ -182,6 +182,9 @@ type Clip = {
   lsm?: boolean;
   /** Per-bone posture correction (rad) about the body's [left, forward] axes; see lsmPosture. */
   lean?: Record<string, [number, number]>;
+  /** The canned turn opener (motion-lib-bridge): nothing is chained from its end pose, so
+   *  while she is still speaking it wraps at once instead of holding (see holdWrapAfter). */
+  bridge?: boolean;
   /** A mid-fade SNAPSHOT's idle share (0..1); real clips use `idle`. See _idleW. */
   idleW?: number;
 };
@@ -1855,7 +1858,7 @@ class VRMMotionPlayer {
           if (data && data.joints && data.joint_names) {
             const idx: Record<string, number> = {};
             data.joint_names.forEach((n: string, i: number) => { idx[n] = i; });
-            const clipObj: Clip = { names: data.joint_names, idx, joints: data.joints, fps: data.fps || 30, loop: !!data.loop, lsm: !!data.gesturelsm };
+            const clipObj: Clip = { names: data.joint_names, idx, joints: data.joints, fps: data.fps || 30, loop: !!data.loop, lsm: !!data.gesturelsm, bridge: !!data.bridge };
             const fromIdle = !this.clip; // seed only when idle was driving the pose
             if (fromIdle) this._snapPose();
             this._stats.applies += 1;
@@ -2032,7 +2035,7 @@ class VRMMotionPlayer {
     if (audio && audio.ended) return; // stale: its sentence already finished (B + C)
     const idx: Record<string, number> = {};
     data.joint_names.forEach((n: string, i: number) => { idx[n] = i; });
-    const clipObj: Clip = { names: data.joint_names, idx, joints: data.joints, fps: data.fps || 30, loop: !!data.loop, idle: !!data.idle, engaged: !!data.engaged, lsm: !!data.gesturelsm };
+    const clipObj: Clip = { names: data.joint_names, idx, joints: data.joints, fps: data.fps || 30, loop: !!data.loop, idle: !!data.idle, engaged: !!data.engaged, lsm: !!data.gesturelsm, bridge: !!data.bridge };
     const fromIdle = !this.clip; // seed only when idle was driving the pose
     if (fromIdle) this._snapPose();
     this._prepareClip(clipObj, data);
@@ -2160,6 +2163,7 @@ class VRMMotionPlayer {
   /** End the gesture. NO hard reset — updateIdle blends every bone (and the legs/hips)
    *  back toward the ambient pose, so gesture->talk/idle eases instead of snapping. */
   stop() {
+    this._windClip = null;
     this.clip = null; this._prevClip = null; this._fadeT = 1; this._gestAudio = null;
     this._hipsTgtValid = false; // idle eases the hips from here; the last target is stale
     this._turnOver = false;
@@ -2197,7 +2201,28 @@ class VRMMotionPlayer {
     this._turnOver = true;    // idle may take over even though a clip is still set
     this._idleSuspended = false;
     this._idleNextAt = performance.now() + 700;
+    // ROBOT: the reply is over, so is the gesture. Free-running, the last clip went on
+    // gesturing at full size for 1.3 s after her voice stopped (its padded tail), and then
+    // a KAWAII idle took the body over (8-17 deg/frame for 0.75 s) — measured 2026-11-05.
+    // Slow the clip to a stop over robotWindDown, then ease into the stance.
+    // Called twice per reply (playback drained, then conversation-chain-end ~0.4 s later):
+    // re-arming restarted the crossfade and threw the forearm 24 deg back in one frame.
+    if (this.robotIdle && this.clip && !this.clip.idle && this._windClip !== this.clip) {
+      this._windClip = this.clip; this._windAt = performance.now();
+    }
   }
+
+  /** Robot, end of a reply: the gesture's playhead stops within robotGestureStop s, while
+   *  the pose crossfades into the stance over robotWindDown s (smoothstep). WALL seconds:
+   *  the render step is clamped to 1/30 s and this tab runs ~29 fps, so dt-time ran ~1.5x
+   *  slow (0.8 s took 1.2 s). */
+  robotGestureStop = 0.3;
+
+  robotWindDown = 1.2;
+
+  private _windClip: Clip | null = null;
+
+  private _windAt = 0;
 
   isActive() { return !!this.clip; }
 
@@ -2246,6 +2271,7 @@ class VRMMotionPlayer {
 
   /** Stop the idle cycle (a turn started); resumes on its own once the body is free. */
   suspendIdle(sec = 1.5) {
+    this._windClip = null; // a new reply: nothing to wind down
     this._idleSuspended = true;
     this._turnOver = false; // a reply is live again
     this._idleNextAt = performance.now() + sec * 1000;
@@ -2319,7 +2345,11 @@ class VRMMotionPlayer {
     // since fingertips were added — so it is gone rather than left as a trap.
     if (!c || !c.lsm) return false;
     const clipLen = (c.joints.length - 1) / c.fps;
-    return this.elapsed < clipLen + 1.5;
+    // The playhead stops at the end pose while holding (free-running branch of
+    // update()), so `elapsed` never passed clipLen + 1.5 and the valve never
+    // opened: the body froze for the rest of the turn after one GestureLSM clip
+    // (2026-11-04). Time spent holding is what the 1.5 s is about.
+    return this.elapsed < clipLen + 1.5 && this._holdT < 1.5;
   }
 
   /** The RAW SMPL joint positions currently driving the VRM this tick — the
@@ -2455,6 +2485,27 @@ class VRMMotionPlayer {
     }
   }
 
+  /** The posture a GestureLSM clip is corrected TO (deg, POSTURE's convention). POSTURE
+   *  itself was measured over KAWAII idles — the human standing of Rem/Miku: spine tipped
+   *  10 deg forward, the head tilted 3 deg to her left, shoulders shrugged, arms 9-11 deg
+   *  out. The robot stands in its rig's REST spine (identity, see _robotStand) with the
+   *  arms 7 deg out (_robotArms), so its gestures are centred on that instead: measured
+   *  live from restDir, so another robot rig gets its own. (2026-11-05: "レムの立ち姿は
+   *  Iris には一切いらない") */
+  private _postureRef(b: string, human: [number, number]): [number, number] {
+    if (!this.robotIdle) return human;
+    if (b === "leftUpperArm") return [0, 7];
+    if (b === "rightUpperArm") return [0, -7];
+    const v = this.restDir[b]; const la = this.restDir.leftUpperArm;
+    if (!v || !la) return human;
+    const D = 180 / Math.PI; const sx = Math.sign(la.x) || 1; // +x = her left?
+    const x = v.x * sx; const y = v.y; const z = v.z;
+    if (b === "leftShoulder" || b === "rightShoulder") {
+      return [0, Math.asin(Math.max(-1, Math.min(1, y / (Math.hypot(x, y, z) || 1)))) * D];
+    }
+    return [Math.atan2(z, Math.abs(y)) * D, Math.atan2(x, Math.abs(y)) * D];
+  }
+
   /** Each POSTURE segment's mean angle over the clip, as the rotation (rad) about the
    *  body's [left, forward] axes that brings it back to the reference. */
   private _leanOf(c: Clip): Record<string, [number, number]> {
@@ -2462,7 +2513,8 @@ class VRMMotionPlayer {
     const li = c.idx.L_Hip; const ri = c.idx.R_Hip;
     if (li === undefined || ri === undefined) return out;
     const D = Math.PI / 180;
-    for (const [b, cfg] of Object.entries(POSTURE)) {
+    for (const [b, cfg0] of Object.entries(POSTURE)) {
+      const cfg = { kind: cfg0.kind, ref: this._postureRef(b, cfg0.ref) };
       const a = AIM[b];
       const i = a && c.idx[a[0]]; const j = a && c.idx[a[1]];
       if (!a || i === undefined || j === undefined) continue;
@@ -2681,7 +2733,11 @@ class VRMMotionPlayer {
       // so waiting here makes the handover truly seamless. Only when the gap drags on
       // (late clip / long pause) do we wrap and keep gesturing.
       const remainEnd = clipLen - this.elapsed;
-      if (remainEnd < 0.15) {
+      if (this._windClip === this.clip) {
+        // reply over (robot): the playhead's rate falls linearly to 0 (see endTurn)
+        const k = Math.max(0, 1 - (performance.now() - this._windAt) / 1000 / this.robotGestureStop);
+        this.elapsed = Math.min(clipLen, this.elapsed + dt * this.speed * k);
+      } else if (remainEnd < 0.15) {
         this.elapsed += Math.max(0, remainEnd) * Math.min(1, dt * 6); // brief settle
         this._holdT += dt;
       } else {
@@ -2779,6 +2835,22 @@ class VRMMotionPlayer {
     // ongoing jerks that flung the hair are now killed by SMOOTHING the retargeted
     // bones in applyFrame, so the springs get smooth input and can sway for real.
     if (this.pendingSpringInit > 0) { this.springReset(); this.pendingSpringInit -= 1; }
+    if (this._windClip && this._windClip === this.clip) {
+      // Reply over (see endTurn): crossfade the slowing gesture into the stance —
+      // smoothstep, so the body leaves the gesture at the gesture's own speed and arrives
+      // with none. Then the stance takes the body over already standing in it.
+      const u = Math.min(1, (performance.now() - this._windAt) / 1000 / this.robotWindDown);
+      // idleT: the stance's own clock (its servo head schedules on it). It only advances
+      // with no clip, so the head target here is the one the stance resumes with.
+      this._robotStand(dt, this.idleT, 0, u * u * (3 - 2 * u));
+      if (u >= 1) {
+        this._windClip = null;
+        this.clip = null; this._prevClip = null; this._fadeT = 1;
+        this._hipsTgtValid = false;
+        this._robotRamp = 1;
+        return;
+      }
+    }
     // Loop via a crossfade (outgoing = this clip held at its end, incoming = frame 0) so
     // the loop keeps velocity instead of stopping. `elapsed > clipLen` only happens when
     // free-running (the audio-sync caps at clipLen). A fresh line's clip crossfades over
@@ -2830,7 +2902,11 @@ class VRMMotionPlayer {
     // them apart by the audio clock, which is still running only in the first case.
     const speaking = !!ga && !ga.paused && !ga.ended;
     const mayWrap = this.clip.lsm ? speaking : true;
-    if (!loop && !this.clip.idle && mayWrap && (this.elapsed > clipLen || this._holdT > this.holdWrapAfter)) {
+    // The opener has no successor chained from its end pose, so the hold is only a stall:
+    // a long first sentence's own clip lands ~3.5 s in, the opener is 2.7 s, and the body
+    // held 0.7 s in between (2026-11-05).
+    const wrapAfter = this.clip.bridge ? 0.05 : this.holdWrapAfter;
+    if (!loop && !this.clip.idle && mayWrap && (this.elapsed > clipLen || this._holdT > wrapAfter)) {
       // A finished clip HOLDS at its end pose waiting for the NEXT (chained) clip to
       // crossfade from that exact pose — a SEAMLESS handover (no jump). The gentle idle
       // sway (updateIdle) keeps it from a dead freeze meanwhile. We only loop-crossfade
@@ -2904,11 +2980,14 @@ class VRMMotionPlayer {
    *  talking, and gesture->ambient transitions are all smooth. */
   /** Robot standby pose + servo head (see robotIdle). Arms are aimed at WORLD directions
    *  from their rest directions, so the stance does not depend on the rig's rest pose. */
-  private _robotStand(dt: number, t: number, e: number) {
+  private _robotStand(dt: number, t: number, e: number, w?: number) {
     // ~0.6 s to settle: steady, not a snap. Ramped in over 0.4 s after an idle clip
     // hands over, so the return starts from rest instead of at its fastest.
-    this._robotRamp = Math.min(1, this._robotRamp + dt / 0.4);
-    const a = 0.06 * this._robotRamp * this._robotRamp;
+    // `w` (0..1): blend the pose on the body this far into the stance instead — the
+    // end-of-reply crossfade out of a speech clip (see endTurn), which re-applies the
+    // clip every frame, so the weight is absolute rather than a per-frame ease.
+    if (w === undefined) this._robotRamp = Math.min(1, this._robotRamp + dt / 0.4);
+    const a = w ?? 0.06 * this._robotRamp * this._robotRamp;
     // Torso: still. Only the talking layer (e > 0 when speaking without a clip) moves it.
     this.ambient("spine", Math.sin(t * 2.1) * 0.015 * e, 0, 0, a);
     this.ambient("chest", 0.02 * e, 0, 0, a);
@@ -2923,8 +3002,9 @@ class VRMMotionPlayer {
     const k = Math.min(1, dt * 9);
     s.cx += (s.tx - s.cx) * k;
     s.cy += (s.ty - s.cy) * k;
-    this.ambient("head", s.cy + Math.sin(t * 3.3) * 0.04 * e, s.cx, 0, 0.5 * this._robotRamp * this._robotRamp);
+    this.ambient("head", s.cy + Math.sin(t * 3.3) * 0.04 * e, s.cx, 0, w ?? 0.5 * this._robotRamp * this._robotRamp);
     this._robotArms(a);
+    if (w !== undefined) return; // mid-crossfade: the clip path owns the rest of the frame
     this._robotArmW = this._robotArmU = 1;
     const hipsN = this.node("hips");
     if (hipsN) { hipsN.quaternion.slerp(this._ambIdentity, a); hipsN.position.lerp(this.hipsRestPos, a); hipsN.updateMatrixWorld(true); }

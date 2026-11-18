@@ -7,7 +7,8 @@ from fastapi import WebSocket
 from loguru import logger
 
 from ..chat_group import ChatGroupManager
-from ..chat_history_manager import store_message
+from ..chat_history_manager import modify_latest_message, store_message
+from ..utils.sentence_spacing import unglue
 from ..service_context import ServiceContext
 from .group_conversation import process_group_conversation
 from .single_conversation import process_single_conversation
@@ -140,6 +141,9 @@ async def handle_conversation_trigger(
         received_data_buffers[client_uid] = np.array([])
 
     images = data.get("images")
+    # omni mode: the server VAD attaches the utterance audio (base64 WAV) so the
+    # speech-in LLM hears the turn itself; absent for typed text and in cascade.
+    audio = data.get("audio")
     session_emoji = np.random.choice(EMOJI_LIST)
 
     # Spoken language: the CHARACTER's configured language wins (the persona,
@@ -205,6 +209,7 @@ async def handle_conversation_trigger(
                 images=images,
                 session_emoji=session_emoji,
                 metadata=metadata,
+                audio=audio,
             )
         )
 
@@ -217,7 +222,15 @@ async def handle_individual_interrupt(
 ):
     if client_uid in current_conversation_tasks:
         task = current_conversation_tasks[client_uid]
-        if task and not task.done():
+        running = task is not None and not task.done()
+        heard_response = unglue((heard_response or "").strip())
+        if not running and not heard_response:
+            # Nothing generating and nothing being heard: no reply to cut off.
+            # Stored anyway, a stray barge-in (a state left at "thinking") put a
+            # marker in the file each time — 5 in a row on 2026-10-23 22:38-22:39.
+            logger.debug("[interrupt] no reply running or playing — ignored")
+            return
+        if running:
             task.cancel()
             logger.info("🛑 Conversation task was successfully interrupted")
 
@@ -226,7 +239,29 @@ async def handle_individual_interrupt(
         except Exception as e:
             logger.error(f"Error handling interrupt: {e}")
 
-        if context.history_uid:
+        if context.history_uid and not running:
+            # The reply had finished generating and was stored whole; she was
+            # cut off while it was still PLAYING. Keep only what she got out,
+            # as the agent's memory now does — appended, it stood in the file
+            # twice (full, then partial).
+            if not modify_latest_message(
+                context.character_config.conf_uid, context.history_uid, "ai", heard_response
+            ):
+                store_message(
+                    conf_uid=context.character_config.conf_uid,
+                    history_uid=context.history_uid,
+                    role="ai",
+                    content=heard_response,
+                    name=context.character_config.character_name,
+                    avatar=context.character_config.avatar,
+                )
+            store_message(
+                conf_uid=context.character_config.conf_uid,
+                history_uid=context.history_uid,
+                role="system",
+                content="[Interrupted by user]",
+            )
+        elif context.history_uid:
             # Only record what she ACTUALLY got out before being cut off. A
             # barge-in during the pause before the first word leaves
             # heard_response empty, and storing that put a contentless `ai` turn

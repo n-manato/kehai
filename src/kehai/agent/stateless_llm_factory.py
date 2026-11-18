@@ -7,6 +7,7 @@ from .stateless_llm.stateless_llm_with_template import (
     AsyncLLMWithTemplate as StatelessLLMWithTemplate,
 )
 from .stateless_llm.openai_compatible_llm import AsyncLLM as OpenAICompatibleLLM
+from .stateless_llm.openai_omni_llm import AsyncOmniLLM
 from .stateless_llm.ollama_llm import OllamaLLM
 from .stateless_llm.claude_llm import AsyncLLM as ClaudeLLM
 
@@ -43,6 +44,23 @@ class LLMFactory:
                 presence_penalty=kwargs.get("presence_penalty"),
                 frequency_penalty=kwargs.get("frequency_penalty"),
                 top_p=kwargs.get("top_p"),
+            )
+        if llm_provider == "openai_omni_llm":
+            # Qwen3-Omni on vLLM-Omni (omni mode): hears the turn's audio, may
+            # also speak. Same request shape as openai_llm plus the omni extras.
+            return AsyncOmniLLM(
+                model=kwargs.get("model"),
+                base_url=kwargs.get("base_url"),
+                llm_api_key=kwargs.get("llm_api_key"),
+                organization_id=kwargs.get("organization_id"),
+                project_id=kwargs.get("project_id"),
+                temperature=kwargs.get("temperature"),
+                presence_penalty=kwargs.get("presence_penalty"),
+                frequency_penalty=kwargs.get("frequency_penalty"),
+                top_p=kwargs.get("top_p"),
+                speaker=kwargs.get("speaker"),
+                audio_output=bool(kwargs.get("audio_output", False)),
+                top_k=kwargs.get("top_k"),
             )
         if llm_provider == "stateless_llm_with_template":
             return StatelessLLMWithTemplate(

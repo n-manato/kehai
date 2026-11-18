@@ -1,3 +1,4 @@
+import os
 from typing import Type, Literal
 from loguru import logger
 
@@ -40,6 +41,24 @@ class AgentFactory:
             # Get the LLM provider choice from agent settings
             basic_memory_settings: dict = agent_settings.get("basic_memory_agent", {})
             llm_provider: str = basic_memory_settings.get("llm_provider")
+
+            # Mode switch (PC-B `./kehai.sh mode omni`): start_server.sh exports
+            # LLM_PROVIDER_OVERRIDE so the SAME conf.yaml / characters serve both
+            # modes — the brain is chosen by .mode, not by editing the configs.
+            # Ignored when the named provider has no block to read.
+            override = os.getenv("LLM_PROVIDER_OVERRIDE", "").strip()
+            if override and override != llm_provider:
+                if llm_configs.get(override):
+                    logger.info(
+                        f"[mode] LLM provider {llm_provider!r} -> {override!r} "
+                        "(LLM_PROVIDER_OVERRIDE)"
+                    )
+                    llm_provider = override
+                else:
+                    logger.warning(
+                        f"[mode] LLM_PROVIDER_OVERRIDE={override!r} has no llm_configs "
+                        f"block; keeping {llm_provider!r}"
+                    )
 
             if not llm_provider:
                 raise ValueError("LLM provider not specified for basic memory agent")

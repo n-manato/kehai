@@ -27,7 +27,7 @@ import { webrtcAudio } from '@/utils/webrtc-audio';
 import { mmdExpression } from '@/utils/mmd-expression';
 import { vrmExpression } from '@/utils/vrm-expression';
 import { vrmLipSync } from '@/utils/vrm-lipsync';
-import { StreamingAudioPlayer, streamingPlaybackState } from '@/utils/streaming-audio-player';
+import { StreamingAudioPlayer, streamingPlaybackState, streamingControl } from '@/utils/streaming-audio-player';
 import { WsOpusDecoder } from '@/utils/ws-opus-decoder';
 import { playBackchannel } from '@/utils/backchannel-player';
 import { isRenderSource } from '@/utils/render-source';
@@ -139,12 +139,14 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
   const [wsState, setWsState] = useState<string>('CLOSED');
   const [wsUrl, setWsUrl] = useLocalStorage<string>('wsUrl', defaultWsUrl);
   const [baseUrl, setBaseUrl] = useLocalStorage<string>('baseUrl', defaultBaseUrl);
-  const { aiState, setAiState, backendSynthComplete, setBackendSynthComplete } = useAiState();
+  const {
+    aiState, getAiState, setAiState, backendSynthComplete, setBackendSynthComplete,
+  } = useAiState();
   const { setModelInfo } = useLive2DConfig();
   const { setSubtitleText } = useSubtitle();
   const {
     clearResponse, setForceNewMessage, appendHumanMessage, appendAIMessage,
-    appendOrUpdateToolCallMessage,
+    appendOrUpdateToolCallMessage, appendResponse,
   } = useChatHistory();
   const { addAudioTask } = useAudioTask();
   const bgUrlContext = useBgUrl();
@@ -156,6 +158,8 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
   const { startMic, stopMic, autoStartMicOnConvEnd } = useVAD();
   const autoStartMicOnConvEndRef = useRef(autoStartMicOnConvEnd);
   const { interrupt } = useInterrupt();
+  const interruptRef = useRef(interrupt);
+  interruptRef.current = interrupt;
   const { setBrowserViewData } = useBrowser();
 
   // --- true-TTS-streaming playback (audio-stream-* messages) ----------------
@@ -236,6 +240,10 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
     vrmExpression.relax();
     mmdExpression.relax();
     talkingMotionController.onSpeechEnd();
+    // Drained, so stop() only closes its AudioContext. Dropping the ref alone
+    // leaked one running context per reply — and in render mode each stays
+    // wired into the tap that carries her voice to the PROTO.
+    streamPlayerRef.current?.stop();
     streamPlayerRef.current = null;
     closeOpusDecoder();
     setAiState((s: AiState) => (s === 'thinking-speaking' ? 'idle' : s));
@@ -259,10 +267,18 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
     vrmMotionPlayer.stopTalking();
   }, [clearStreamTimers, closeOpusDecoder]);
 
-  // Interrupt (barge-in / user spoke): kill the stream immediately.
+  // Interrupt (barge-in / user spoke): kill the stream immediately. interrupt()
+  // calls it directly (streamingControl); the effect stays for other paths that
+  // set 'interrupted'.
   useEffect(() => {
     if (aiState === 'interrupted') stopStreamingNow();
   }, [aiState, stopStreamingNow]);
+  useEffect(() => {
+    streamingControl.stopNow = stopStreamingNow;
+    return () => {
+      if (streamingControl.stopNow === stopStreamingNow) streamingControl.stopNow = null;
+    };
+  }, [stopStreamingNow]);
 
   // The browser is refusing to play her voice until this page gets a click.
   // Surfaced as a toast because nothing else about it is visible: the reply
@@ -339,9 +355,29 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
         console.warn('Server reports a stalled mic — restarting the WebRTC peer');
         webrtcAudio.forceReconnect();
         break;
+      case 'user-speech-start':
+        // The server's VAD opened a turn — past its proximity gate, so this is
+        // speech it is going to answer. In server-VAD mode this, not the local
+        // VAD, is the barge-in: the local one has no level gate and stopped her
+        // for voices the server then ignored, leaving no reply at all.
+        if (getAiState() === 'thinking-speaking' || streamPlayerRef.current) {
+          interruptRef.current();
+        }
+        setAiState((s: AiState) => (s === 'idle' || s === 'interrupted' ? 'listening' : s));
+        break;
+      case 'listening-nod':
+        // The visitor in front of her paused or finished a sentence (server VAD,
+        // websocket_handler): a small nod, the "mm-hm" a listener gives
+        // (vrm-viewer ATTEND.listenDeg).
+        window.dispatchEvent(new CustomEvent('kehai-listen'));
+        break;
       case 'conversation-chain-start':
         // Turn events for her gaze (vrm-viewer ATTEND): she looks away to think.
         window.dispatchEvent(new CustomEvent('kehai-turn', { detail: 'think' }));
+        // A reply still playing here was superseded server-side (a new turn
+        // replaced it). Its player must not carry over: the new reply's audio
+        // would queue behind the old one's leftovers and skip the turn setup.
+        if (streamPlayerRef.current) stopStreamingNow();
         setAiState('thinking-speaking');
         talkingMotionController.onThinkingStart(); // "thinking" pose until audio starts
         audioTaskQueue.clearQueue();
@@ -400,7 +436,7 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
             console.warn('resetOnIdle', e);
           }
           setAiState((currentState: AiState) => {
-            if (currentState === 'thinking-speaking') {
+            if (currentState === 'thinking-speaking' || currentState === 'listening') {
               // Auto start mic if enabled
               if (autoStartMicOnConvEndRef.current) {
                 startMic();
@@ -415,7 +451,7 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
       default:
         console.warn('Unknown control command:', controlText);
     }
-  }, [setAiState, clearResponse, setForceNewMessage, startMic, stopMic]);
+  }, [setAiState, getAiState, clearResponse, setForceNewMessage, startMic, stopMic, stopStreamingNow]);
 
   const handleWebSocketMessage = useCallback((message: MessageEvent) => {
     console.log('Received message from server:', message);
@@ -544,6 +580,7 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
           // (the "voice but frozen body" bug). The wiring below is idempotent,
           // so re-running it every sentence also self-heals a missed turn start.
           if (aiState === 'interrupted') break;
+          const openingSentenceRtc = !streamingPlaybackState.active; // see the WS branch
           if (!streamingPlaybackState.active) { vrmMotionPlayer.statsReset(); gestureFramesRef.current = 0; appliedGestureRef.current.clear(); }
           streamingPlaybackState.active = true;
           // SILENCE WATCHDOG. The server has just said "I am speaking now", so
@@ -575,6 +612,7 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
               // lines she never got to say. appendAIMessage merges consecutive AI
               // text, so the sentences of one turn land as one message.
               if (dtxt) appendAIMessage(dtxt, dname, davatar);
+              if (dtxt) appendResponse(dtxt); // the heard part (see the WS branch)
               if (emo) vrmExpression.playEmotion(emo);
             }, playInMs);
             streamTimersRef.current.push(tid);
@@ -600,7 +638,7 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
                 // slammed its KAWAII talk-loop over a running GestureLSM clip — measured
                 // 8 source flips in one turn, i.e. the visible KAWAII/GestureLSM seam.
                 // Emote sentences (kind !== 'talk') still play: the pose is the point.
-                if (gm2.kind === 'talk' && vrmMotionPlayer.gestureLSMActive()) return;
+                if (!openingSentenceRtc && gm2.kind === 'talk' && vrmMotionPlayer.gestureLSMActive()) return;
                 const clock = makeWallClock(startAt, dur);
                 const clip = vrmMotionPlayer.takePrefetched(gm2.id);
                 if (clip) vrmMotionPlayer.setClip(clip, clock);
@@ -622,6 +660,10 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
         // a REAL barge-in ('interrupted', set by use-interrupt) may drop audio;
         // the server has already stopped sending for that turn anyway.
         if (aiState === 'interrupted') break;
+        // The turn's FIRST sentence: whatever GestureLSM clip is on the body belongs to an
+        // earlier (possibly interrupted) reply, so its continuity guard must not skip this
+        // turn's opener — it did, and the body held 3.7 s at a reply start (2026-11-05).
+        const openingSentence = !streamPlayerRef.current;
         if (!streamPlayerRef.current) {
           const player = new StreamingAudioPlayer({
             sampleRate: message.sample_rate || 32000,
@@ -668,6 +710,8 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
             }
           }
           vrmMotionPlayer.statsReset();
+          gestureFramesRef.current = 0;
+          appliedGestureRef.current.clear();
           streamingPlaybackState.active = true;
           // scale 2.4: live PCM RMS runs lower than the old normalized volumes[],
           // so the mouth needs more gain to open convincingly.
@@ -696,9 +740,38 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
           const tid = setTimeout(() => {
             if (dtxt) setSubtitleText(dtxt);
             if (dtxt) appendAIMessage(dtxt, dname, davatar); // see the WebRTC branch
+            // What she has actually begun to say: a barge-in reports this as the
+            // heard part (use-interrupt), so the history keeps her reply only up
+            // to where she was cut off. Streaming never filled it before, so
+            // every interrupt reported "" and her reply vanished from the file.
+            if (dtxt) appendResponse(dtxt);
             if (emo) vrmExpression.playEmotion(emo);
           }, delayMs);
           streamTimersRef.current.push(tid);
+          // MOTION FROM THE START FRAME, as the WebRTC branch above does. The clip id
+          // rides this frame (fired from the sentence text), but this path only applied
+          // it on audio-stream-end — i.e. once the whole sentence was synthesized, which
+          // for a reply's FIRST sentence is after it has begun playing: measured 0.46 s
+          // and 1.75 s of no motion at the start of a reply (2026-11-05). Prefetch now,
+          // apply at this sentence's play origin; the end frame then only adds the upgrade.
+          const gm0 = message.actions?.motion;
+          if (gm0?.id && gm0.key === 'gesture' && (window as any).__vrm) {
+            const url0 = `/motion/clip-smpl/${gm0.id}`;
+            vrmMotionPlayer.prefetch(url0, gm0.id, 80, 250);
+            appliedGestureRef.current.add(gm0.id);
+            // The real length is not known until the end frame; the estimate + margin
+            // only bounds the clock (a clip that runs out holds or wraps while speaking).
+            const dur0 = Math.max(0.5, gm0.duration ?? 3) + 1.5;
+            const tid0 = setTimeout(() => {
+              if (!streamPlayerRef.current) return;
+              if (!openingSentence && gm0.kind === 'talk' && vrmMotionPlayer.gestureLSMActive()) return; // keep GestureLSM continuous
+              const clock = makeStreamClock(sp, origin, dur0);
+              const clip = vrmMotionPlayer.takePrefetched(gm0.id);
+              if (clip) vrmMotionPlayer.setClip(clip, clock);
+              else vrmMotionPlayer.playGesture(url0, { audio: clock, tries: 80, intervalMs: 250 });
+            }, delayMs);
+            streamTimersRef.current.push(tid0);
+          }
         }
         break;
       }
@@ -790,20 +863,23 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
           // ~20s poll budget: streamed sentences synthesise in a burst so their
           // gestures queue behind each other on GestureLSM — poll far longer than
           // the file path's default (each clip still lands before its late sentence).
-          vrmMotionPlayer.prefetch(url, gm.id, 80, 250);
           const delayMs = Math.max(0, (origin - pe.currentTime()) * 1000);
-          const tid = setTimeout(() => {
-            if (!streamPlayerRef.current) return;
-            // Keep GestureLSM CONTINUOUS: skip this sentence's KAWAII talk-loop while a
-            // GestureLSM clip is still driving (its own upgrade below chains on). Emote
-            // sentences (kind !== 'talk') always play their cute pose.
-            if (gm.kind === 'talk' && vrmMotionPlayer.gestureLSMActive()) return;
-            const clock = makeStreamClock(pe, origin, dur);
-            const clip = vrmMotionPlayer.takePrefetched(gm.id);
-            if (clip) vrmMotionPlayer.setClip(clip, clock);
-            else vrmMotionPlayer.playGesture(url, { audio: clock, tries: 80, intervalMs: 250 });
-          }, delayMs);
-          streamTimersRef.current.push(tid);
+          // Already applied from the start frame (above) — only the upgrade is new here.
+          if (!appliedGestureRef.current.has(gm.id)) {
+            vrmMotionPlayer.prefetch(url, gm.id, 80, 250);
+            const tid = setTimeout(() => {
+              if (!streamPlayerRef.current) return;
+              // Keep GestureLSM CONTINUOUS: skip this sentence's KAWAII talk-loop while a
+              // GestureLSM clip is still driving (its own upgrade below chains on). Emote
+              // sentences (kind !== 'talk') always play their cute pose.
+              if (gm.kind === 'talk' && vrmMotionPlayer.gestureLSMActive()) return;
+              const clock = makeStreamClock(pe, origin, dur);
+              const clip = vrmMotionPlayer.takePrefetched(gm.id);
+              if (clip) vrmMotionPlayer.setClip(clip, clock);
+              else vrmMotionPlayer.playGesture(url, { audio: clock, tries: 80, intervalMs: 250 });
+            }, delayMs);
+            streamTimersRef.current.push(tid);
+          }
           // HYBRID: GestureLSM co-speech upgrade — crossfade OVER the instant KAWAII
           // loop the moment it lands. upgradeGesture never claims gestureSeq, so it
           // cannot cancel the primary's in-flight poll; near-immediate schedule + fast
@@ -981,7 +1057,7 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
       default:
         console.warn('Unknown message type:', message.type);
     }
-  }, [aiState, addAudioTask, appendHumanMessage, appendAIMessage, setRestorePending, baseUrl, bgUrlContext, setAiState, setConfName, setConfUid, setConfigFiles, setCurrentHistoryUid, setHistoryList, setMessages, setModelInfo, setSubtitleText, startMic, stopMic, setSelfUid, setGroupMembers, setIsOwner, backendSynthComplete, setBackendSynthComplete, clearResponse, handleControlMessage, appendOrUpdateToolCallMessage, interrupt, setBrowserViewData, t]);
+  }, [aiState, addAudioTask, appendHumanMessage, appendAIMessage, setRestorePending, baseUrl, bgUrlContext, setAiState, setConfName, setConfUid, setConfigFiles, setCurrentHistoryUid, setHistoryList, setMessages, setModelInfo, setSubtitleText, startMic, stopMic, setSelfUid, setGroupMembers, setIsOwner, backendSynthComplete, setBackendSynthComplete, clearResponse, handleControlMessage, appendOrUpdateToolCallMessage, appendResponse, interrupt, setBrowserViewData, t]);
 
   useEffect(() => {
     wsService.connect(wsUrl);

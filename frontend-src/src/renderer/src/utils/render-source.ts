@@ -54,25 +54,36 @@ registerProcessor("kehai-tap", Tap);
 // a burst has filled it: every word then reaches VAD that much later, and the
 // end-of-turn with it. So past 80 ms it drops back to 40 ms — a few ms of
 // skipped mic audio at a burst, instead of permanent lag.
+// Both repairs cut holes in the speech VAD and whisper get, so they are counted:
+// `drop` = audio thrown away, `gap` = silence played while the viewer was still
+// sending (its queue ran dry), both in ms per report, to the server's stats line.
 const MIC_WORKLET = `
 class Mic extends AudioWorkletProcessor {
   constructor() {
     super(); this.q = []; this.cur = null; this.pos = 0; this.queued = 0; this.n = 0;
+    this.dropped = 0; this.gap = 0; this.lastMsg = -1;
     this.port.onmessage = (e) => {
       const f = new Float32Array(e.data.length);
       for (let i = 0; i < f.length; i++) f[i] = e.data[i] / 0x7fff;
-      this.q.push(f); this.queued += f.length;
+      this.q.push(f); this.queued += f.length; this.lastMsg = currentTime;
       if (this.queued > 48000 * 0.08) {
-        while (this.q.length > 1 && this.queued > 48000 * 0.04) this.queued -= this.q.shift().length;
+        while (this.q.length > 1 && this.queued > 48000 * 0.04) {
+          const d = this.q.shift().length; this.queued -= d; this.dropped += d;
+        }
       }
-      if (++this.n % 50 === 0) this.port.postMessage(this.queued / 48);
+      if (++this.n % 50 === 0) {
+        this.port.postMessage({ q: this.queued / 48, drop: this.dropped / 48, gap: this.gap / 48 });
+        this.dropped = 0; this.gap = 0;
+      }
     };
   }
   process(_, outputs) {
     const out = outputs[0][0];
+    const live = this.lastMsg >= 0 && currentTime - this.lastMsg < 0.1;
     for (let i = 0; i < out.length; i++) {
       if (!this.cur || this.pos >= this.cur.length) { this.cur = this.q.shift() || null; this.pos = 0; if (this.cur) this.queued -= this.cur.length; }
-      out[i] = this.cur ? this.cur[this.pos++] : 0;
+      if (this.cur) out[i] = this.cur[this.pos++];
+      else { out[i] = 0; if (live) this.gap++; }
     }
     return true;
   }
@@ -108,9 +119,12 @@ function start() {
     };
     micNode = new AudioWorkletNode(mix, "kehai-mic", { numberOfInputs: 0, outputChannelCount: [1] });
     micNode.connect(micDest);
-    // Queue depth (ms), roughly once a second, for the server's latency line.
+    // Queue depth and repairs (ms), roughly once a second, for the server's line.
     micNode.port.onmessage = (e) => {
-      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: "micq", ms: Math.round(e.data as number) }));
+      const { q, drop, gap } = e.data as { q: number; drop: number; gap: number };
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ t: "micq", ms: Math.round(q), drop: Math.round(drop), gap: Math.round(gap) }));
+      }
     };
   });
 

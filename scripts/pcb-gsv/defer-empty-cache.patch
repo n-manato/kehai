@@ -1,0 +1,39 @@
+--- a/GPT_SoVITS/TTS_infer_pack/TTS.py
++++ b/GPT_SoVITS/TTS_infer_pack/TTS.py
+@@ -1032,6 +1032,10 @@
+             Tuple[int, np.ndarray]: sampling rate and audio data.
+         """
+         ########## variables initialization ###########
++        # (KEHAI patch) a deferred cleanup must not run under this request.
++        _t = getattr(self, "_cleanup_timer", None)
++        if _t is not None:
++            _t.cancel()
+         self.stop_flag: bool = False
+         text: str = inputs.get("text", "")
+         text_lang: str = inputs.get("text_lang", "")
+@@ -1526,7 +1530,24 @@
+             self.init_vits_weights(self.configs.vits_weights_path)
+             raise e
+         finally:
+-            self.empty_cache()
++            # (KEHAI patch, 2026-10-24) Deferred to idle. Run here it took ~460 ms
++            # (gc.collect over this process) AFTER the last audio had been sent,
++            # holding every streaming request open that long — and the next
++            # sentence's request waited behind it, so each sentence boundary of
++            # a reply cost ~460 ms of silence. Measured on "Mm,": all audio at
++            # +252 ms, stream closed at +709 ms. Now it runs once the server has
++            # been idle for 2 s; a new request cancels it.
++            self._defer_empty_cache()
++
++    def _defer_empty_cache(self, delay: float = 2.0):
++        import threading
++
++        t = getattr(self, "_cleanup_timer", None)
++        if t is not None:
++            t.cancel()
++        self._cleanup_timer = threading.Timer(delay, self.empty_cache)
++        self._cleanup_timer.daemon = True
++        self._cleanup_timer.start()
+ 
+     def empty_cache(self):
+         try:

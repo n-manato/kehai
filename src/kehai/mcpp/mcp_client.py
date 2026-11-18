@@ -1,8 +1,9 @@
 """MCP Client for KEHAI."""
 
+import asyncio
 import os
 from contextlib import AsyncExitStack
-from typing import Dict, Any, List, Callable
+from typing import Dict, Any, Iterable, List, Callable, Optional
 from loguru import logger
 from datetime import timedelta
 
@@ -13,11 +14,31 @@ from mcp.client.stdio import stdio_client
 from .server_registry import ServerRegistry
 
 DEFAULT_TIMEOUT = timedelta(seconds=30)
+# aclose() gives each server task this long to wind down on its own (stdin
+# close -> process.wait, with the SDK's 2 s SIGTERM/SIGKILL escalation on top)
+# before cancelling it outright.
+CLOSE_TIMEOUT = 10.0
 
 
 class MCPClient:
     """MCP Client for KEHAI.
     Manages persistent connections to multiple MCP servers.
+
+    Every server connection lives in its OWN asyncio task (`_serve`): the stdio
+    transport and the ClientSession are entered there and exited there. Both
+    are built on anyio task groups / cancel scopes, which refuse to be exited
+    from any task but the one that entered them. The previous shared
+    AsyncExitStack was entered from whichever conversation task first needed a
+    server and exited from the disconnect handler, which raised "Attempted to
+    exit cancel scope in a different task than it was entered in"
+    (logs/server.log, 2026-10-22 16:14:22) and left the child process behind.
+    Callers only ever receive the session object; the owning task parks on
+    `_stop` until aclose().
+
+    Sessions can be started ahead of the first tool call with start_servers()
+    (the uvx `time` server took ~480 ms to spawn on the first call of a turn,
+    all of it silence). A pre-spawn that fails is retried lazily by the next
+    request, exactly as before.
     """
 
     def __init__(
@@ -27,11 +48,17 @@ class MCPClient:
         client_uid: str = None,
     ) -> None:
         """Initialize the MCP Client."""
-        self.exit_stack: AsyncExitStack = AsyncExitStack()
         self.active_sessions: Dict[str, ClientSession] = {}
         self._list_tools_cache: Dict[str, List[Tool]] = {}  # Cache for list_tools
         self._send_text: Callable = send_text
         self._client_uid: str = client_uid
+        # Per-server lifecycle task, and the future that resolves to its session
+        # (or to the connect error). A future that is done but whose session is
+        # gone is simply replaced by the next request.
+        self._server_tasks: Dict[str, asyncio.Task] = {}
+        self._server_ready: Dict[str, asyncio.Future] = {}
+        self._stop = asyncio.Event()
+        self._closing = False
 
         if isinstance(server_registery, ServerRegistry):
             self.server_registery = server_registery
@@ -41,19 +68,41 @@ class MCPClient:
             )
         logger.info("MCPC: Initialized MCPClient instance.")
 
-    async def _ensure_server_running_and_get_session(
-        self, server_name: str
-    ) -> ClientSession:
-        """Gets the existing session or creates a new one."""
-        if server_name in self.active_sessions:
-            return self.active_sessions[server_name]
+    def start_servers(self, server_names: Iterable[str]) -> None:
+        """Pre-spawn: start the connection task for each named server NOW, in
+        the background, so the first tool call of the connection finds a live
+        session instead of paying the spawn. Best effort: a failure is logged by
+        the task and the next request falls back to the lazy spawn in
+        _ensure_server_running_and_get_session. Unknown names are skipped (the
+        ToolAdapter already warned about them)."""
+        started = []
+        for name in server_names:
+            if name in self._server_tasks or not self.server_registery.get_server(name):
+                continue
+            self._spawn(name)
+            started.append(name)
+        if started:
+            logger.info(f"MCPC: Pre-spawning server(s) in the background: {started}")
 
-        logger.info(f"MCPC: Starting and connecting to server '{server_name}'...")
+    def _spawn(self, server_name: str) -> asyncio.Future:
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future = loop.create_future()
+        self._server_ready[server_name] = ready
+        self._server_tasks[server_name] = loop.create_task(
+            self._serve(server_name, ready), name=f"mcp-server:{server_name}"
+        )
+        return ready
+
+    async def _serve(self, server_name: str, ready: asyncio.Future) -> None:
+        """Own one server connection for its whole life, in this task."""
         server = self.server_registery.get_server(server_name)
         if not server:
-            raise ValueError(
-                f"MCPC: Server '{server_name}' not found in available servers."
+            ready.set_exception(
+                ValueError(
+                    f"MCPC: Server '{server_name}' not found in available servers."
+                )
             )
+            return
 
         timeout = server.timeout if server.timeout else DEFAULT_TIMEOUT
 
@@ -72,25 +121,72 @@ class MCPClient:
             cwd=server.cwd,
         )
 
+        logger.info(f"MCPC: Starting and connecting to server '{server_name}'...")
+        session: Optional[ClientSession] = None
         try:
-            stdio_transport = await self.exit_stack.enter_async_context(
-                stdio_client(server_params)
-            )
-            read, write = stdio_transport
+            async with AsyncExitStack() as stack:
+                read, write = await stack.enter_async_context(
+                    stdio_client(server_params)
+                )
+                session = await stack.enter_async_context(
+                    ClientSession(read, write, read_timeout_seconds=timeout)
+                )
+                await session.initialize()
+                self.active_sessions[server_name] = session
+                if not ready.done():
+                    ready.set_result(session)
+                logger.info(f"MCPC: Successfully connected to server '{server_name}'.")
+                await self._stop.wait()
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            if not ready.done():
+                ready.set_exception(
+                    RuntimeError(
+                        f"MCPC: Connection to server '{server_name}' was cancelled."
+                    )
+                )
+            raise
+        except BaseException as e:  # noqa: BLE001 — anyio teardown raises BaseExceptionGroup
+            if not ready.done():
+                logger.warning(
+                    f"MCPC: Failed to connect to server '{server_name}': {e!r}"
+                )
+                ready.set_exception(
+                    RuntimeError(f"MCPC: Failed to connect to server '{server_name}'.")
+                )
+            else:
+                logger.warning(
+                    f"MCPC: Connection to server '{server_name}' ended: {e!r}"
+                )
+        finally:
+            if session is not None and self.active_sessions.get(server_name) is session:
+                del self.active_sessions[server_name]
 
-            session = await self.exit_stack.enter_async_context(
-                ClientSession(read, write, read_timeout_seconds=timeout)
-            )
-            await session.initialize()
-
-            self.active_sessions[server_name] = session
-            logger.info(f"MCPC: Successfully connected to server '{server_name}'.")
+    async def _ensure_server_running_and_get_session(
+        self, server_name: str
+    ) -> ClientSession:
+        """Gets the existing session or creates a new one."""
+        session = self.active_sessions.get(server_name)
+        if session is not None:
             return session
-        except Exception as e:
-            logger.exception(f"MCPC: Failed to connect to server '{server_name}': {e}")
+        if self._closing:
             raise RuntimeError(
-                f"MCPC: Failed to connect to server '{server_name}'."
-            ) from e
+                f"MCPC: Client is closing; cannot connect to server '{server_name}'."
+            )
+        if not self.server_registery.get_server(server_name):
+            raise ValueError(
+                f"MCPC: Server '{server_name}' not found in available servers."
+            )
+
+        ready = self._server_ready.get(server_name)
+        if ready is None or ready.done():
+            # Nothing in flight: no pre-spawn, the pre-spawn failed, or the
+            # session went away since (its task popped active_sessions). Lazy
+            # spawn, as before.
+            ready = self._spawn(server_name)
+        else:
+            logger.info(f"MCPC: Waiting for pre-spawned server '{server_name}'...")
+        # shield: a cancelled caller (barge-in) must not cancel the shared future
+        return await asyncio.shield(ready)
 
     async def list_tools(self, server_name: str) -> List[Tool]:
         """List all available tools on the specified server."""
@@ -167,14 +263,32 @@ class MCPClient:
         return result
 
     async def aclose(self) -> None:
-        """Closes all active server connections."""
+        """Closes all active server connections, each in the task that owns it."""
+        tasks = [t for t in self._server_tasks.values() if not t.done()]
         logger.info(
             f"MCPC: Closing client instance and {len(self.active_sessions)} active connections..."
         )
-        await self.exit_stack.aclose()
-        self.active_sessions.clear()
-        self._list_tools_cache.clear()  # Clear cache on close
-        self.exit_stack = AsyncExitStack()
+        self._closing = True
+        self._stop.set()
+        try:
+            if tasks:
+                _done, pending = await asyncio.wait(tasks, timeout=CLOSE_TIMEOUT)
+                for task in pending:
+                    logger.warning(
+                        f"MCPC: {task.get_name()} did not stop within "
+                        f"{CLOSE_TIMEOUT}s; cancelling."
+                    )
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+        finally:
+            self._server_tasks.clear()
+            self._server_ready.clear()
+            self.active_sessions.clear()
+            self._list_tools_cache.clear()  # Clear cache on close
+            # Re-armed, so the instance stays reusable (as the old exit stack was).
+            self._stop = asyncio.Event()
+            self._closing = False
         logger.info("MCPC: Client instance closed.")
 
     async def __aenter__(self) -> "MCPClient":

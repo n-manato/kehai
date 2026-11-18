@@ -69,6 +69,8 @@ def forget_client(websocket) -> None:
 
 def client_supports_opus(websocket_send) -> bool:
     ws = getattr(websocket_send, "__self__", None)
+    if ws is not None and getattr(ws, "pcm_only", False):
+        return False  # render_stream.ViewerMirror decodes PCM for the viewer
     return ws is not None and id(ws) in _opus_clients
 
 
