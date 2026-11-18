@@ -119,7 +119,9 @@ def check(t0: float, t1: float, audio16k: np.ndarray) -> str:
         k = np.clip(((grid - t0) * 16000 / hop).astype(int), 0, max(n - 1, 0))
         voiced = during & (loud[k] if n else False)
         before = (grid < t0 - 0.3) & (grid >= t0 - BASE_S)
-        f = lambda mask: float(np.mean(lg[mask])) if mask.sum() >= 8 else float("nan")
+        def f(mask, lg=lg):
+            return float(np.mean(lg[mask])) if mask.sum() >= 8 else float("nan")
+
         whole, v, b = f(during), f(voiced), f(before)
         rise = v - b
         pos = float(np.mean(lg[voiced] > 0)) if voiced.sum() >= 8 else float("nan")
