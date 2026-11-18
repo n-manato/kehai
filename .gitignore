@@ -150,3 +150,6 @@ Live2D Characters/vrm/female_android.glb
 
 # purchased source assets for the android avatar (not redistributable); see KEHAI-assets/female_android_rig/README.md
 /KEHAI-assets/
+
+# Purchased animation pack: kept locally, never committed
+/KAWAII ANIMATIONS*/
